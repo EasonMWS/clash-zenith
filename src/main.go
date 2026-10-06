@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -514,7 +514,6 @@ func countWindows(port int) int {
 	}
 	return n
 }
-
 
 func hiddenCommand(name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)

@@ -367,4 +367,3 @@ func HiddenCommand(name string, args ...string) (string, error) {
 	}
 	return string(out), nil
 }
-

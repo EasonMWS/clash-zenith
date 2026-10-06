@@ -26,20 +26,20 @@ var (
 	shell32  = syscall.NewLazyDLL("shell32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	procRegisterClassExW  = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW   = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW    = user32.NewProc("DefWindowProcW")
-	procDestroyWindow     = user32.NewProc("DestroyWindow")
-	procGetMessageW       = user32.NewProc("GetMessageW")
-	procTranslateMessage  = user32.NewProc("TranslateMessage")
-	procDispatchMessageW  = user32.NewProc("DispatchMessageW")
-	procPostMessageW      = user32.NewProc("PostMessageW")
-	procPostQuitMessage   = user32.NewProc("PostQuitMessage")
-	procCreatePopupMenu   = user32.NewProc("CreatePopupMenu")
-	procAppendMenuW       = user32.NewProc("AppendMenuW")
-	procDestroyMenu       = user32.NewProc("DestroyMenu")
-	procTrackPopupMenu    = user32.NewProc("TrackPopupMenu")
-	procSetForegroundWnd  = user32.NewProc("SetForegroundWindow")
+	procRegisterClassExW = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW  = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW   = user32.NewProc("DefWindowProcW")
+	procDestroyWindow    = user32.NewProc("DestroyWindow")
+	procGetMessageW      = user32.NewProc("GetMessageW")
+	procTranslateMessage = user32.NewProc("TranslateMessage")
+	procDispatchMessageW = user32.NewProc("DispatchMessageW")
+	procPostMessageW     = user32.NewProc("PostMessageW")
+	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
+	procCreatePopupMenu  = user32.NewProc("CreatePopupMenu")
+	procAppendMenuW      = user32.NewProc("AppendMenuW")
+	procDestroyMenu      = user32.NewProc("DestroyMenu")
+	procTrackPopupMenu   = user32.NewProc("TrackPopupMenu")
+	procSetForegroundWnd = user32.NewProc("SetForegroundWindow")
 	procGetCursorPos     = user32.NewProc("GetCursorPos")
 	procLoadImageW       = user32.NewProc("LoadImageW")
 	procDestroyIcon      = user32.NewProc("DestroyIcon")
@@ -87,7 +87,7 @@ type wndClassExW struct {
 	style         uint32
 	lpfnWndProc   uintptr
 	cbClsExtra    int32
-	cbWndExtra   int32
+	cbWndExtra    int32
 	hInstance     uintptr
 	hIcon         uintptr
 	hCursor       uintptr
@@ -494,11 +494,11 @@ func EnableDpiAwareness() {
 // ---- modal dialogs --------------------------------------------------------
 
 const (
-	mbYesNo        = 0x00000004
-	mbIconQuestion = 0x00000020
-	mbIconInfo     = 0x00000040
+	mbYesNo         = 0x00000004
+	mbIconQuestion  = 0x00000020
+	mbIconInfo      = 0x00000040
 	mbSetForeground = 0x00010000
-	idYes          = 6
+	idYes           = 6
 )
 
 func messageBox(title, text string, flags uintptr) int {

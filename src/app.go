@@ -40,9 +40,9 @@ type App struct {
 	secret     string
 	dnsPort    int
 
-	mu          sync.Mutex
-	optimizing  bool
-	lastErr     string
+	mu         sync.Mutex
+	optimizing bool
+	lastErr    string
 	// pending auto-pick: a marginal win has to persist before it is acted on
 	pickCandidate string
 	pickSince     time.Time
@@ -50,10 +50,10 @@ type App struct {
 	// the user's most recent deliberate node choice, respected for a while
 	userPicked   string
 	userPickedAt time.Time
-	quitting    bool
-	stopCh      chan struct{}
-	onQuit      func()
-	trafficSnap Connections
+	quitting     bool
+	stopCh       chan struct{}
+	onQuit       func()
+	trafficSnap  Connections
 }
 
 func NewApp(rootDir string) (*App, error) {
@@ -239,6 +239,7 @@ func copyPatch(in map[string]interface{}) map[string]interface{} {
 	}
 	return out
 }
+
 // ---- startup --------------------------------------------------------------
 
 // Boot prepares the config and starts the core in the BACKGROUND.
@@ -433,6 +434,7 @@ func (a *App) resetPickWatch() {
 	a.pickWatching = false
 	a.mu.Unlock()
 }
+
 // enforceFastest makes sure the fastest verified node is the one in use.
 //
 // Ranking uses the handshake time the optimiser actually measured, not the
@@ -1127,4 +1129,3 @@ func (a *App) Shutdown() {
 	}
 	os.Exit(0)
 }
-

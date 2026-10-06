@@ -1,0 +1,34 @@
+# 统一换行与文本处理，避免 Windows 检出时把整个仓库标成已修改
+* text=auto eol=lf
+
+# Go 源码
+*.go   text eol=lf
+*.mod  text eol=lf
+go.sum text eol=lf
+
+# 界面资源
+*.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+
+# 脚本：PowerShell 在 Windows 上按 CRLF 更自然
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# 文档
+*.md   text eol=lf
+
+# 二进制：不做任何转换
+*.exe    binary
+*.syso   binary
+*.ico    binary
+*.dat    binary
+*.metadb binary
+*.mmdb   binary
+
+# 语言统计时不要把生成物算进去
+data/GeoSite.dat   linguist-generated
+data/geoip.metadb  linguist-generated
+src/icon.syso      linguist-generated
+core/mihomo.exe    linguist-vendored
