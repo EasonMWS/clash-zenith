@@ -367,7 +367,7 @@ func (s *Server) handleAbout(w http.ResponseWriter, r *http.Request) {
 		"go":      goVersion(),
 		"core":    s.app.core.Version(),
 		"license": "GPL-3.0",
-		"repo":    "https://github.com/EasonMWS/Zenith",
+		"repo":    "https://github.com/EasonMWS/clash-zenith",
 		"dataDir": s.app.dataDir,
 		"ports": map[string]int{
 			"mixed":   s.app.store.Settings().MixedPort,
