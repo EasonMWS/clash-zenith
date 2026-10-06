@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -51,6 +53,13 @@ func NewApp(rootDir string) (*App, error) {
 	}
 	InitLog(logDir)
 
+	// The rule databases ship with the repository, but a truncated copy (or a
+	// clone that predates them) must be repaired before the core starts,
+	// otherwise mihomo sits in a download loop and never comes up.
+	if err := ensureGeodata(dataDir); err != nil {
+		Log("geodata check: %v", err, "WARN")
+	}
+
 	store, err := NewStore(dataDir)
 	if err != nil {
 		return nil, err
@@ -74,6 +83,110 @@ func NewApp(rootDir string) (*App, error) {
 }
 
 func goVersion() string { return runtime.Version() }
+
+// ---- geodata bootstrap ----------------------------------------------------
+
+// geodataFiles are the rule databases mihomo needs for GEOSITE / GEOIP rules.
+// They ship with the repository so a fresh clone starts in a second instead of
+// waiting on a download.
+var geodataFiles = map[string]int64{
+	"GeoSite.dat":  1 << 20, // 1 MB - the real file is ~4 MB
+	"geoip.metadb": 1 << 20, // 1 MB - the real file is ~8 MB
+}
+
+// geodataMirrors are tried in order. mihomo itself fetches from GitHub, which
+// times out on many networks (measured here: 40 s and zero bytes), so Zenith
+// fetches through a mirror instead and only falls back to letting the core try.
+var geodataMirrors = []string{
+	"https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/%s",
+	"https://ghproxy.net/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/%s",
+}
+
+// ensureGeodata makes sure the rule databases exist and are complete.
+//
+// A previous version only checked whether the files existed, so a truncated
+// download (a 0-byte GeoSite.dat left behind by an interrupted run) kept mihomo
+// in a download-retry loop and the core never came up.
+func ensureGeodata(dataDir string) error {
+	var missing []string
+	for name, minSize := range geodataFiles {
+		p := filepath.Join(dataDir, name)
+		st, err := os.Stat(p)
+		if err == nil && st.Size() >= minSize {
+			continue
+		}
+		if err == nil {
+			Log("%s is only %d bytes (truncated), removing it", name, st.Size(), "WARN")
+			_ = os.Remove(p)
+		}
+		missing = append(missing, name)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	Log("first run: fetching %d rule database(s), this takes a few seconds", len(missing))
+	for _, name := range missing {
+		dest := filepath.Join(dataDir, name)
+		if err := downloadGeodata(name, dest); err != nil {
+			Log("could not fetch %s: %v", name, err, "WARN")
+			// let the core try on its own; it may work on this network
+			continue
+		}
+		if st, err := os.Stat(dest); err == nil {
+			Log("%s ready (%d KB)", name, st.Size()/1024)
+		}
+	}
+	return nil
+}
+
+func downloadGeodata(name, dest string) error {
+	for _, pattern := range geodataMirrors {
+		url := fmt.Sprintf(pattern, name)
+		if err := downloadFile(url, dest); err != nil {
+			Log("mirror failed for %s: %v", name, err, "WARN")
+			continue
+		}
+		if st, err := os.Stat(dest); err == nil && st.Size() >= geodataFiles[name] {
+			return nil
+		}
+		_ = os.Remove(dest)
+	}
+	return fmt.Errorf("所有镜像都失败了")
+}
+
+// downloadFile streams a URL to a file, writing to a temporary name first so an
+// interrupted download can never leave a half written file behind.
+func downloadFile(url, dest string) error {
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	tmp := dest + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(f, resp.Body)
+	cerr := f.Close()
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if cerr != nil {
+		_ = os.Remove(tmp)
+		return cerr
+	}
+	if n == 0 {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("收到 0 字节")
+	}
+	return os.Rename(tmp, dest)
+}
 
 // ---- startup --------------------------------------------------------------
 

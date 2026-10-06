@@ -23,6 +23,7 @@ func main() {
 		headless = flag.Bool("headless", false, "run the backend only, without a window")
 		browser  = flag.Bool("browser", false, "open the UI in the default browser")
 		stop     = flag.Bool("stop", false, "stop a running Zenith and exit")
+		noProxy  = flag.Bool("no-proxy", false, "run without touching the system proxy")
 		version  = flag.Bool("version", false, "print the version and exit")
 		portFlag = flag.Int("port", 0, "UI port (default 7799)")
 	)
@@ -51,6 +52,15 @@ func main() {
 	uiPort := st.UIPort
 	if *portFlag > 0 {
 		uiPort = *portFlag
+	}
+	// An explicit "leave my network alone" switch. Two Zenith instances on
+	// different UI ports would otherwise both try to own the system proxy, and
+	// whichever started last would silently steal it.
+	if *noProxy && st.SystemProxy {
+		if _, err := app.store.UpdateSettings(map[string]interface{}{"systemProxy": false}); err == nil {
+			st.SystemProxy = false
+			Log("running with -no-proxy: the system proxy will not be touched")
+		}
 	}
 
 	Log("root=%s uiPort=%d headless=%v", rootDir, uiPort, *headless)

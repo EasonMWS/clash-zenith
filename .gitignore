@@ -15,12 +15,15 @@
 /data/cache.db
 /data/nodes.json
 /data/ui-profile/
-/data/GeoSite.dat
-/data/geoip.metadb
-/data/geoip.dat
-/data/geosite.dat
 /data/ASN.mmdb
+/data/*.part
 /logs/
+
+# ---- intentionally tracked, do NOT ignore ----
+#   core/mihomo.exe     the proxy core
+#   data/zenith.ico     the application icon
+#   data/GeoSite.dat    rule database, so a fresh clone starts in a second
+#   data/geoip.metadb   rule database, same reason
 
 # ---- editors / OS ----
 .vscode/
