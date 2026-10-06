@@ -116,12 +116,29 @@ type OptimizeProgress struct {
 	Text  string `json:"text"`
 }
 
+// OptimizeSummary explains what the last scan actually did, so the UI can be
+// honest about a subscription that mixes optimisable relays with direct nodes.
+type OptimizeSummary struct {
+	Templates     int      `json:"templates"`     // distinct WebSocket tunnels found
+	Optimizable   int      `json:"optimizable"`   // nodes those tunnels can represent
+	Unsupported   int      `json:"unsupported"`   // nodes优选 cannot touch (direct nodes)
+	FailedTunnels []string `json:"failedTunnels"` // tunnels that yielded nothing
+	Nodes         int      `json:"nodes"`         // optimised nodes produced
+}
+
 type Optimizer struct {
-	dataDir string
-	mu      sync.Mutex
-	running bool
-	prog    OptimizeProgress
-	cancel  chan struct{}
+	dataDir     string
+	mu          sync.Mutex
+	running     bool
+	prog        OptimizeProgress
+	cancel      chan struct{}
+	lastSummary OptimizeSummary
+}
+
+func (o *Optimizer) LastSummary() OptimizeSummary {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.lastSummary
 }
 
 func NewOptimizer(dataDir string) *Optimizer {
@@ -286,6 +303,104 @@ func probeWSVerbose(ip, sni, path, host string, timeout time.Duration, why *stri
 	return elapsed, true
 }
 
+// wsEndpoint is the routing identity of an optimisable node: the SNI, path and
+// Host are what Cloudflare routes on, so only the edge address may change. Two
+// nodes sharing these values will be reached through the same tunnel and must
+// be optimised together.
+type wsEndpoint struct {
+	SNI  string
+	Path string
+	Host string
+}
+
+// templateGroup is one optimisable tunnel plus the node it is cloned from.
+type templateGroup struct {
+	index    int
+	template Proxy
+	ep       wsEndpoint
+}
+
+func endpointOf(p *Proxy) wsEndpoint {
+	sni := p.Servername
+	if sni == "" {
+		sni = p.SNI
+	}
+	if sni == "" {
+		sni = p.Server
+	}
+	path := "/"
+	host := sni
+	if p.WSOpts != nil {
+		if v, ok := p.WSOpts["path"].(string); ok && v != "" {
+			path = v
+		}
+		if hdrs, ok := p.WSOpts["headers"].(map[string]interface{}); ok {
+			if h, ok := hdrs["Host"].(string); ok && h != "" {
+				host = h
+			}
+		}
+	}
+	return wsEndpoint{SNI: sni, Path: path, Host: host}
+}
+
+// canOptimize reports whether a node can be re-pointed at a Cloudflare edge.
+//
+// Only WebSocket + TLS qualifies. A subscription that mixes a Cloudflare relay
+// with direct nodes (Singapore / Japan / US) therefore yields both kinds, and
+// the direct ones must be left completely alone - they are reachable at their
+// own address and no edge swap can improve them.
+func canOptimize(p *Proxy) bool {
+	if p.Server == "" || p.Port == 0 {
+		return false
+	}
+	if !strings.EqualFold(p.Network, "ws") {
+		return false
+	}
+	// TLS is implied by servername/sni, or stated explicitly
+	return p.TLS != nil && *p.TLS || p.Servername != "" || p.SNI != ""
+}
+
+// collectTemplates finds every distinct optimisable tunnel in the node list,
+// preferring a vmess entry as the representative of each one.
+func collectTemplates(nodes []Proxy) []templateGroup {
+	type slot struct {
+		group templateGroup
+		vmess bool
+	}
+	order := make([]string, 0, 4)
+	seen := make(map[string]*slot, 4)
+
+	for i := range nodes {
+		p := nodes[i]
+		if !canOptimize(&p) {
+			continue
+		}
+		ep := endpointOf(&p)
+		key := strings.ToLower(fmt.Sprintf("%s|%s|%s|%d", ep.SNI, ep.Path, ep.Host, p.Port))
+
+		isVmess := strings.EqualFold(p.Type, "vmess")
+		if s, ok := seen[key]; ok {
+			// a vmess node is the better template: it carries uuid/cipher/alterId
+			if isVmess && !s.vmess {
+				s.group.template = p
+				s.group.ep = ep
+				s.vmess = true
+			}
+			continue
+		}
+		seen[key] = &slot{group: templateGroup{template: p, ep: ep}, vmess: isVmess}
+		order = append(order, key)
+	}
+
+	out := make([]templateGroup, 0, len(order))
+	for _, k := range order {
+		g := seen[k].group
+		g.index = len(out) + 1
+		out = append(out, g)
+	}
+	return out
+}
+
 // ScanEdges ranks the candidate pool and returns the winning proxies, built by
 // re-pointing the template node's server field at each winning IP.
 //
@@ -293,44 +408,22 @@ func probeWSVerbose(ip, sni, path, host string, timeout time.Duration, why *stri
 // the scan runs a second pass over the next slice of the candidate pool instead
 // of silently returning less than asked for.
 func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Proxy, []edgeResult, error) {
-	var template *Proxy
+	groups := collectTemplates(nodes)
+	if len(groups) == 0 {
+		return nil, nil, fmt.Errorf("订阅里没有可用于优选的节点：优选只能作用于 WebSocket + TLS 中转节点，" +
+			"直连节点（trojan/ss/hysteria2 等）不需要也不能优选")
+	}
+	optimizable := 0
 	for i := range nodes {
-		n := nodes[i]
-		if n.Type == "vmess" && strings.EqualFold(n.Network, "ws") {
-			template = &n
-			break
+		if canOptimize(&nodes[i]) {
+			optimizable++
 		}
 	}
-	if template == nil {
-		for i := range nodes {
-			if strings.EqualFold(nodes[i].Network, "ws") {
-				template = &nodes[i]
-				break
-			}
-		}
-	}
-	if template == nil {
-		return nil, nil, fmt.Errorf("订阅里没有可用于优选的 WebSocket 节点")
-	}
-
-	sni := template.Servername
-	if sni == "" {
-		sni = template.SNI
-	}
-	if sni == "" {
-		sni = template.Server
-	}
-	path := "/"
-	host := sni
-	if template.WSOpts != nil {
-		if p, ok := template.WSOpts["path"].(string); ok && p != "" {
-			path = p
-		}
-		if hdrs, ok := template.WSOpts["headers"].(map[string]interface{}); ok {
-			if h, ok := hdrs["Host"].(string); ok && h != "" {
-				host = h
-			}
-		}
+	Log("optimiser: %d node(s), %d optimisable across %d distinct tunnel(s)",
+		len(nodes), optimizable, len(groups))
+	for _, g := range groups {
+		Log("  tunnel %d: sni=%s host=%s path=%s (from %q)",
+			g.index, g.ep.SNI, g.ep.Host, g.ep.Path, g.template.Name)
 	}
 
 	ips := o.Candidates()
@@ -354,68 +447,122 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Prox
 	if minWanted > len(ips) {
 		minWanted = len(ips)
 	}
-
-	usable, err := o.scanPass(ips, template, sni, path, host, rounds, workers, minWanted)
-	if err != nil {
-		return nil, nil, err
+	// Split the budget over the tunnels. Each keeps a useful share, and the
+	// candidate slice each one sweeps is proportionally smaller, so adding a
+	// second relay does not double the wall clock time.
+	perTemplate := (minWanted + len(groups) - 1) / len(groups)
+	if perTemplate < 8 {
+		perTemplate = 8
 	}
-	Log("edge scan pass 1: %d usable out of %d candidates", len(usable), len(ips))
 
-	// If the first slice of the pool did not yield enough, sweep the rest. The
-	// pool is ordered roughly best first, so pass one normally suffices.
-	if len(usable) < minWanted {
-		rest := ips[minWanted:]
-		if len(rest) > 0 {
-			o.setProgress("scan", 0, len(rest),
-				fmt.Sprintf("可用节点不足，继续测试剩余 %d 个…", len(rest)))
-			more, err2 := o.scanPass(rest, template, sni, path, host, rounds, workers,
-				minWanted-len(usable))
-			if err2 == nil {
-				usable = append(usable, more...)
-				sort.Slice(usable, func(i, j int) bool { return usable[i].Score < usable[j].Score })
-				Log("edge scan pass 2: %d more usable (total %d)", len(more), len(usable))
+	type groupOutcome struct {
+		group   templateGroup
+		results []edgeResult
+		err     error
+	}
+	outcomes := make([]groupOutcome, len(groups))
+	var wg sync.WaitGroup
+	for i, g := range groups {
+		select {
+		case <-o.cancel:
+			return nil, nil, fmt.Errorf("已取消")
+		default:
+		}
+		wg.Add(1)
+		go func(i int, g templateGroup) {
+			defer wg.Done()
+			wWorkers := workers / len(groups)
+			if wWorkers < 6 {
+				wWorkers = 6
 			}
+			usable, err := o.scanPass(ips, &g.template, g.ep.SNI, g.ep.Path, g.ep.Host,
+				rounds, wWorkers, perTemplate)
+			if err == nil && len(usable) < perTemplate {
+				// first slice was not enough, sweep the rest of the pool
+				if rest := ips[min(perTemplate, len(ips)):]; len(rest) > 0 {
+					more, err2 := o.scanPass(rest, &g.template, g.ep.SNI, g.ep.Path, g.ep.Host,
+						rounds, wWorkers, perTemplate-len(usable))
+					if err2 == nil {
+						usable = append(usable, more...)
+						sort.Slice(usable, func(a, b int) bool { return usable[a].Score < usable[b].Score })
+					}
+				}
+			}
+			outcomes[i] = groupOutcome{group: g, results: usable, err: err}
+		}(i, g)
+	}
+	wg.Wait()
+
+	// Build the per-tunnel node lists, keeping the tunnels separate so a relay
+	// that verifies well cannot crowd out one that verifies poorly.
+	var out []Proxy
+	var allUsable []edgeResult
+	var failed []string
+	for _, oc := range outcomes {
+		if oc.err != nil {
+			Log("tunnel %d failed: %v", oc.group.index, oc.err, "WARN")
+			failed = append(failed, fmt.Sprintf("%s:%s", oc.group.ep.SNI, oc.group.ep.Path))
+			continue
+		}
+		if len(oc.results) == 0 {
+			failed = append(failed, fmt.Sprintf("%s:%s", oc.group.ep.SNI, oc.group.ep.Path))
+			continue
+		}
+		allUsable = append(allUsable, oc.results...)
+		Log("tunnel %d: %d usable edge(s), best %.0fms",
+			oc.group.index, len(oc.results), oc.results[0].Median*1000)
+		for i, r := range oc.results {
+			if i >= perTemplate {
+				break
+			}
+			p := oc.group.template
+			p.Server = r.IP
+			// The IP already identifies the winner; the tunnel suffix only has to
+			// disambiguate when more than one relay is in play.
+			if len(groups) > 1 {
+				p.Name = fmt.Sprintf("优选T%d-%02d · %s · %.0fms", oc.group.index, i+1, r.IP, r.Median*1000)
+			} else {
+				p.Name = fmt.Sprintf("优选%02d · %s · %.0fms", i+1, r.IP, r.Median*1000)
+			}
+			out = append(out, p)
 		}
 	}
-
-	sort.Slice(usable, func(i, j int) bool { return usable[i].Score < usable[j].Score })
-	if len(usable) == 0 {
+	if len(out) == 0 {
 		return nil, nil, fmt.Errorf("没有一个边缘节点可用：可能是订阅已失效或网络本身有问题")
 	}
+
+	sort.Slice(allUsable, func(i, j int) bool { return allUsable[i].Score < allUsable[j].Score })
 	{
 		learned := o.learnCandidates(func() []string {
-			out := make([]string, 0, len(usable))
-			for _, r := range usable {
-				out = append(out, r.IP)
+			seen := map[string]bool{}
+			learned := make([]string, 0, len(allUsable))
+			for _, r := range allUsable {
+				if !seen[r.IP] {
+					seen[r.IP] = true
+					learned = append(learned, r.IP)
+				}
 			}
-			return out
+			return learned
 		}())
 		if learned > 0 {
 			Log("candidate pool grew by %d verified IPs", learned)
 		}
 	}
 
-	// Every verified edge becomes a node. Truncating here to keepNodes was a
-	// mistake: raising the setting in the UI then had no effect until a whole
-	// new scan finished, and shrinking it threw away verified work. The setting
-	// is applied at display time instead (see App.nodeSet).
-	const maxOptimized = 300
-	out := make([]Proxy, 0, len(usable))
-	for i, r := range usable {
-		if i >= maxOptimized {
-			break
-		}
-		p := *template
-		p.Server = r.IP
-		p.Name = fmt.Sprintf("优选%02d · %s · %.0fms", i+1, r.IP, r.Median*1000)
-		// the subscription's own params stay untouched: SNI, path and Host are
-		// what Cloudflare routes on, only the edge address changes
-		out = append(out, p)
+	o.mu.Lock()
+	o.lastSummary = OptimizeSummary{
+		Templates:     len(groups),
+		Optimizable:   optimizable,
+		Unsupported:   len(nodes) - optimizable,
+		FailedTunnels: failed,
+		Nodes:         len(out),
 	}
-	Log("edge scan done: %d/%d usable, best %s (%.0fms)",
-		len(usable), total, usable[0].IP, usable[0].Median*1000)
+	o.mu.Unlock()
+
+	Log("edge scan done: %d node(s) from %d tunnel(s), best %s (%.0fms)",
+		len(out), len(groups)-len(failed), allUsable[0].IP, allUsable[0].Median*1000)
 	o.setProgress("idle", 0, 0, "完成")
-	return out, usable, nil
+	return out, allUsable, nil
 }
 
 // scanPass probes one slice of candidate IPs and returns those that completed a

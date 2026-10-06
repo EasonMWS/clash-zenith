@@ -432,6 +432,7 @@ func (a *App) Status() map[string]interface{} {
 		"systemProxy":  a.sysproxy.Status(),
 		"optimizing":   a.opt.Running(),
 		"progress":     a.opt.Progress(),
+		"optSummary":   a.opt.LastSummary(),
 		"lastOptimize": snap.LastOptimize,
 		"error":        a.lastErr,
 		"ports": map[string]int{

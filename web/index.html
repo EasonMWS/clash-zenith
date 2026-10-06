@@ -43,26 +43,47 @@
 
     <!-- ---------- 概览 ---------- -->
     <section class="tab" id="tab-overview">
+      <!-- 延迟是这一页的主角：数值最大、单独配色 -->
+      <div class="card latency none" id="latency-card">
+        <div class="latency-main">
+          <div class="latency-head">
+            <span class="latency-label" id="latency-label">当前节点延迟</span>
+            <span class="latency-at" id="latency-at"></span>
+            <button class="icon-btn" id="btn-refresh-delay" title="重新测一次当前节点延迟"
+              aria-label="重新测速">
+              <svg class="ic-refresh" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1" />
+                <polyline points="20.6 3.6 20.6 9.4 14.8 9.4" />
+              </svg>
+            </button>
+          </div>
+          <div class="latency-value" id="latency-value">—<span class="latency-unit" id="latency-unit"></span></div>
+          <div class="latency-node" id="latency-node">读取中…</div>
+        </div>
+      </div>
+
       <div class="card hero">
         <div class="hero-main">
-          <div class="hero-tags">
-            <span class="badge" id="mode-badge">规则</span>
-            <span class="badge ghost" id="proxy-badge">系统代理 未知</span>
-            <span class="badge ghost" id="opt-badge">未优选</span>
-          </div>
           <div class="hero-node" id="hero-node">读取中…</div>
           <div class="hero-meta" id="hero-meta">—</div>
         </div>
         <div class="hero-actions">
-          <button class="btn primary lg" id="btn-optimize">立即优选</button>
-          <button class="btn hidden" id="btn-cancel">取消</button>
-        </div>
-        <div class="progress hidden" id="progress-wrap">
-          <div class="progress-head">
-            <span id="progress-text">等待中…</span>
-            <span id="progress-count"></span>
+          <div class="hero-btns">
+            <button class="btn primary lg" id="btn-optimize">立即优选</button>
+            <button class="btn hidden" id="btn-cancel">取消</button>
           </div>
-          <div class="bar"><i id="progress-bar"></i></div>
+          <div class="progress hidden" id="progress-wrap">
+            <div class="progress-head">
+              <span id="progress-text">等待中…</span>
+              <span id="progress-count"></span>
+            </div>
+            <div class="bar"><i id="progress-bar"></i></div>
+          </div>
+        </div>
+        <div class="hero-tags">
+          <span class="badge" id="mode-badge">规则</span>
+          <span class="badge ghost" id="proxy-badge">系统代理 未知</span>
+          <span class="badge ghost" id="opt-badge">未优选</span>
         </div>
       </div>
 

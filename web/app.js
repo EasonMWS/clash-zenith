@@ -17,7 +17,7 @@ const NUM_FIELDS = [['#in-optint', 'optimizeIntervalMin'], ['#in-subint', 'subsc
 
 const S = {
   tab: 'overview', status: null, online: true, subs: null, settings: null, delays: {}, testing: {},
-  testBusy: false, logWhich: 'app', logAuto: false, confirmDel: '', loaded: {}
+  testBusy: false, logWhich: 'app', logAuto: false, confirmDel: '', loaded: {}, delayAt: '', delayBusy: false
 };
 
 /* --------------------------------------------------------------- 基础工具 */
@@ -138,6 +138,86 @@ function setTab(tab) {
   }
 }
 
+/* -------------------------------------------------- 概览：延迟主角（hero） */
+
+/* 当前节点的延迟：优先看正在使用的那个节点，测不到就退回按名字匹配 */
+function activeNode(st) {
+  const list = (st && st.nodes) || [];
+  let n = list.filter((x) => x.active)[0];
+  if (!n && st && st.current) n = list.filter((x) => x.name === st.current)[0];
+  return n || null;
+}
+
+/* 手动测速的结果优先，其次是 /api/status 里带的延迟；未知按 0 处理 */
+function currentDelay(st, node) {
+  if (!node) return 0;
+  const d = S.delays[node.name];
+  return d === undefined ? Number(node.delay) || 0 : Number(d) || 0;
+}
+
+function clockText() {
+  const d = new Date();
+  const p = (x) => String(x).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/* 延迟配色：与 CSS 里的 --success / --warn / --danger / --muted 保持一致，
+   但由 JS 直接写内联色，避免颜色只靠 class 传递时读到过渡中的旧值 */
+const DELAY_COLOR = { none: '#8b98b0', good: '#35d07f', mid: '#ffb020', bad: '#ff5c72' };
+
+/* 只改数字本身，ms 后缀留在 span 里，避免每次轮询都重建节点 */
+function paintDelayNum(d) {
+  const num = $('#latency-value');
+  if (!num) return;
+  const text = delayText(d);                     // 0 或缺失时是「—」
+  if (num.firstChild && num.firstChild.nodeType === 3) num.firstChild.nodeValue = text;
+  else num.insertBefore(document.createTextNode(text), num.firstChild);
+}
+
+/* 数值 + 配色一起更新，轮询与手动测速走同一条路 */
+function renderDelayHero(st) {
+  const card = $('#latency-card');
+  if (!card || !$('#latency-value')) return;
+
+  const node = activeNode(st);
+  const d = currentDelay(st, node);
+  const cls = delayClass(d);                            // none / good / mid / bad，阈值与节点页一致
+  card.className = 'card latency ' + cls;
+  card.style.borderLeftColor = DELAY_COLOR[cls];
+  $('#latency-value').style.color = DELAY_COLOR[cls];
+  $('#latency-unit').style.color = DELAY_COLOR[cls];
+  paintDelayNum(d);
+  $('#latency-unit').textContent = d > 0 ? 'ms' : '';
+  card.title = node
+    ? node.name + ' · ' + delayText(d) + (S.delayAt ? ' · 上次测速 ' + S.delayAt : '')
+    : '还没有选中节点';
+
+  $('#latency-node').textContent = node ? node.name : '未选择节点';
+  $('#latency-at').textContent = S.delayAt ? S.delayAt + ' 更新' : '';
+}
+
+/* 对当前节点单独测一次延迟，结果立刻显示在 hero 上 */
+function testCurrentDelay(btn) {
+  const node = activeNode(S.status);
+  const name = node ? node.name : (S.status && S.status.current ? S.status.current : '');
+  if (!name) { toast('还没有可用节点', 'err'); return Promise.resolve(); }
+  return guard(btn, async () => {
+    S.delayBusy = true;
+    if (btn) btn.classList.add('busy');
+    try {
+      const r = await api('/api/test-delay', { name: name });
+      if (!r.ok && !(Number(r.delay) > 0)) toast('测速失败：' + (r.error || '节点无响应'), 'err');
+      S.delays[name] = r.ok && Number(r.delay) > 0 ? Number(r.delay) : 0;
+      S.delayAt = clockText();
+      renderDelayHero(S.status);
+      if (S.tab === 'nodes') paintRow(name);
+    } finally {
+      S.delayBusy = false;
+      if (btn && btn.isConnected) btn.classList.remove('busy');
+    }
+  });
+}
+
 /* ------------------------------------------------------------------- 概览 */
 
 function renderOverview(st) {
@@ -164,6 +244,8 @@ function renderOverview(st) {
   if (st.autoPick && st.autoPick !== st.current) meta.push('自动测速最优：' + st.autoPick);
   if (st.lastOptimize) meta.push('上次优选 ' + prettyTime(st.lastOptimize));
   $('#hero-meta').textContent = meta.join(' · ');
+
+  renderDelayHero(st);
 
   const tr = st.traffic || {};
   $('#st-down').textContent = bytes(tr.downloadTotal);
@@ -591,6 +673,8 @@ function bindNav() {
 }
 
 function bindOverview() {
+  $('#btn-refresh-delay').addEventListener('click', function () { testCurrentDelay(this); });
+
   $('#btn-optimize').addEventListener('click', function () {
     guard(this, async () => {
       const r = await api('/api/optimize', {});

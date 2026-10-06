@@ -212,8 +212,76 @@ a:hover { text-decoration: underline; }
 .badge.bad { border-color: rgba(255, 92, 114, .4); background: var(--danger-soft); color: #ffb3be; }
 .badge.warn { border-color: rgba(255, 176, 32, .4); background: var(--warn-soft); color: #ffd591; }
 
+/* ------------------------------------------------------ 概览：延迟主角块 */
+.latency {
+  position: relative;
+  overflow: hidden;
+  padding: 16px 20px 15px 25px;
+  border-left: 4px solid var(--muted);
+  transition: border-color .2s ease, background .2s ease;
+}
+.latency-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+.latency-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.latency-label { font-size: 13px; font-weight: 600; letter-spacing: .4px; color: var(--muted); }
+.latency-at { font-size: 11.5px; color: #5f6b82; white-space: nowrap; }
+.latency-at:not(:empty)::before { content: "· "; }
+.latency-head .icon-btn { margin-left: auto; }
+
+.latency-value {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-top: 1px;
+  font-size: 64px;
+  font-weight: 700;
+  line-height: 1.02;
+  letter-spacing: -2px;
+  color: var(--muted);          /* 未测速时的中性灰；运行时由 JS 按数值写内联色 */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+.latency-unit { font-size: 19px; font-weight: 600; letter-spacing: .4px; color: var(--muted); }
+
+/* 数值越大越慢：绿 → 橙 → 红，颜色同时落在数字、左侧色条和背景上 */
+.latency.good { border-left-color: var(--success); background-image: linear-gradient(90deg, var(--success-soft), transparent 58%); }
+.latency.good .latency-value, .latency.good .latency-unit { color: var(--success); }
+.latency.mid { border-left-color: var(--warn); background-image: linear-gradient(90deg, var(--warn-soft), transparent 58%); }
+.latency.mid .latency-value, .latency.mid .latency-unit { color: var(--warn); }
+.latency.bad { border-left-color: var(--danger); background-image: linear-gradient(90deg, var(--danger-soft), transparent 58%); }
+.latency.bad .latency-value, .latency.bad .latency-unit { color: var(--danger); }
+
+.latency-node {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+/* 测速按钮：圆形箭头，请求期间转圈 */
+.icon-btn {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease, border-color .16s ease;
+}
+.icon-btn:hover { color: var(--text); background: #212a3c; border-color: #2e3a52; }
+.icon-btn:disabled { cursor: progress; }
+.icon-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.icon-btn.busy { color: var(--accent); border-color: rgba(79, 140, 255, .45); }
+.icon-btn.busy svg { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
 /* ================================================================ 概览页 */
-.hero { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 20px; }
+.hero { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 20px; }
 .hero-main { flex: 1 1 320px; min-width: 0; }
 .hero-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .hero-node {
@@ -224,9 +292,10 @@ a:hover { text-decoration: underline; }
   word-break: break-all;
 }
 .hero-meta { margin-top: 6px; font-size: 12.5px; color: var(--muted); }
-.hero-actions { display: flex; align-items: center; gap: 10px; }
+.hero-actions { flex: 0 1 auto; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 10px; }
+.hero-btns { display: flex; align-items: center; gap: 10px; }
 
-.progress { flex: 1 1 100%; }
+.progress { flex: 1 1 100%; min-width: 190px; }
 .progress-head {
   display: flex;
   justify-content: space-between;
@@ -625,4 +694,6 @@ a:hover { text-decoration: underline; }
   :root { --node-cols: minmax(0, 1fr) 96px 64px; }
   .node-head > span:nth-child(2), .node-server, .node-net { display: none; }
   .grid-3 { grid-template-columns: 1fr; }
+  .latency-value { font-size: 52px; letter-spacing: -1px; }
+  .latency-unit { font-size: 17px; }
 }
