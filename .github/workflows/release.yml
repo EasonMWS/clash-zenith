@@ -1,0 +1,76 @@
+name: release
+
+# Pushing a tag like v1.0.0 builds Zenith.exe and attaches it to a GitHub
+# Release, so somebody who does not want to install Go can download a ready
+# binary instead of cloning and building.
+#
+# The executable is deliberately NOT committed to the repository: a binary in
+# git history grows with every rebuild, and a stale one is worse than none.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build
+        working-directory: src
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          go build -trimpath -ldflags '-s -w' -o ../Zenith.exe .
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $v = & .\Zenith.exe -version
+          Write-Host $v
+          if ($v -notmatch 'Zenith') { throw "the binary does not run" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          # ship the whole runnable tree; the user unzips and double clicks
+          $stage = 'Zenith-windows-amd64'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'Zenith.exe' $stage
+          Copy-Item 'README.md','LICENSE' $stage
+          Copy-Item 'core'   $stage -Recurse
+          Copy-Item 'web'    $stage -Recurse
+          Copy-Item 'docs'   $stage -Recurse
+          New-Item -ItemType Directory -Force -Path "$stage/data" | Out-Null
+          Copy-Item 'data/GeoSite.dat','data/geoip.metadb','data/zenith.ico' "$stage/data"
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -Force
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --generate-notes
+          }
+          gh release upload $tag 'Zenith-windows-amd64.zip' --clobber
+
+      - name: Keep the zip as a build artifact too
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zenith-windows-amd64
+          path: Zenith-windows-amd64.zip
