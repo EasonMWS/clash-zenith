@@ -131,6 +131,7 @@ function setTab(tab) {
 
   if (tab === 'subs' && !S.loaded.subs) { S.loaded.subs = true; loadSubs(); }
   if (tab === 'advanced' && !S.loaded.advanced) { S.loaded.advanced = true; loadRules(); }
+  if (tab === 'nodes') renderNodes();
   if (tab === 'settings') {
     if (!S.loaded.settings) { S.loaded.settings = true; loadSettings(); loadAbout(); }
     loadLogs();
@@ -204,6 +205,12 @@ function renderProgress(running, progress, error) {
 
 /* ------------------------------------------------------------------- 节点 */
 
+/* 后端返回的是合并列表：优选节点在前，订阅节点在后 */
+const NODE_SECTIONS = [
+  { opt: true, title: '优选节点', desc: 'Zenith 实测可用的 Cloudflare 边缘，按延迟排序' },
+  { opt: false, title: '订阅节点', desc: '来自你的订阅，优选不会改动它们' }
+];
+
 function visibleNodes() {
   const st = S.status;
   if (!st || !st.nodes.length) return [];
@@ -226,9 +233,47 @@ function rowFor(name) {
   return null;
 }
 
+function nodeRowHtml(n) {
+  const d = nodeDelay(n), cls = delayClass(d), busy = S.testing[n.name];
+  const net = n.network && n.network !== 'tcp' ? '<span class="node-net">' + esc(n.network) + '</span>' : '';
+  return '<div class="node-row' + (n.optimized ? ' opt' : '') + (n.active ? ' active' : '') +
+    (busy ? ' testing' : '') + '" data-name="' + esc(n.name) + '" title="点击切换到该节点">' +
+    '<div class="node-name">' + (n.active ? '<span class="node-mark">使用中</span>' : '') +
+      '<span>' + esc(n.name) + '</span>' + net + '</div>' +
+    '<div class="node-server">' + esc((n.server || '') + (n.port ? ':' + n.port : '')) + '</div>' +
+    '<div class="bar"><i class="' + (busy ? '' : cls) + '" style="width:' +
+      (busy ? 100 : delayPct(d).toFixed(1)) + '%"></i></div>' +
+    '<div class="node-delay ' + (busy ? '' : cls) + '">' + (busy ? '测速中' : delayText(d)) + '</div>' +
+  '</div>';
+}
+
+function nodeGroupHtml(sec, list) {
+  return '<div class="node-group' + (sec.opt ? ' opt' : '') + '">' +
+      '<span class="node-group-title">' + sec.title + '</span>' +
+      '<span class="node-group-count">' + list.length + '</span>' +
+      '<span class="node-group-desc">' + sec.desc + '</span>' +
+    '</div>' + list.map(nodeRowHtml).join('');
+}
+
+/* 保留节点数只影响显示：缓存够的话调大设置立刻生效，不需要重新扫描 */
+function renderNodeHint(st) {
+  const el = $('#node-hint');
+  if (!el) return;
+  const keep = Number(st.settings && st.settings.keepNodes) || 0;
+  const stored = Number(st.storedCount) || 0;
+  if (keep <= 0) { el.textContent = ''; el.className = 'node-hint'; return; }
+  const short = stored < keep;
+  el.className = 'node-hint' + (short ? ' warn' : '');
+  el.textContent = (short
+    ? '已缓存 ' + stored + ' 个，还差 ' + (keep - stored) + ' 个，点「立即优选」补足 · '
+    : '') + '显示前 ' + keep + ' 个优选节点（可在设置中调整）';
+}
+
 function renderNodes() {
   const list = $('#node-list');
   if (!list) return;
+  const st = S.status || {};
+  renderNodeHint(st);
   if (!S.status) { list.innerHTML = '<div class="empty">正在读取节点…</div>'; return; }
 
   const nodes = visibleNodes();
@@ -238,17 +283,10 @@ function renderNodes() {
     return;
   }
 
-  list.innerHTML = nodes.map((n) => {
-    const d = nodeDelay(n), cls = delayClass(d), busy = S.testing[n.name];
-    return '<div class="node-row' + (n.active ? ' active' : '') + (busy ? ' testing' : '') +
-      '" data-name="' + esc(n.name) + '" title="点击切换到该节点">' +
-      '<div class="node-name">' + (n.active ? '<span class="node-mark">使用中</span>' : '') +
-        '<span>' + esc(n.name) + '</span></div>' +
-      '<div class="node-server">' + esc((n.server || '') + (n.port ? ':' + n.port : '')) + '</div>' +
-      '<div class="bar"><i class="' + (busy ? '' : cls) + '" style="width:' +
-        (busy ? 100 : delayPct(d).toFixed(1)) + '%"></i></div>' +
-      '<div class="node-delay ' + (busy ? '' : cls) + '">' + (busy ? '测速中' : delayText(d)) + '</div>' +
-    '</div>';
+  // 分两组渲染；某一组没有（或全部被搜索过滤掉）时连标题一起隐藏
+  list.innerHTML = NODE_SECTIONS.map((sec) => {
+    const group = nodes.filter((n) => !!n.optimized === sec.opt);
+    return group.length ? nodeGroupHtml(sec, group) : '';
   }).join('');
 }
 
@@ -284,7 +322,7 @@ async function testAll() {
   if (S.testBusy) return;
   const st = S.status;
   if (!st || !st.nodes.length) { toast('没有可测速的节点', 'err'); return; }
-
+  // 优选节点与订阅节点一起测
   S.testBusy = true;
   const state = $('#node-test-state');
   const queue = st.nodes.map((n) => n.name);
@@ -299,7 +337,7 @@ async function testAll() {
       const r = await api('/api/test-delay', { name: name });
       delete S.testing[name];
       S.delays[name] = r.ok && Number(r.delay) > 0 ? Number(r.delay) : 0;
-      if (S.delays[name] > 0) alive++;
+      if (r.ok) alive++;
       done++;
       if (state) state.textContent = '测速中 ' + done + ' / ' + total;
       if (S.tab === 'nodes') paintRow(name);

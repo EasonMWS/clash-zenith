@@ -288,7 +288,11 @@ func probeWSVerbose(ip, sni, path, host string, timeout time.Duration, why *stri
 
 // ScanEdges ranks the candidate pool and returns the winning proxies, built by
 // re-pointing the template node's server field at each winning IP.
-func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings) ([]Proxy, []edgeResult, error) {
+//
+// min Wanted is a floor, not a cap: if fewer edges verify than the user wants,
+// the scan runs a second pass over the next slice of the candidate pool instead
+// of silently returning less than asked for.
+func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Proxy, []edgeResult, error) {
 	var template *Proxy
 	for i := range nodes {
 		n := nodes[i]
@@ -342,9 +346,89 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings) ([]Proxy, []edgeResult
 	if workers <= 0 {
 		workers = 24
 	}
+	// Always verify more edges than the display cap so the user can raise
+	// keepNodes without paying for another full scan.
+	if minWanted < 64 {
+		minWanted = 64
+	}
+	if minWanted > len(ips) {
+		minWanted = len(ips)
+	}
 
+	usable, err := o.scanPass(ips, template, sni, path, host, rounds, workers, minWanted)
+	if err != nil {
+		return nil, nil, err
+	}
+	Log("edge scan pass 1: %d usable out of %d candidates", len(usable), len(ips))
+
+	// If the first slice of the pool did not yield enough, sweep the rest. The
+	// pool is ordered roughly best first, so pass one normally suffices.
+	if len(usable) < minWanted {
+		rest := ips[minWanted:]
+		if len(rest) > 0 {
+			o.setProgress("scan", 0, len(rest),
+				fmt.Sprintf("可用节点不足，继续测试剩余 %d 个…", len(rest)))
+			more, err2 := o.scanPass(rest, template, sni, path, host, rounds, workers,
+				minWanted-len(usable))
+			if err2 == nil {
+				usable = append(usable, more...)
+				sort.Slice(usable, func(i, j int) bool { return usable[i].Score < usable[j].Score })
+				Log("edge scan pass 2: %d more usable (total %d)", len(more), len(usable))
+			}
+		}
+	}
+
+	sort.Slice(usable, func(i, j int) bool { return usable[i].Score < usable[j].Score })
+	if len(usable) == 0 {
+		return nil, nil, fmt.Errorf("没有一个边缘节点可用：可能是订阅已失效或网络本身有问题")
+	}
+	{
+		learned := o.learnCandidates(func() []string {
+			out := make([]string, 0, len(usable))
+			for _, r := range usable {
+				out = append(out, r.IP)
+			}
+			return out
+		}())
+		if learned > 0 {
+			Log("candidate pool grew by %d verified IPs", learned)
+		}
+	}
+
+	// Every verified edge becomes a node. Truncating here to keepNodes was a
+	// mistake: raising the setting in the UI then had no effect until a whole
+	// new scan finished, and shrinking it threw away verified work. The setting
+	// is applied at display time instead (see App.nodeSet).
+	const maxOptimized = 300
+	out := make([]Proxy, 0, len(usable))
+	for i, r := range usable {
+		if i >= maxOptimized {
+			break
+		}
+		p := *template
+		p.Server = r.IP
+		p.Name = fmt.Sprintf("优选%02d · %s · %.0fms", i+1, r.IP, r.Median*1000)
+		// the subscription's own params stay untouched: SNI, path and Host are
+		// what Cloudflare routes on, only the edge address changes
+		out = append(out, p)
+	}
+	Log("edge scan done: %d/%d usable, best %s (%.0fms)",
+		len(usable), total, usable[0].IP, usable[0].Median*1000)
+	o.setProgress("idle", 0, 0, "完成")
+	return out, usable, nil
+}
+
+// scanPass probes one slice of candidate IPs and returns those that completed a
+// real WebSocket upgrade, ranked by median time.
+func (o *Optimizer) scanPass(ips []string, template *Proxy, sni, path, host string,
+	rounds, workers, wanted int) ([]edgeResult, error) {
+
+	if wanted > 0 && len(ips) > wanted*3 {
+		// no point testing far more addresses than the caller needs
+		ips = ips[:wanted*3]
+	}
+	total := len(ips)
 	o.setProgress("scan", 0, total, fmt.Sprintf("正在测试 %d 个边缘节点…", total))
-	Log("edge scan: %d candidates, %d rounds, %d workers", total, rounds, workers)
 
 	var done int64
 	sem := make(chan struct{}, workers)
@@ -355,7 +439,7 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings) ([]Proxy, []edgeResult
 	for _, ip := range ips {
 		select {
 		case <-o.cancel:
-			return nil, nil, fmt.Errorf("已取消")
+			return nil, fmt.Errorf("已取消")
 		default:
 		}
 		wg.Add(1)
@@ -373,7 +457,8 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings) ([]Proxy, []edgeResult
 			}
 			n := atomic.AddInt64(&done, 1)
 			if n%10 == 0 {
-				o.setProgress("scan", int(n), total, fmt.Sprintf("正在测试边缘节点 %d/%d", n, total))
+				o.setProgress("scan", int(n), total,
+					fmt.Sprintf("正在测试边缘节点 %d/%d", n, total))
 			}
 			if ok == 0 {
 				return
@@ -389,46 +474,8 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings) ([]Proxy, []edgeResult
 		}(ip)
 	}
 	wg.Wait()
-
 	sort.Slice(results, func(i, j int) bool { return results[i].Score < results[j].Score })
-	usable := results
-	if len(usable) == 0 {
-		return nil, nil, fmt.Errorf("没有一个边缘节点可用：可能是订阅已失效或网络本身有问题")
-	}
-	if len(usable) > 0 {
-		learned := o.learnCandidates(func() []string {
-			out := make([]string, 0, len(usable))
-			for _, r := range usable {
-				out = append(out, r.IP)
-			}
-			return out
-		}())
-		if learned > 0 {
-			Log("candidate pool grew by %d verified IPs", learned)
-		}
-	}
-
-	keep := st.KeepNodes
-	if keep <= 0 {
-		keep = 16
-	}
-	if keep > len(usable) {
-		keep = len(usable)
-	}
-	out := make([]Proxy, 0, keep)
-	for i := 0; i < keep; i++ {
-		r := usable[i]
-		p := *template
-		p.Server = r.IP
-		p.Name = fmt.Sprintf("优选%02d · %s · %.0fms", i+1, r.IP, r.Median*1000)
-		// the subscription's own params stay untouched: SNI, path and Host are
-		// what Cloudflare routes on, only the edge address changes
-		out = append(out, p)
-	}
-	Log("edge scan done: %d/%d usable, best %s (%.0fms)",
-		len(usable), total, usable[0].IP, usable[0].Median*1000)
-	o.setProgress("idle", 0, 0, "完成")
-	return out, usable, nil
+	return results, nil
 }
 
 func (o *Optimizer) Cancel() {

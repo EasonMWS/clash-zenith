@@ -172,6 +172,49 @@ func (a *App) background() {
 	}
 }
 
+// nodeSet returns the two node pools, with the optimised list capped by the
+// user's keepNodes setting.
+//
+// The cap is applied HERE rather than inside the scan on purpose: the setting
+// can then be changed with instant feedback, the verified results of a long
+// scan are never thrown away, and the pools stay separate so the interface can
+// show which nodes came from the subscription and which ones Zenith found.
+func (a *App) nodeSet() (optimized []Proxy, base []Proxy) {
+	snap := a.store.Snapshot()
+	optimized = snap.Optimized
+	base = snap.BaseNodes
+	if n := snap.Settings.KeepNodes; n > 0 && len(optimized) > n {
+		optimized = optimized[:n]
+	}
+	return optimized, base
+}
+
+// mergedNodes is the full list written into config.yaml: optimised edges first,
+// then the subscription's own nodes.
+//
+// Both pools must be present. A subscription can carry direct nodes (Singapore
+// / Japan / US) that the optimiser cannot produce - it only re-points one
+// WebSocket template at different Cloudflare edges - and dropping them would
+// silently remove choices from the interface.
+func (a *App) mergedNodes() []Proxy {
+	optimized, base := a.nodeSet()
+	out := make([]Proxy, 0, len(optimized)+len(base))
+	seen := make(map[string]bool, len(optimized)+len(base))
+	for _, p := range optimized {
+		if !seen[p.Name] {
+			seen[p.Name] = true
+			out = append(out, p)
+		}
+	}
+	for _, p := range base {
+		if !seen[p.Name] {
+			seen[p.Name] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // ---- config ---------------------------------------------------------------
 
 func (a *App) writeConfig(nodes []Proxy, st Settings) {
@@ -183,12 +226,7 @@ func (a *App) writeConfig(nodes []Proxy, st Settings) {
 
 // applyConfig rewrites the config and hot reloads it. No process restart.
 func (a *App) applyConfig() error {
-	snap := a.store.Snapshot()
-	nodes := snap.Optimized
-	if len(nodes) == 0 {
-		nodes = snap.BaseNodes
-	}
-	a.writeConfig(nodes, snap.Settings)
+	a.writeConfig(a.mergedNodes(), a.store.Settings())
 	if !a.core.IsUp() {
 		return a.core.Start()
 	}
@@ -225,25 +263,38 @@ func (a *App) Status() map[string]interface{} {
 		autoPick = autoGroup.Now
 	}
 
-	nodes := snap.Optimized
-	isOptimized := true
-	if len(nodes) == 0 {
-		nodes = snap.BaseNodes
-		isOptimized = false
+	optimized, base := a.nodeSet()
+	isOptimized := len(optimized) > 0
+
+	// Two pools, optimised edges first. A subscription node that happens to
+	// carry the same name as an optimised one is listed once.
+	all := make([]Proxy, 0, len(optimized)+len(base))
+	optimizedNames := make(map[string]bool, len(optimized))
+	for _, p := range optimized {
+		optimizedNames[p.Name] = true
+		all = append(all, p)
 	}
-	list := make([]map[string]interface{}, 0, len(nodes))
-	for _, n := range nodes {
+	for _, p := range base {
+		if !optimizedNames[p.Name] {
+			all = append(all, p)
+		}
+	}
+
+	list := make([]map[string]interface{}, 0, len(all))
+	for _, n := range all {
 		delay := 0
 		if p, ok := proxies[n.Name]; ok {
 			delay = p.Delay
 		}
 		list = append(list, map[string]interface{}{
-			"name":   n.Name,
-			"server": n.Server,
-			"port":   n.Port,
-			"type":   n.Type,
-			"delay":  delay,
-			"active": n.Name == current,
+			"name":      n.Name,
+			"server":    n.Server,
+			"port":      n.Port,
+			"type":      n.Type,
+			"network":   n.Network,
+			"delay":     delay,
+			"active":    n.Name == current,
+			"optimized": optimizedNames[n.Name],
 		})
 	}
 
@@ -260,6 +311,9 @@ func (a *App) Status() map[string]interface{} {
 		"autoPick":     autoPick,
 		"nodes":        list,
 		"nodeCount":    len(list),
+		"optCount":     len(optimized),
+		"baseCount":    len(base),
+		"storedCount":  len(snap.Optimized),
 		"isOptimized":  isOptimized,
 		"settings":     st,
 		"systemProxy":  a.sysproxy.Status(),
@@ -328,17 +382,21 @@ func (a *App) StartOptimize() bool {
 		}()
 
 		snap := a.store.Snapshot()
-		nodes := snap.BaseNodes
-		if len(nodes) == 0 {
-			nodes = snap.Optimized
-		}
-		if len(nodes) == 0 {
+		if len(snap.BaseNodes) == 0 {
 			a.lastErr = "还没有节点：请先在「订阅」页添加一个订阅"
 			Log("%s", a.lastErr, "WARN")
 			return
 		}
 		st := snap.Settings
-		best, _, err := a.opt.ScanEdges(nodes, st)
+		// Scan a generous set, not exactly what the user asked to display: the
+		// keepNodes setting is applied when listing nodes, so a larger pool is
+		// what makes raising that number take effect instantly instead of
+		// needing another ten minute scan.
+		minWanted := st.KeepNodes
+		if minWanted < 64 {
+			minWanted = 64
+		}
+		best, _, err := a.opt.ScanEdges(snap.BaseNodes, st, minWanted)
 		if err != nil {
 			a.lastErr = err.Error()
 			Log("optimize failed: %v", err, "ERR")
@@ -347,13 +405,12 @@ func (a *App) StartOptimize() bool {
 		if err := a.store.SetNodes(nil, best); err != nil {
 			Log("could not save optimized nodes: %v", err, "ERR")
 		}
-		// keep the user's pick when it survived, otherwise take the new winner
+		// Keep the user's pick when it still exists somewhere, otherwise fall
+		// back to the fastest optimised node. A subscription node the user had
+		// selected must NOT be replaced just because it is absent from the
+		// optimised list.
 		cur := a.store.Snapshot().Current
-		names := make([]string, 0, len(best))
-		for _, n := range best {
-			names = append(names, n.Name)
-		}
-		if !contains(names, cur) {
+		if !a.nodeExists(cur) {
 			cur = best[0].Name
 			_ = a.store.SetCurrent(cur)
 		}
@@ -363,9 +420,29 @@ func (a *App) StartOptimize() bool {
 		_ = a.core.Select("PROXY", cur)
 		_ = a.store.SetLastOptimize(time.Now())
 		a.lastErr = ""
-		Log("optimize done: %d nodes, current=%s", len(best), cur)
+		Log("optimize done: stored %d optimised nodes, showing %d, current=%s",
+			len(best), len(a.mergedNodes()), cur)
 	}()
 	return true
+}
+
+// nodeExists reports whether a name is present in either node pool.
+func (a *App) nodeExists(name string) bool {
+	if name == "" {
+		return false
+	}
+	snap := a.store.Snapshot()
+	for _, p := range snap.Optimized {
+		if p.Name == name {
+			return true
+		}
+	}
+	for _, p := range snap.BaseNodes {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- subscriptions --------------------------------------------------------
@@ -520,9 +597,11 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 		}
 	}
 
-	// anything that changes the generated config needs a rewrite + reload
+	// anything that changes the generated config needs a rewrite + reload.
+	// keepNodes is deliberately NOT in this list: it only caps how many
+	// optimised nodes are shown, so changing it must not rewrite the config.
 	needReload := false
-	for _, k := range []string{"mixedPort", "apiPort", "directCNDomains", "blockAds", "customRules", "keepNodes"} {
+	for _, k := range []string{"mixedPort", "apiPort", "directCNDomains", "blockAds", "customRules"} {
 		if _, ok := patch[k]; ok {
 			needReload = true
 			break

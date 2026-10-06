@@ -96,10 +96,7 @@
             <div class="switch-title">自动优选</div>
             <div class="switch-desc">开启后 Zenith 自己按延迟挑最快的节点并切换；关闭后它绝不碰你的选择。</div>
           </div>
-          <label class="switch">
-            <input type="checkbox" id="sw-auto">
-            <span class="slider"></span>
-          </label>
+          <label class="switch"><input type="checkbox" id="sw-auto"><span class="slider"></span></label>
         </div>
       </div>
     </section>
@@ -108,7 +105,10 @@
     <section class="tab hidden" id="tab-nodes">
       <div class="toolbar">
         <input class="input search" id="node-search" type="search" placeholder="搜索节点名或服务器地址…">
-        <span class="hint" id="node-test-state"></span>
+        <div class="toolbar-note">
+          <span class="node-hint" id="node-hint"></span>
+          <span class="node-test-state" id="node-test-state"></span>
+        </div>
         <div class="spacer"></div>
         <button class="btn" id="btn-test-all">全部测速</button>
         <button class="btn" id="btn-direct">切到直连</button>
@@ -232,8 +232,7 @@
         <div class="form-row top-gap">
           <button class="btn" id="btn-core-restart">重启内核</button>
           <span class="hint" id="core-state-hint">—</span>
-        </div>
-      </div>
+        </div>      </div>
 
       <div class="card">
         <div class="card-head">
