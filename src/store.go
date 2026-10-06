@@ -90,6 +90,8 @@ type Settings struct {
 	// meta
 	WindowWidth  int    `json:"windowWidth"`
 	WindowHeight int    `json:"windowHeight"`
+	WindowX      int    `json:"windowX"` // remembered window position, 0 = let Windows choose
+	WindowY      int    `json:"windowY"`
 	LastProfile  string `json:"lastProfile"` // selected proxy group member
 }
 

@@ -26,12 +26,23 @@ jobs:
         with:
           go-version: '1.24'
 
+      - name: Icon resource
+        shell: pwsh
+        run: |
+          # icon.syso is committed, so this is a no-op unless the .ico changed.
+          # Regenerating keeps the executable's icon in step with the source.
+          if (-not (Test-Path src/icon.syso)) {
+            go install github.com/akavel/rsrc@latest
+            $rsrc = Join-Path $env:USERPROFILE 'go\bin\rsrc.exe'
+            & $rsrc -ico data/zenith.ico -o src/icon.syso -arch amd64
+          }
+
       - name: Build
         working-directory: src
         shell: pwsh
         run: |
           $env:CGO_ENABLED = '0'
-          go build -trimpath -ldflags '-s -w' -o ../Zenith.exe .
+          go build -trimpath -ldflags '-s -w -H=windowsgui' -o ../Zenith.exe .
           if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
       - name: Smoke test

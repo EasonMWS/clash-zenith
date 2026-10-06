@@ -15,6 +15,11 @@ import (
 const (
 	AppName    = "Zenith"
 	AppVersion = "1.0.0"
+
+	// coreStartGrace is how long the watchdog waits before it decides the core
+	// is broken. A first run against an empty data directory downloads the rule
+	// databases, which on a slow link takes a couple of minutes.
+	coreStartGrace = 4 * time.Minute
 )
 
 // ---------------------------------------------------------------------------
@@ -29,6 +34,7 @@ type App struct {
 
 	dataDir    string
 	logDir     string
+	rootDir    string
 	configPath string
 	secret     string
 	dnsPort    int
@@ -69,6 +75,7 @@ func NewApp(rootDir string) (*App, error) {
 	app := &App{
 		store:      store,
 		dataDir:    dataDir,
+		rootDir:    rootDir,
 		logDir:     logDir,
 		configPath: filepath.Join(dataDir, "config.yaml"),
 		secret:     "zenith-" + fmt.Sprint(time.Now().UnixNano()%1_000_000),
@@ -83,6 +90,32 @@ func NewApp(rootDir string) (*App, error) {
 }
 
 func goVersion() string { return runtime.Version() }
+
+// rebindDirs points the whole application at a different data directory and
+// rebuilds everything that had the old path baked in.
+//
+// This exists so a test run can never touch the real data directory, ports or
+// the registry: the store, the core, the optimiser and the system proxy helper
+// are all replaced, not merely reconfigured.
+func (a *App) rebindDirs(dataDir string) {
+	store, err := NewStore(dataDir)
+	if err != nil {
+		Log("rebind failed: %v", err, "ERR")
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.store = store
+	a.dataDir = dataDir
+	a.configPath = filepath.Join(dataDir, "config.yaml")
+	st := store.Settings()
+	a.dnsPort = st.MixedPort + 300
+	// the core always lives next to the executable, never inside the data dir
+	a.core = NewCore(filepath.Join(a.rootDir, "core", "mihomo.exe"),
+		dataDir, a.configPath, a.secret, st.ControlPort)
+	a.opt = NewOptimizer(dataDir)
+	a.sysproxy = NewSystemProxy(dataDir)
+}
 
 // ---- geodata bootstrap ----------------------------------------------------
 
@@ -266,6 +299,7 @@ func (a *App) bootCore() {
 // background runs the housekeeping loop: core watchdog, dead proxy guard,
 // scheduled subscription refresh and scheduled optimisation.
 func (a *App) background() {
+	started := time.Now()
 	lastSub := time.Now()
 	lastOpt := time.Now()
 	// Latch on whether the proxy is ALREADY ours at startup, rather than
@@ -287,6 +321,14 @@ func (a *App) background() {
 		st := a.store.Settings()
 
 		if !a.core.IsUp() {
+			// Give the core room to finish its first start. A brand new data
+			// directory has no rule databases yet, so mihomo downloads them and
+			// that takes far longer than the health check interval. Restarting
+			// it mid-download looped forever, because every restart began the
+			// same download again and the core never got to answer.
+			if time.Since(started) < coreStartGrace {
+				continue
+			}
 			if a.core.Ensure() {
 				a.lastErr = ""
 			}

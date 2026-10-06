@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
+	"io"
+	"net/http"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -26,8 +32,19 @@ func main() {
 		noProxy  = flag.Bool("no-proxy", false, "run without touching the system proxy")
 		version  = flag.Bool("version", false, "print the version and exit")
 		portFlag = flag.Int("port", 0, "UI port (default 7799)")
+		dataFlag = flag.String("datadir", "", "use a different data directory")
 	)
 	flag.Parse()
+
+	// A GUI-subsystem binary has no console, so an unhandled panic would vanish
+	// without a trace. Catch it and put it in the log instead.
+	defer func() {
+		if r := recover(); r != nil {
+			Log("PANIC: %v\n%s", r, debug.Stack(), "ERR")
+			Info(AppName, fmt.Sprintf("Zenith 遇到内部错误并已停止：\n%v\n\n详情见 logs/zenith.log", r))
+			os.Exit(1)
+		}
+	}()
 
 	if *version {
 		fmt.Printf("%s %s (%s)\n", AppName, AppVersion, goVersion())
@@ -47,6 +64,27 @@ func main() {
 	app, err := NewApp(rootDir)
 	if err != nil {
 		fatal("initialisation failed: %v", err)
+	}
+	if *dataFlag != "" {
+		// Isolated run: used for testing so the real data directory, ports and
+		// system proxy are untouched.
+		abs, aerr := filepath.Abs(*dataFlag)
+		if aerr != nil {
+			fatal("bad -datadir: %v", aerr)
+		}
+		if err := os.MkdirAll(abs, 0o755); err != nil {
+			fatal("cannot create -datadir: %v", err)
+		}
+		free := abs + string(os.PathSeparator) + "free.flag"
+		if _, err := os.Stat(free); err != nil {
+			// First use of this directory: start from defaults and never take
+			// the system proxy.
+			_ = os.WriteFile(free, []byte("1"), 0o644)
+			_ = os.WriteFile(filepath.Join(abs, "state.json"),
+				[]byte(`{"settings":{"systemProxy":false}}`), 0o644)
+		}
+		app.rebindDirs(abs)
+		Log("isolated run: data dir=%s, system proxy disabled", abs, "WARN")
 	}
 	st := app.store.Settings()
 	uiPort := st.UIPort
@@ -94,28 +132,220 @@ func main() {
 		select {}
 	}
 
-	proc, err := openWindow(uiPort, st, *browser, app.dataDir)
-	if err != nil {
-		fmt.Printf("could not open a window: %v\nUI: http://127.0.0.1:%d/\n", err, uiPort)
-		select {}
+	// The tray icon is the application's home now. Closing the window hides it
+	// instead of quitting, so the proxy keeps running and the user gets it back
+	// from the tray - which is also the only place that really quits.
+	tray := NewTray()
+	wireTray(tray, app, srv, uiPort)
+	iconPath := filepath.Join(rootDir, "data", "zenith.ico")
+	go func() {
+		if err := tray.Run(iconPath, AppName); err != nil {
+			Log("tray icon unavailable: %v", err, "WARN")
+			return
+		}
+		Log("tray icon ready")
+	}()
+	select {
+	case <-tray.Ready():
+	case <-time.After(5 * time.Second):
+		Log("tray icon did not come up in time; the window still works", "WARN")
 	}
 
-	// watchWindow calls Shutdown when the UI window really goes away. It can
-	// also return early: Chromium may hand the URL to an already running
-	// process, and the window count can fail to resolve. In those cases the
-	// backend MUST stay alive - letting the main goroutine fall through here
-	// used to end the process while the window was still on screen.
-	watchWindow(proc, uiPort, func() { app.Shutdown() })
-	Log("window watcher finished; Zenith keeps serving the open window")
+	if wp, werr := openWindow(uiPort, st, *browser, app.dataDir); werr != nil {
+		Log("could not open a window: %v (the tray can still open it)", werr, "WARN")
+	} else {
+		windowProc.Store(wp)
+	}
 
-	// Fallback: also stop when no Zenith window remains, checked slowly so a
-	// transient query failure can never kill a live session.
-	for {
-		time.Sleep(20 * time.Second)
-		if n := countWindows(uiPort); n == 0 {
-			Log("no Zenith window left; shutting down")
-			app.Shutdown()
+	// Update the hover text with the live node and latency, so the tray is
+	// useful without opening anything.
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			st := app.Status()
+			cur, _ := st["current"].(string)
+			if cur == "" {
+				cur = "未选择节点"
+			}
+			delay := 0
+			if nodes, ok := st["nodes"].([]map[string]interface{}); ok {
+				for _, n := range nodes {
+					if act, _ := n["active"].(bool); act {
+						if d, ok := n["delay"].(int); ok {
+							delay = d
+						}
+						break
+					}
+				}
+			}
+			tip := fmt.Sprintf("%s · %s", AppName, cur)
+			if delay > 0 {
+				tip = fmt.Sprintf("%s · %s · %dms", AppName, cur, delay)
+			}
+			tray.SetTip(tip)
 		}
+	}()
+
+	// Keep the backend alive for as long as the process runs. The window may be
+	// closed and reopened many times; only the tray's 退出 does a real shutdown.
+	select {}
+}
+
+// ---- tray menu ------------------------------------------------------------
+
+// Menu ids. Small positive numbers; the tray dispatches on wParam.
+const (
+	idShowWindow = 1 + iota
+	idOpenBrowser
+	idModeRule
+	idModeGlobal
+	idModeDirect
+	idSysProxy
+	idOptimize
+	idOpenSubs
+	idOpenSettings
+	idQuit
+)
+
+// apiPost talks to our own local server, so a tray action behaves exactly like
+// the same click in the interface - including the validation and the errors.
+func apiPost(port int, path string, body interface{}) map[string]interface{} {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return map[string]interface{}{"ok": false, "error": err.Error()}
+	}
+	req, err := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("http://127.0.0.1:%d%s", port, path), bytes.NewReader(raw))
+	if err != nil {
+		return map[string]interface{}{"ok": false, "error": err.Error()}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return map[string]interface{}{"ok": false, "error": err.Error()}
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var out map[string]interface{}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return map[string]interface{}{"ok": false, "error": strings.TrimSpace(string(data))}
+	}
+	return out
+}
+
+// windowProc tracks the browser process that is currently showing the UI.
+//
+// Counting windows through the shell is not reliable enough to decide whether a
+// window already exists: the query can fail or lag, and the result was a second
+// window stacked on top of the first. The process handle is authoritative, and
+// Chromium's own single-instance behaviour covers the case where the handle is
+// stale because the browser handed the URL to an existing process.
+var windowProc atomic.Pointer[os.Process]
+
+func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
+	// Opening the window is idempotent: a live window process means the UI is up.
+	bringUp := func() {
+		if p := windowProc.Load(); p != nil && processAlive(p) {
+			Log("window is already open (pid %d)", p.Pid)
+			return
+		}
+		st := app.store.Settings()
+		p, err := openWindow(uiPort, st, false, app.dataDir)
+		if err != nil {
+			Log("could not open the window: %v", err, "WARN")
+			Info(AppName, fmt.Sprintf("无法打开窗口：%v\n\n界面地址：http://127.0.0.1:%d/", err, uiPort))
+			return
+		}
+		windowProc.Store(p)
+	}
+
+	tray.On(idShowWindow, bringUp)
+	tray.On(idOpenBrowser, func() {
+		st := app.store.Settings()
+		if _, err := openWindow(uiPort, st, true, app.dataDir); err != nil {
+			Log("could not open the browser: %v", err, "WARN")
+		}
+	})
+	tray.On(idModeRule, func() { trayMode(app, "rule") })
+	tray.On(idModeGlobal, func() { trayMode(app, "global") })
+	tray.On(idModeDirect, func() { trayMode(app, "direct") })
+	tray.On(idSysProxy, func() {
+		cur := app.store.Settings().SystemProxy
+		if r := apiPost(uiPort, "/api/system-proxy", map[string]interface{}{"enabled": !cur}); r["ok"] != true {
+			Info(AppName, fmt.Sprintf("切换系统代理失败：%v", r["error"]))
+		}
+	})
+	tray.On(idOptimize, func() {
+		if r := apiPost(uiPort, "/api/optimize", nil); r["ok"] != true {
+			Info(AppName, fmt.Sprintf("无法开始优选：%v", r["error"]))
+			return
+		}
+		Info(AppName, "已开始优选边缘节点。\n过程中可以正常上网，完成后会自动切换。")
+	})
+	tray.On(idOpenSubs, func() {
+		bringUp()
+		Info(AppName, "订阅管理在界面左侧的「订阅」页。")
+	})
+	tray.On(idOpenSettings, func() {
+		bringUp()
+		Info(AppName, "设置与关于在界面左侧的「设置」页。")
+	})
+	tray.On(idQuit, func() {
+		if !Confirm(AppName, "退出 Zenith？\n\n会同时停止代理并还原系统代理设置。") {
+			return
+		}
+		// tear the tray down first so no ghost icon is left in the notification area
+		tray.Stop()
+		select {
+		case <-tray.closed:
+		case <-time.After(2 * time.Second):
+		}
+		app.Shutdown()
+	})
+
+	// The menu is rebuilt every time it opens, so the ticks and the labels can
+	// never be stale.
+	tray.SetMenu(func() []menuItem {
+		st := app.Status()
+		mode, _ := st["mode"].(string)
+		optimizing, _ := st["optimizing"].(bool)
+		sysProxy, _ := st["settings"].(Settings)
+		proxyOn := false
+		if ps, ok := st["systemProxy"].(ProxyState); ok {
+			proxyOn = ps.Enabled && ps.Owner == "zenith"
+		}
+		_ = sysProxy
+
+		items := []menuItem{
+			{id: idShowWindow, label: "打开 Zenith 窗口"},
+			{id: idOpenBrowser, label: "在浏览器中打开"},
+			{separate: true},
+			{id: idModeRule, label: "规则模式", checked: mode == "rule"},
+			{id: idModeGlobal, label: "全局模式", checked: mode == "global"},
+			{id: idModeDirect, label: "直连模式", checked: mode == "direct"},
+			{separate: true},
+			{id: idSysProxy, label: "系统代理", checked: proxyOn},
+		}
+		if optimizing {
+			items = append(items, menuItem{id: idOptimize, label: "正在优选…", disabled: true})
+		} else {
+			items = append(items, menuItem{id: idOptimize, label: "立即优选节点"})
+		}
+		items = append(items,
+			menuItem{separate: true},
+			menuItem{id: idOpenSubs, label: "订阅管理"},
+			menuItem{id: idOpenSettings, label: "设置与关于"},
+			menuItem{separate: true},
+			menuItem{id: idQuit, label: "退出 Zenith"},
+		)
+		return items
+	})
+}
+
+func trayMode(app *App, mode string) {
+	if err := app.SetMode(mode); err != nil {
+		Info(AppName, fmt.Sprintf("切换模式失败：%v", err))
 	}
 }
 
@@ -177,7 +407,8 @@ func stopRunning(rootDir string) {
 // ---- window ---------------------------------------------------------------
 
 // openWindow launches the UI in a chromeless app window. A private profile is
-// used so it never merges with the user's normal browser session.
+// used so it never merges with the user's normal browser session, and so the
+// window size and position flags are honoured on every launch.
 func openWindow(port int, st Settings, forceBrowser bool, dataDir string) (*os.Process, error) {
 	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
 	if forceBrowser {
@@ -189,6 +420,7 @@ func openWindow(port int, st Settings, forceBrowser bool, dataDir string) (*os.P
 	}
 	profileDir := filepath.Join(dataDir, "ui-profile")
 	_ = os.MkdirAll(profileDir, 0o755)
+
 	w, h := st.WindowWidth, st.WindowHeight
 	if w <= 0 {
 		w = 1200
@@ -196,6 +428,9 @@ func openWindow(port int, st Settings, forceBrowser bool, dataDir string) (*os.P
 	if h <= 0 {
 		h = 780
 	}
+
+	// Reuse an existing window when one is already open: without a stable
+	// profile lock Chromium would just stack another window on every call.
 	args := []string{
 		"--app=" + url,
 		"--user-data-dir=" + profileDir,
@@ -204,6 +439,10 @@ func openWindow(port int, st Settings, forceBrowser bool, dataDir string) (*os.P
 		"--no-default-browser-check",
 		"--disable-features=Translate,msEdgeIdentityFeatures",
 	}
+	if st.WindowX != 0 || st.WindowY != 0 {
+		args = append(args, fmt.Sprintf("--window-position=%d,%d", st.WindowX, st.WindowY))
+	}
+
 	cmd := exec.Command(exe, args...)
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -231,6 +470,32 @@ func findBrowser() string {
 	return ""
 }
 
+// processAlive reports whether a tracked process is still running.
+//
+// Go caches the exit code of a Process it has already reaped, so both Signal(0)
+// and a fresh FindProcess can keep answering "alive" long after the process is
+// gone. That made the tray refuse to reopen a closed window. The Win32 wait
+// primitive answers the real question.
+func processAlive(p *os.Process) bool {
+	if p == nil || p.Pid <= 0 {
+		return false
+	}
+	const (
+		processQueryLimitedInformation = 0x1000
+		synchronize                    = 0x00100000
+		waitTimeout                    = 0x00000102
+	)
+	k := syscall.NewLazyDLL("kernel32.dll")
+	h, _, _ := k.NewProc("OpenProcess").Call(
+		processQueryLimitedInformation|synchronize, 0, uintptr(p.Pid))
+	if h == 0 {
+		return false // cannot open it, so it is gone
+	}
+	defer k.NewProc("CloseHandle").Call(h)
+	ret, _, _ := k.NewProc("WaitForSingleObject").Call(h, 0)
+	return uint32(ret) == waitTimeout
+}
+
 // countWindows reports how many Zenith UI windows exist. It returns -1 when the
 // answer cannot be determined; callers must treat that as unknown and never
 // shut down because of it.
@@ -254,49 +519,6 @@ func countWindows(port int) int {
 	return n
 }
 
-// watchWindow stops the app when the window really goes away. A spawned browser
-// process dying is not proof the window closed: Chromium hands the URL to an
-// existing instance and our process exits at once.
-func watchWindow(proc *os.Process, port int, onClose func()) {
-	if proc == nil {
-		return
-	}
-	started := time.Now()
-	gone := 0
-	for {
-		time.Sleep(3 * time.Second)
-		if processAlive(proc) {
-			continue
-		}
-		n := countWindows(port)
-		if n < 0 {
-			Log("could not determine the window count, keeping Zenith running", "WARN")
-			continue
-		}
-		if n > 0 {
-			Log("window process handed off; %d window(s) still open", n)
-			return
-		}
-		if time.Since(started) < 20*time.Second {
-			Log("window process exited during the settle period, keeping Zenith running", "WARN")
-			return
-		}
-		gone++
-		if gone >= 2 {
-			Log("window closed -> shutting down")
-			onClose()
-			return
-		}
-		time.Sleep(3 * time.Second)
-	}
-}
-
-func processAlive(p *os.Process) bool {
-	if p == nil {
-		return false
-	}
-	return p.Signal(syscall.Signal(0)) == nil
-}
 
 func hiddenCommand(name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)

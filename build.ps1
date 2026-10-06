@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 #  Zenith build script
 #
 #  Compiles src/ into Zenith.exe in the repository root.
@@ -63,12 +63,45 @@ if ($Clean) {
     }
 }
 
+# ---------------------------------------------------------------- icon
+# Windows reads the executable's icon from a resource section, which Go cannot
+# emit on its own. icon.syso is committed so a normal build needs nothing extra;
+# this step only regenerates it when the .ico is newer than the .syso, and it
+# degrades to a warning when no resource compiler is available.
+$icoPath = Join-Path $Root 'data\zenith.ico'
+$sysoPath = Join-Path $SrcDir 'icon.syso'
+if (Test-Path $icoPath) {
+    $needIcon = -not (Test-Path $sysoPath)
+    if (-not $needIcon) {
+        $needIcon = (Get-Item $icoPath).LastWriteTime -gt (Get-Item $sysoPath).LastWriteTime
+    }
+    if ($needIcon) {
+        $rsrc = $null
+        foreach ($c in @((Join-Path (Split-Path $go -Parent) 'rsrc.exe'),
+                         (Join-Path $env:USERPROFILE 'go\bin\rsrc.exe'))) {
+            if (Test-Path $c) { $rsrc = $c; break }
+        }
+        if ($rsrc) {
+            Write-Step '生成图标资源…'
+            & $rsrc -ico $icoPath -o $sysoPath -arch amd64
+            if ($LASTEXITCODE -ne 0) { Write-Step '  图标生成失败，将使用默认图标' 'Yellow' }
+        } else {
+            Write-Step 'icon.syso 已是最新；如需重新生成请安装 rsrc：' 'Yellow'
+            Write-Step '  go install github.com/akavel/rsrc@latest' 'Yellow'
+        }
+    }
+}
+
 # ---------------------------------------------------------------- build
 Write-Step '编译中…'
 Push-Location $SrcDir
 try {
     $env:CGO_ENABLED = '0'
-    $args = @('build', '-trimpath', '-ldflags', '-s -w', '-o', $OutExe)
+    # -H=windowsgui makes this a GUI-subsystem binary. Without it Windows
+    # allocates a console window on every launch, and closing that console
+    # kills the process (CTRL_CLOSE_EVENT) - which looked like "closing the
+    # black window shuts Zenith down".
+    $args = @('build', '-trimpath', '-ldflags', '-s -w -H=windowsgui', '-o', $OutExe)
     if ($Race) { $args += '-race' }
     $args += '.'
     & $go @args
@@ -81,12 +114,40 @@ $exe = Get-Item $OutExe
 Write-Step ("编译完成: {0}  ({1:N1} MB)" -f $exe.Name, ($exe.Length / 1MB)) 'Green'
 
 # ---------------------------------------------------------------- smoke test
-Write-Step '快速自检…'
-$ver = & $OutExe -version 2>&1
-Write-Step "  $ver" 'Green'
+# A GUI-subsystem binary has no console, so its stdout goes nowhere and
+# "-version" cannot be captured. The checks are therefore on the artefact: its
+# size, its PE subsystem, and whether the icon resource made it in.
+Write-Step '检查产物…'
+if ($exe.Length -lt 2MB) {
+    throw "产物异常小 ($([math]::Round($exe.Length/1KB,1)) KB)，编译可能失败了"
+}
+
+$fs = [System.IO.File]::OpenRead($OutExe)
+try {
+    $br = New-Object System.IO.BinaryReader($fs)
+    $fs.Position = 0x3C
+    $peOff = $br.ReadInt32()
+    $fs.Position = $peOff + 24 + 68
+    $subsystem = $br.ReadUInt16()
+} finally { $fs.Close() }
+if ($subsystem -eq 2) {
+    Write-Step '  GUI 子系统：双击不会弹出命令行窗口' 'Green'
+} else {
+    Write-Step "  警告：子系统为 $subsystem（应为 2），运行时会弹出命令行窗口" 'Yellow'
+}
+
+$bytes = [System.IO.File]::ReadAllBytes($OutExe)
+$hasRsrc = $false
+for ($i = 0; $i -lt $bytes.Length - 5; $i++) {
+    if ($bytes[$i] -eq 0x2E -and $bytes[$i + 1] -eq 0x72 -and $bytes[$i + 2] -eq 0x73 -and
+        $bytes[$i + 3] -eq 0x72 -and $bytes[$i + 4] -eq 0x63) { $hasRsrc = $true; break }
+}
+if ($hasRsrc) { Write-Step '  图标资源：已嵌入' 'Green' }
+else { Write-Step '  图标资源：缺失（exe 会显示默认图标）' 'Yellow' }
 
 Write-Host ''
 Write-Host '接下来：' -ForegroundColor Cyan
 Write-Host '  双击 Zenith.exe 即可运行'
+Write-Host '  关闭窗口不会退出：程序留在系统托盘，右键托盘图标才能退出'
 Write-Host '  只跑后端：  .\Zenith.exe -headless'
 Write-Host '  停止运行：  .\Zenith.exe -stop'
