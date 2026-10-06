@@ -210,7 +210,12 @@ func dedupeNames(in []Proxy) []Proxy {
 }
 
 // BuildConfig renders mihomo's config.yaml.
-func BuildConfig(nodes []Proxy, st Settings, secret string, current string, dnsPort int) string {
+//
+// optimised names the nodes that came from the edge scan; they are the ones the
+// AUTO group is allowed to choose between, because they are the only ones Zenith
+// has actually verified. The subscription's own nodes are still listed in PROXY
+// so they can be picked by hand.
+func BuildConfig(nodes []Proxy, optimised []string, st Settings, secret string, current string, dnsPort int) string {
 	nodes = dedupeNames(nodes)
 	var b strings.Builder
 
@@ -255,18 +260,36 @@ func BuildConfig(nodes []Proxy, st Settings, secret string, current string, dnsP
 	}
 
 	b.WriteString("\nproxy-groups:\n")
-	// A url-test group so the core keeps picking the fastest node on its own,
-	// and a select group so the user can pin one. The select group is what the
-	// UI drives; when the user has not pinned anything it follows AUTO.
+	// AUTO is a url-test group, but it only ever contains nodes the optimiser
+	// verified. Mixing the subscription's own nodes in used to make the core
+	// wander onto a node Zenith had not measured, which is the opposite of what
+	// "use the fastest verified node" means.
+	//
+	// The group is still useful even though Zenith also enforces the choice
+	// itself: it gives the core an immediate answer, and it is what the PROXY
+	// group follows when the user has not pinned anything.
+	autoMembers := make([]string, 0, len(optimised))
+	seenAuto := make(map[string]bool, len(optimised))
+	for _, n := range optimised {
+		if contains(names, n) && !seenAuto[n] {
+			seenAuto[n] = true
+			autoMembers = append(autoMembers, n)
+		}
+	}
+	if len(autoMembers) == 0 {
+		// nothing verified yet: fall back to everything so the proxy still works
+		autoMembers = append(autoMembers, names...)
+	}
+
 	b.WriteString("  - name: \"AUTO\"\n")
 	b.WriteString("    type: url-test\n")
 	b.WriteString("    url: \"https://www.gstatic.com/generate_204\"\n")
 	b.WriteString("    interval: 180\n")
 	b.WriteString("    tolerance: 120\n")
 	b.WriteString("    lazy: false\n")
-	if len(names) > 0 {
+	if len(autoMembers) > 0 {
 		b.WriteString("    proxies:\n")
-		for _, n := range names {
+		for _, n := range autoMembers {
 			fmt.Fprintf(&b, "      - %s\n", q(n))
 		}
 	} else {

@@ -115,9 +115,16 @@
         <div class="switch-row">
           <div class="switch-text">
             <div class="switch-title">自动优选</div>
-            <div class="switch-desc">开启后 Zenith 自己按延迟挑最快的节点并切换；关闭后它绝不碰你的选择。</div>
+            <div class="switch-desc">开启后 Zenith 每 30 分钟重新测一遍边缘 IP，把最快的写进节点列表；关闭后它绝不碰你的节点。</div>
           </div>
           <label class="switch"><input type="checkbox" id="sw-auto"><span class="slider"></span></label>
+        </div>
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">自动用最快的<span class="badge" id="fastest-badge">—</span></div>
+            <div class="switch-desc">始终切到优选节点里实测最快的那一个。按优选时真的握手延迟排序，比内核自己 ping 更准。</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="sw-pick"><span class="slider"></span></label>
         </div>
       </div>
     </section>

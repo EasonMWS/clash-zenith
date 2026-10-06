@@ -37,7 +37,11 @@ type Proxy struct {
 	WSOpts            map[string]interface{} `json:"ws-opts,omitempty"`
 	GrpcOpts          map[string]interface{} `json:"grpc-opts,omitempty"`
 	H2Opts            map[string]interface{} `json:"h2-opts,omitempty"`
-	Extra             map[string]interface{} `json:"-"`
+	// MeasuredMS is the WebSocket handshake time the optimiser measured for this
+	// edge, in milliseconds. It is what auto-pick ranks by, so the choice is
+	// based on the real tunnel rather than on a ping.
+	MeasuredMS float64                `json:"measuredMs,omitempty"`
+	Extra      map[string]interface{} `json:"-"`
 }
 
 // Subscription is one user added source of nodes.
@@ -71,6 +75,7 @@ type Settings struct {
 
 	// optimisation
 	AutoOptimize        bool `json:"autoOptimize"`        // false => the user is in control
+	AutoPickOff         bool `json:"autoPickOff"`         // stored inverted so the default is ON for older settings files
 	OptimizeIntervalMin int  `json:"optimizeIntervalMin"` //
 	OptimizeOnStart     bool `json:"optimizeOnStart"`     //
 	KeepNodes           int  `json:"keepNodes"`           // how many winners to keep
@@ -106,6 +111,7 @@ func defaultSettings() Settings {
 		StartMinimized:            false,
 		Language:                  "zh-CN",
 		AutoOptimize:              true,
+		AutoPickOff:               false, // auto-pick is on by default
 		OptimizeIntervalMin:       30,
 		OptimizeOnStart:           false,
 		KeepNodes:                 16,

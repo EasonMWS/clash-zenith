@@ -40,6 +40,7 @@ winners. The core hot-reloads that config in place.
 | **No stray console window** | Built as a GUI binary, so double clicking it opens only the interface |
 | **Multiple subscriptions** | Add, switch, refresh and delete any number of them from the UI |
 | **Automatic edge optimisation** | Scans a candidate pool, verifies each edge with a real WebSocket handshake, keeps the fastest N |
+| **Always uses the fastest verified node** | Auto-pick ranks by the handshake time Zenith actually measured, not by a ping. A big win switches at once; a marginal one has to hold for 45 seconds before it is trusted, so measurement noise never bounces you between equivalent nodes |
 | **Handles mixed subscriptions** | A subscription may mix several relays with direct nodes (Singapore / Japan / US). Every WebSocket tunnel is optimised on its own; direct nodes are left exactly as they are |
 | **Manual / automatic control** | One switch. On: Zenith keeps picking the fastest node. Off: it never touches your choice |
 | **Three modes** | Rule based split routing, global proxy, direct |
@@ -174,6 +175,7 @@ Zenith 是一个自用的 Windows 代理客户端，内核是
 | **不会多弹命令行** | 编译为 GUI 子系统程序，双击只出界面 |
 | **多订阅** | 界面上添加、切换、刷新、删除任意多个订阅 |
 | **自动优选** | 扫描候选池，用真实 WebSocket 握手验证每个边缘，保留最快的若干个 |
+| **自动用最快的** | 按优选时**真实握手延迟**排序，比内核自己 ping 更准。差距大立刻切，差距小先观察 45 秒确认，噪声级别（<12ms）不动，所以你不会被在几个差不多的节点之间来回甩 |
 | **支持混合订阅** | 订阅里可能既有中转又有直连节点（新加坡 / 日本 / 美国）。每个 WebSocket 中转各优选一批，直连节点原样保留、绝不改动 |
 | **手动 / 自动开关** | 一个开关。打开时它自动挑最快的；关闭后它绝不碰你的选择 |
 | **三种模式** | 规则分流、全局代理、直连 |

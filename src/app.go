@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,10 @@ type App struct {
 	mu          sync.Mutex
 	optimizing  bool
 	lastErr     string
+	// pending auto-pick: a marginal win has to persist before it is acted on
+	pickCandidate string
+	pickSince     time.Time
+	pickWatching  bool
 	quitting    bool
 	stopCh      chan struct{}
 	onQuit      func()
@@ -221,6 +226,16 @@ func downloadFile(url, dest string) error {
 	return os.Rename(tmp, dest)
 }
 
+// ---- settings translation ---
+// copyPatch clones a settings patch so translating a key cannot mutate the
+// caller's map.
+func copyPatch(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
 // ---- startup --------------------------------------------------------------
 
 // Boot prepares the config and starts the core in the BACKGROUND.
@@ -349,6 +364,17 @@ func (a *App) background() {
 		}
 		a.sysproxy.GuardDeadProxy()
 
+		// Keep the fastest verified node in use. The core's own url-test only
+		// knows whether a node answers a 204 probe; Zenith knows the real
+		// WebSocket handshake time it measured. This reuses that measurement so
+		// "自动" means the fastest node Zenith actually proved, not the fastest
+		// one that happens to answer a ping.
+		if !st.AutoPickOff && a.core.IsUp() && !a.opt.Running() {
+			if picked, changed := a.enforceFastest(); changed {
+				Log("auto-pick: switched to the fastest verified node %q (%.0fms)", picked.Name, picked.delay)
+			}
+		}
+
 		if st.SubscriptionAutoUpdate {
 			due := lastSub.Add(time.Duration(st.SubscriptionIntervalHours) * time.Hour)
 			if time.Now().After(due) {
@@ -368,6 +394,161 @@ func (a *App) background() {
 			}
 		}
 	}
+}
+
+// pickResult is what enforceFastest decided.
+type pickResult struct {
+	Name  string
+	delay float64
+}
+
+// Auto-pick thresholds, in milliseconds.
+//
+// Two jobs pull in opposite directions: follow the fastest node, and do not
+// bounce the user between near-identical nodes because of measurement noise.
+// The compromise is tiered - a big win moves at once, a marginal win has to
+// prove itself by holding for a while, and anything under noiseFloor is ignored
+// outright.
+const (
+	pickNoiseFloorMS = 12 // differences below this are noise, never act
+	pickForceMS      = 60 // a win this large switches immediately
+	pickForceRatio   = 0.20
+	pickPatience     = 45 * time.Second
+	pickPatienceSecs = 45
+)
+
+// resetPickWatch forgets any pending auto-pick. Called whenever the situation
+// no longer calls for a switch, so the next candidate starts its wait fresh.
+func (a *App) resetPickWatch() {
+	a.mu.Lock()
+	a.pickCandidate = ""
+	a.pickSince = time.Time{}
+	a.pickWatching = false
+	a.mu.Unlock()
+}
+// enforceFastest makes sure the fastest verified node is the one in use.
+//
+// Ranking uses the handshake time the optimiser actually measured, not the
+// core's url-test, which only learns whether a node answers a 204 probe.
+func (a *App) enforceFastest() (pickResult, bool) {
+	optimized, _ := a.nodeSet()
+	if len(optimized) < 2 {
+		return pickResult{}, false
+	}
+
+	// MeasuredMS is only set by scans run after this feature existed, so the
+	// number embedded in the node name is used as a fallback for older nodes.
+	best := Proxy{}
+	bestMS := 0.0
+	for _, p := range optimized {
+		ms := p.MeasuredMS
+		if ms <= 0 {
+			ms = latencyFromName(p.Name)
+		}
+		if ms <= 0 {
+			continue
+		}
+		if bestMS == 0 || ms < bestMS {
+			best, bestMS = p, ms
+		}
+	}
+	if bestMS == 0 {
+		return pickResult{}, false
+	}
+
+	proxies, err := a.core.Proxies()
+	if err != nil {
+		return pickResult{}, false
+	}
+	current := ""
+	if g, ok := proxies["PROXY"]; ok {
+		current = g.Now
+	}
+	if current == best.Name {
+		a.resetPickWatch()
+		return pickResult{}, false
+	}
+
+	curMS := 0.0
+	currentIsOptimised := false
+	for _, p := range optimized {
+		if p.Name == current {
+			currentIsOptimised = true
+			curMS = p.MeasuredMS
+			if curMS <= 0 {
+				curMS = latencyFromName(p.Name)
+			}
+			break
+		}
+	}
+	if curMS <= 0 {
+		if status, ok := proxies[current]; ok && status.Delay > 0 {
+			curMS = float64(status.Delay)
+		}
+	}
+
+	// A subscription node the user pinned by hand is left alone: this feature
+	// chooses among verified edges, it does not override a deliberate choice.
+	// A dead node is still replaced, because a dead node is not a choice.
+	if !currentIsOptimised && current != "" && current != "AUTO" {
+		if curMS > 0 {
+			return pickResult{}, false
+		}
+	}
+
+	// Nothing to fix when the current node is already effectively the fastest,
+	// or when the difference is inside the noise band.
+	if curMS > 0 {
+		delta := curMS - bestMS
+		if delta < pickNoiseFloorMS {
+			a.resetPickWatch()
+			return pickResult{}, false
+		}
+		if delta < pickForceMS && bestMS > curMS*(1-pickForceRatio) {
+			// A win worth having, but not an emergency. Wait for it to persist,
+			// so a single noisy measurement cannot move the user.
+			a.mu.Lock()
+			if !a.pickWatching || a.pickCandidate != best.Name {
+				a.pickCandidate = best.Name
+				a.pickSince = time.Now()
+				a.pickWatching = true
+				a.mu.Unlock()
+				Log("auto-pick: %q is %.0fms faster than %q; confirming for %d seconds",
+					best.Name, delta, current, pickPatienceSecs)
+				return pickResult{}, false
+			}
+			held := time.Since(a.pickSince)
+			a.mu.Unlock()
+			if held < pickPatience {
+				return pickResult{}, false
+			}
+		}
+	}
+
+	if err := a.core.Select("PROXY", best.Name); err != nil {
+		return pickResult{}, false
+	}
+	a.core.CloseConnections()
+	_ = a.store.SetCurrent(best.Name)
+	a.resetPickWatch()
+	return pickResult{Name: best.Name, delay: bestMS}, true
+}
+
+// latencyFromName reads the "123ms" suffix the optimiser writes into a node
+// name. It exists so nodes stored before MeasuredMS was introduced still rank
+// correctly instead of being ignored.
+func latencyFromName(name string) float64 {
+	i := strings.LastIndex(name, " · ")
+	if i < 0 {
+		return 0
+	}
+	tail := name[i+len(" · "):]
+	tail = strings.TrimSuffix(strings.TrimSpace(tail), "ms")
+	v, err := strconv.ParseFloat(tail, 64)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 // nodeSet returns the two node pools, with the optimised list capped by the
@@ -416,7 +597,14 @@ func (a *App) mergedNodes() []Proxy {
 // ---- config ---------------------------------------------------------------
 
 func (a *App) writeConfig(nodes []Proxy, st Settings) {
-	cfg := BuildConfig(nodes, st, a.secret, a.store.Snapshot().Current, a.dnsPort)
+	// The AUTO group must only span nodes the optimiser verified, so its members
+	// are passed separately from the full list.
+	optimized, _ := a.nodeSet()
+	optNames := make([]string, 0, len(optimized))
+	for _, p := range optimized {
+		optNames = append(optNames, p.Name)
+	}
+	cfg := BuildConfig(nodes, optNames, st, a.secret, a.store.Snapshot().Current, a.dnsPort)
 	if err := os.WriteFile(a.configPath, []byte(cfg), 0o644); err != nil {
 		Log("could not write config: %v", err, "ERR")
 	}
@@ -464,6 +652,23 @@ func (a *App) Status() map[string]interface{} {
 	optimized, base := a.nodeSet()
 	isOptimized := len(optimized) > 0
 
+	// Report the fastest verified node and its measured time so the interface
+	// can say what "自动" is aiming at, rather than leaving it a black box.
+	fastest := Proxy{}
+	fastestMS := 0.0
+	for _, p := range optimized {
+		ms := p.MeasuredMS
+		if ms <= 0 {
+			ms = latencyFromName(p.Name)
+		}
+		if ms <= 0 {
+			continue
+		}
+		if fastestMS == 0 || ms < fastestMS {
+			fastest, fastestMS = p, ms
+		}
+	}
+
 	// Two pools, optimised edges first. A subscription node that happens to
 	// carry the same name as an optimised one is listed once.
 	all := make([]Proxy, 0, len(optimized)+len(base))
@@ -506,7 +711,10 @@ func (a *App) Status() map[string]interface{} {
 		"coreUptime":   a.core.Uptime(),
 		"mode":         st.Mode,
 		"current":      current,
-		"autoPick":     autoPick,
+		"autoPick":     autoPick, // what the core's AUTO group currently chooses
+		"autoPickOn":   !st.AutoPickOff,
+		"fastestName":  fastest.Name,
+		"fastestMS":    fastestMS,
 		"nodes":        list,
 		"nodeCount":    len(list),
 		"optCount":     len(optimized),
@@ -783,6 +991,15 @@ func (a *App) SelectSubscription(id string) (int, error) {
 // ---- settings -------------------------------------------------------------
 
 func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
+	// The interface toggles "autoPick", but the stored field is the inverse
+	// ("autoPickOff") so that older settings files default to ON.
+	if v, ok := patch["autoPick"]; ok {
+		if on, isBool := v.(bool); isBool {
+			patch = copyPatch(patch)
+			patch["autoPickOff"] = !on
+			delete(patch, "autoPick")
+		}
+	}
 	before := a.store.Settings()
 	next, err := a.store.UpdateSettings(patch)
 	if err != nil {
@@ -816,6 +1033,14 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 	if mp, ok := patch["mixedPort"].(int); ok && mp > 0 && mp != before.MixedPort {
 		a.core = NewCore(a.core.exePath, a.core.dataDir, a.configPath, a.secret, next.ControlPort)
 		_ = a.core.Start()
+	}
+	// Switching auto-pick on should take effect at once, not on the next tick.
+	if v, ok := patch["autoPickOff"]; ok {
+		if off, isBool := v.(bool); isBool && !off {
+			if picked, changed := a.enforceFastest(); changed {
+				Log("auto-pick enabled: switched to %q (%.0fms)", picked.Name, picked.delay)
+			}
+		}
 	}
 	if sp, ok := patch["systemProxy"].(bool); ok {
 		if sp {

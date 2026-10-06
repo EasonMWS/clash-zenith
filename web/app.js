@@ -254,6 +254,24 @@ function renderOverview(st) {
 
   const sw = $('#sw-auto');
   if (document.activeElement !== sw) sw.checked = !!(st.settings && st.settings.autoOptimize);
+
+  // 自动用最快的：开关 + 说明当前瞄准的是哪个节点、多快
+  const swPickEl = $('#sw-pick');
+  if (swPickEl && document.activeElement !== swPickEl) swPickEl.checked = st.autoPickOn !== false;
+  const badge = $('#fastest-badge');
+  if (badge) {
+    const nm = st.fastestName || '';
+    const ms = st.fastestMS || 0;
+    if (nm && ms > 0) {
+      // 只显示 IP 段，完整名字太长
+      const ip = (nm.match(/(\d+\.\d+\.\d+\.\d+)/) || [])[1] || nm;
+      badge.textContent = ip + ' · ' + Math.round(ms) + 'ms';
+      badge.className = 'badge ' + (ms < 800 ? 'good' : ms < 2000 ? 'warn' : 'bad');
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
   renderProgress(st.optimizing, st.progress, st.error);
 }
 
@@ -711,9 +729,22 @@ function bindOverview() {
       const r = await api('/api/mode', { autoOptimize: on });
       if (!r.ok) { el.checked = !on; toast('设置失败：' + r.error, 'err'); return; }
       if (S.settings) S.settings.autoOptimize = on;
-      toast(on ? '自动优选已开启：Zenith 会自己挑最快的节点' : '自动优选已关闭：它不会再动你的选择', 'ok');
+      toast(on ? '自动优选已开启：会定期重测边缘 IP' : '自动优选已关闭：它不会再动你的节点', 'ok');
     });
   });
+
+  const swPick = $('#sw-pick');
+  if (swPick) {
+    swPick.addEventListener('change', function () {
+      const on = this.checked, el = this;
+      guard(el, async () => {
+        const r = await api('/api/settings', { autoPick: on });
+        if (!r.ok) { el.checked = !on; toast('设置失败：' + r.error, 'err'); return; }
+        if (S.status) S.status.autoPickOn = on;
+        toast(on ? '已开启：始终使用实测最快的优选节点' : '已关闭：你手动选的节点不会被换掉', 'ok');
+      });
+    });
+  }
 }
 
 function bindNodes() {

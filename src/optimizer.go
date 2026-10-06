@@ -517,6 +517,7 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Prox
 			}
 			p := oc.group.template
 			p.Server = r.IP
+			p.MeasuredMS = r.Median * 1000
 			// The IP already identifies the winner; the tunnel suffix only has to
 			// disambiguate when more than one relay is in play.
 			if len(groups) > 1 {

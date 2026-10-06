@@ -211,6 +211,9 @@ a:hover { text-decoration: underline; }
 .badge.ok { border-color: rgba(53, 208, 127, .4); background: var(--success-soft); color: #9df0c4; }
 .badge.bad { border-color: rgba(255, 92, 114, .4); background: var(--danger-soft); color: #ffb3be; }
 .badge.warn { border-color: rgba(255, 176, 32, .4); background: var(--warn-soft); color: #ffd591; }
+/* 延迟分档与节点页保持一致，用于「自动用最快的」旁的实时徽章 */
+.badge.good { border-color: rgba(53, 208, 127, .4); background: var(--success-soft); color: #9df0c4; }
+.switch-title .badge { margin-left: 8px; font-weight: 600; }
 
 /* ------------------------------------------------------ 概览：延迟主角块 */
 .latency {
