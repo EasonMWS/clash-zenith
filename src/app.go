@@ -196,15 +196,51 @@ func downloadFile(url, dest string) error {
 // geodata files on first run and that can take up to a minute. The window must
 // appear immediately so the user sees progress instead of a frozen app.
 func (a *App) Boot() {
+	a.EnsureUsablePort()
 	snap := a.store.Snapshot()
 	st := snap.Settings
 
-	nodes := snap.Optimized
-	if len(nodes) == 0 {
-		nodes = snap.BaseNodes
-	}
-	a.writeConfig(nodes, st)
+	a.writeConfig(a.mergedNodes(), st)
 	go a.bootCore()
+}
+
+// EnsureUsablePort makes sure the mixed port is genuinely ours before the core
+// starts.
+//
+// mihomo sets SO_REUSEADDR, so if another proxy already listens on 7890 it will
+// bind anyway and the two then share incoming connections. That is silent and
+// very confusing: half the traffic goes through a proxy the user did not choose.
+// When the port is taken, Zenith moves itself aside and updates the system proxy
+// to match.
+func (a *App) EnsureUsablePort() {
+	st := a.store.Settings()
+	want := st.MixedPort
+	if want <= 0 {
+		want = 7890
+	}
+	if PortFreeToBind(want) {
+		return
+	}
+
+	// If the thing sitting on the port is another Zenith instance, this process
+	// has no business running at all; the UI port check catches that case, so
+	// reaching here means a foreign proxy holds it.
+	var free int
+	for p := want + 9; p <= want+99 && free == 0; p++ {
+		if PortFreeToBind(p) {
+			free = p
+		}
+	}
+	if free == 0 {
+		Log("mixed port %d is taken and no alternative was free; leaving it as is", want, "WARN")
+		return
+	}
+	Log("mixed port %d is already in use by another program; moving Zenith to %d", want, free, "WARN")
+	if _, err := a.store.UpdateSettings(map[string]interface{}{"mixedPort": free}); err != nil {
+		Log("could not persist the new mixed port: %v", err, "WARN")
+		return
+	}
+	a.lastErr = fmt.Sprintf("端口 %d 已被其他程序占用，已自动改用 %d", want, free)
 }
 
 func (a *App) bootCore() {
@@ -232,7 +268,14 @@ func (a *App) bootCore() {
 func (a *App) background() {
 	lastSub := time.Now()
 	lastOpt := time.Now()
-	proxyArmed := false
+	// Latch on whether the proxy is ALREADY ours at startup, rather than
+	// assuming it is not. A normal shutdown hands the registry back or turns it
+	// off, so on the next launch it must be taken again - but if a previous
+	// instance is somehow still holding it, re-arming would fight over it.
+	proxyArmed := a.sysproxy.Status().Owner == "zenith"
+	if proxyArmed {
+		Log("system proxy is already Zenith's; leaving it in place")
+	}
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {

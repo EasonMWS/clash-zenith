@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,6 +137,24 @@ func portFromServer(server string) int {
 }
 
 // ---- snapshot / restore ---------------------------------------------------
+
+// PortFreeToBind reports whether Zenith can take a port for itself.
+//
+// A plain bind test is not enough: mihomo sets SO_REUSEADDR, so on Windows it
+// will happily bind a port another application is already listening on, and both
+// then accept a share of the connections - silently splitting traffic between
+// two different proxies. So the real listener table is consulted as well.
+func PortFreeToBind(port int) bool {
+	if len(ListeningPids(port)) > 0 {
+		return false
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
 
 func (s *SystemProxy) saveSnapshot() error {
 	snap := proxySnapshot{
