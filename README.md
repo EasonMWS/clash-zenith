@@ -36,7 +36,7 @@ winners. The core hot-reloads that config in place.
 | | |
 |---|---|
 | **Nothing to install** | One executable plus the core. No runtime, no dependencies |
-| **Lives in the tray** | Closing the window keeps Zenith running in the notification area; the tray menu switches mode, toggles the system proxy, starts an optimisation or quits |
+| **Lives in the tray** | Closing the window keeps Zenith running in the notification area. The tray menu opens the window, switches mode, toggles the system proxy, starts an optimisation or quits |
 | **No stray console window** | Built as a GUI binary, so double clicking it opens only the interface |
 | **Multiple subscriptions** | Add, switch, refresh and delete any number of them from the UI |
 | **Automatic edge optimisation** | Scans a candidate pool, verifies each edge with a real WebSocket handshake, keeps the fastest N |
@@ -170,7 +170,7 @@ Zenith 是一个自用的 Windows 代理客户端，内核是
 | | |
 |---|---|
 | **零安装** | 一个可执行文件加内核，无运行时、无依赖 |
-| **常驻系统托盘** | 关掉窗口程序不退出，留在托盘；右键托盘图标可以切模式、开关系统代理、立即优选、退出 |
+| **常驻系统托盘** | 关掉窗口程序不退出，留在托盘。右键托盘图标：打开窗口、切换模式、开关系统代理、立即优选、退出 |
 | **不会多弹命令行** | 编译为 GUI 子系统程序，双击只出界面 |
 | **多订阅** | 界面上添加、切换、刷新、删除任意多个订阅 |
 | **自动优选** | 扫描候选池，用真实 WebSocket 握手验证每个边缘，保留最快的若干个 |

@@ -202,8 +202,6 @@ const (
 	idModeDirect
 	idSysProxy
 	idOptimize
-	idOpenSubs
-	idOpenSettings
 	idQuit
 )
 
@@ -283,14 +281,6 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		}
 		Info(AppName, "已开始优选边缘节点。\n过程中可以正常上网，完成后会自动切换。")
 	})
-	tray.On(idOpenSubs, func() {
-		bringUp()
-		Info(AppName, "订阅管理在界面左侧的「订阅」页。")
-	})
-	tray.On(idOpenSettings, func() {
-		bringUp()
-		Info(AppName, "设置与关于在界面左侧的「设置」页。")
-	})
 	tray.On(idQuit, func() {
 		if !Confirm(AppName, "退出 Zenith？\n\n会同时停止代理并还原系统代理设置。") {
 			return
@@ -310,12 +300,10 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		st := app.Status()
 		mode, _ := st["mode"].(string)
 		optimizing, _ := st["optimizing"].(bool)
-		sysProxy, _ := st["settings"].(Settings)
 		proxyOn := false
 		if ps, ok := st["systemProxy"].(ProxyState); ok {
 			proxyOn = ps.Enabled && ps.Owner == "zenith"
 		}
-		_ = sysProxy
 
 		items := []menuItem{
 			{id: idShowWindow, label: "打开 Zenith 窗口"},
@@ -332,10 +320,10 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		} else {
 			items = append(items, menuItem{id: idOptimize, label: "立即优选节点"})
 		}
+		// Subscription management and settings live in the window itself; the
+		// menu deliberately does not duplicate them, because a tray item that
+		// can only point at a tab is worse than no item at all.
 		items = append(items,
-			menuItem{separate: true},
-			menuItem{id: idOpenSubs, label: "订阅管理"},
-			menuItem{id: idOpenSettings, label: "设置与关于"},
 			menuItem{separate: true},
 			menuItem{id: idQuit, label: "退出 Zenith"},
 		)
