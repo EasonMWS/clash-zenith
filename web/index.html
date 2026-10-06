@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Zenith</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ==================== 侧边栏 ==================== -->
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">Z</div>
+      <div class="brand-text">
+        <div class="brand-name">Zenith</div>
+        <div class="brand-sub" id="brand-sub">本地代理客户端</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item" data-tab="overview">概览</button>
+      <button class="nav-item" data-tab="nodes">节点</button>
+      <button class="nav-item" data-tab="subs">订阅</button>
+      <button class="nav-item" data-tab="advanced">高级</button>
+      <button class="nav-item" data-tab="settings">设置</button>
+    </nav>
+
+    <div class="side-foot">
+      <div class="core-state">
+        <span class="dot" id="side-dot"></span>
+        <span class="core-state-text" id="side-core">正在连接…</span>
+      </div>
+      <div class="side-meta" id="side-meta">—</div>
+    </div>
+  </aside>
+
+  <!-- ==================== 主区域 ==================== -->
+  <main class="main">
+    <div class="offline-bar" id="offline-bar">与后端失联，正在重试…</div>
+
+    <!-- ---------- 概览 ---------- -->
+    <section class="tab" id="tab-overview">
+      <div class="card hero">
+        <div class="hero-main">
+          <div class="hero-tags">
+            <span class="badge" id="mode-badge">规则</span>
+            <span class="badge ghost" id="proxy-badge">系统代理 未知</span>
+            <span class="badge ghost" id="opt-badge">未优选</span>
+          </div>
+          <div class="hero-node" id="hero-node">读取中…</div>
+          <div class="hero-meta" id="hero-meta">—</div>
+        </div>
+        <div class="hero-actions">
+          <button class="btn primary lg" id="btn-optimize">立即优选</button>
+          <button class="btn hidden" id="btn-cancel">取消</button>
+        </div>
+        <div class="progress hidden" id="progress-wrap">
+          <div class="progress-head">
+            <span id="progress-text">等待中…</span>
+            <span id="progress-count"></span>
+          </div>
+          <div class="bar"><i id="progress-bar"></i></div>
+        </div>
+      </div>
+
+      <div class="grid-3">
+        <div class="card stat">
+          <div class="stat-label">总下载</div>
+          <div class="stat-value" id="st-down">0 B</div>
+        </div>
+        <div class="card stat">
+          <div class="stat-label">总上传</div>
+          <div class="stat-value" id="st-up">0 B</div>
+        </div>
+        <div class="card stat">
+          <div class="stat-label">实时连接</div>
+          <div class="stat-value" id="st-conns">0</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>代理模式</h3>
+          <span class="hint">切换后立即生效，无需重启内核</span>
+        </div>
+        <div class="segment" id="seg-mode">
+          <button class="seg" data-mode="rule">规则</button>
+          <button class="seg" data-mode="global">全局</button>
+          <button class="seg" data-mode="direct">直连</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">自动优选</div>
+            <div class="switch-desc">开启后 Zenith 自己按延迟挑最快的节点并切换；关闭后它绝不碰你的选择。</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="sw-auto">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 节点 ---------- -->
+    <section class="tab hidden" id="tab-nodes">
+      <div class="toolbar">
+        <input class="input search" id="node-search" type="search" placeholder="搜索节点名或服务器地址…">
+        <span class="hint" id="node-test-state"></span>
+        <div class="spacer"></div>
+        <button class="btn" id="btn-test-all">全部测速</button>
+        <button class="btn" id="btn-direct">切到直连</button>
+      </div>
+      <div class="card list-card">
+        <div class="node-head">
+          <span>节点</span><span>服务器</span><span>延迟</span><span class="right">耗时</span>
+        </div>
+        <div class="node-list" id="node-list"></div>
+      </div>
+    </section>
+
+    <!-- ---------- 订阅 ---------- -->
+    <section class="tab hidden" id="tab-subs">
+      <div class="card">
+        <div class="card-head"><h3>添加订阅</h3></div>
+        <div class="form-row">
+          <input class="input grow" id="sub-url" type="text" placeholder="订阅地址 https://…">
+          <input class="input" id="sub-name" type="text" placeholder="备注名（可选）">
+          <button class="btn primary" id="btn-sub-add">添加</button>
+        </div>
+        <div class="hint">Zenith 会自己按间隔刷新订阅并重建配置，不需要再装别的客户端。</div>
+      </div>
+      <div class="sub-list" id="sub-list"></div>
+    </section>
+
+    <!-- ---------- 高级 ---------- -->
+    <section class="tab hidden" id="tab-advanced">
+      <div class="card">
+        <div class="card-head">
+          <h3>自定义规则</h3>
+          <span class="hint">每行一条，按顺序插入到 MATCH 之前</span>
+        </div>
+        <div class="chips" id="rule-templates">
+          <button class="chip" data-tpl="DOMAIN-SUFFIX">DOMAIN-SUFFIX</button>
+          <button class="chip" data-tpl="DOMAIN-KEYWORD">DOMAIN-KEYWORD</button>
+          <button class="chip" data-tpl="GEOIP">GEOIP</button>
+          <button class="chip" data-tpl="GEOSITE">GEOSITE</button>
+          <button class="chip" data-tpl="IP-CIDR">IP-CIDR</button>
+          <button class="chip" data-tpl="PROCESS-NAME">PROCESS-NAME</button>
+        </div>
+        <div class="rule-edit">
+          <textarea class="textarea" id="rules" spellcheck="false" placeholder="DOMAIN-SUFFIX,example.com,PROXY"></textarea>
+        </div>
+        <div class="err hidden" id="rule-error"></div>
+        <div class="form-row">
+          <label class="mini-label" for="rule-target">插入出口</label>
+          <select class="input select" id="rule-target"></select>
+          <div class="spacer"></div>
+          <button class="btn primary" id="btn-save-rules">保存规则</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>内置分流</h3></div>
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">国内直连</div>
+            <div class="switch-desc">国内域名与 IP 不走代理，速度更快。</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="sw-directcn"><span class="slider"></span></label>
+        </div>
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">拦截广告</div>
+            <div class="switch-desc">广告与追踪域名直接拒绝，不产生流量。</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="sw-blockads"><span class="slider"></span></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>当前配置</h3>
+          <button class="btn sm" id="btn-cfg-refresh">刷新</button>
+        </div>
+        <pre class="pre" id="current-cfg">尚未读取配置。</pre>
+      </div>
+    </section>
+
+    <!-- ---------- 设置 ---------- -->
+    <section class="tab hidden" id="tab-settings">
+      <div class="card">
+        <div class="card-head"><h3>常规</h3></div>
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">系统代理</div>
+            <div class="switch-desc" id="sysproxy-desc">把 Windows 系统代理指向 Zenith 的本地端口。</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="sw-sysproxy"><span class="slider"></span></label>
+        </div>
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">订阅自动更新</div>
+            <div class="switch-desc">按下面的间隔自动重新拉取订阅节点。</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="sw-subauto"><span class="slider"></span></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>参数</h3>
+          <span class="hint" id="settings-state"></span>
+        </div>
+        <div class="field-grid">
+          <label class="field"><span>优选间隔（分钟）</span><input class="input" type="number" id="in-optint" min="5" max="1440"></label>
+          <label class="field"><span>订阅刷新间隔（小时）</span><input class="input" type="number" id="in-subint" min="1" max="168"></label>
+          <label class="field"><span>保留节点数</span><input class="input" type="number" id="in-keep" min="4" max="64"></label>
+          <label class="field"><span>探测轮数</span><input class="input" type="number" id="in-rounds" min="1" max="10"></label>
+          <label class="field"><span>探测并发</span><input class="input" type="number" id="in-workers" min="1" max="128"></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>端口</h3></div>
+        <div class="kv"><span>混合代理（HTTP / SOCKS5）</span><b id="p-mixed">—</b></div>
+        <div class="kv"><span>内核 API</span><b id="p-api">—</b></div>
+        <div class="kv"><span>界面</span><b id="p-ui">—</b></div>
+        <div class="kv"><span>外部控制</span><b id="p-control">—</b></div>
+        <div class="form-row top-gap">
+          <button class="btn" id="btn-core-restart">重启内核</button>
+          <span class="hint" id="core-state-hint">—</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>日志</h3>
+          <div class="spacer"></div>
+          <div class="segment sm" id="seg-log">
+            <button class="seg" data-which="app">应用日志</button>
+            <button class="seg" data-which="core">内核日志</button>
+          </div>
+          <button class="btn sm" id="btn-log-refresh">刷新</button>
+        </div>
+        <pre class="pre logs" id="log-view">正在读取…</pre>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>关于</h3></div>
+        <div class="about">
+          <div class="about-mark">Z</div>
+          <div class="about-body">
+            <div class="about-title">Zenith <span class="badge" id="about-version">v—</span></div>
+            <div class="about-desc">自包含的 Windows 代理客户端：内置内核、订阅、优选与系统代理，全部在本地完成。</div>
+          </div>
+        </div>
+        <div class="kv"><span>程序版本</span><b id="ab-version">—</b></div>
+        <div class="kv"><span>编译环境</span><b id="ab-go">—</b></div>
+        <div class="kv"><span>内核版本</span><b id="ab-core">—</b></div>
+        <div class="kv"><span>开源协议</span><b id="ab-license">GPL-3.0</b></div>
+        <div class="kv"><span>项目仓库</span><b><a id="ab-repo" href="#" target="_blank" rel="noreferrer">—</a></b></div>
+        <div class="kv"><span>数据目录</span><b class="mono" id="ab-datadir">—</b></div>
+        <div class="note">
+          这是个人自用工具，代码开放只是为了方便自己复查与改造；不接受换皮商用，也请勿把它包装成别人的产品分发。
+        </div>
+        <div class="form-row top-gap">
+          <button class="btn danger" id="btn-quit">退出 Zenith</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toast-stack" id="toast-stack"></div>
+<script src="app.js"></script>
+</body>
+</html>

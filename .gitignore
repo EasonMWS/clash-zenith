@@ -1,0 +1,31 @@
+# ---- build output ----
+/Zenith.exe
+*.exe
+!core/mihomo.exe
+*.test
+*.out
+
+# ---- runtime state (regenerated on first run) ----
+/data/state.json
+/data/state.json.*
+/data/config.yaml
+/data/proxy-snapshot.json
+/data/candidates.txt
+/data/nodes.json
+/data/ui-profile/
+/data/GeoSite.dat
+/data/geoip.metadb
+/data/geoip.dat
+/data/geosite.dat
+/data/ASN.mmdb
+/logs/
+
+# ---- editors / OS ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# ---- go ----
+/vendor/
