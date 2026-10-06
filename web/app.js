@@ -124,7 +124,7 @@ function setTab(tab) {
   if (!TAB_TITLE[tab]) tab = 'overview';
   S.tab = tab;
   $$('#nav .nav-item').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-  $$('.tab').forEach((sec) => { sec.hidden = sec.id !== 'tab-' + tab; });
+  $$('.tab').forEach((sec) => { sec.classList.toggle('hidden', sec.id !== 'tab-' + tab); });
   try { localStorage.setItem(LS_TAB, tab); } catch (e) { /* 忽略 */ }
   if ($('.main')) $('.main').scrollTop = 0;
   S.logAuto = tab === 'settings';

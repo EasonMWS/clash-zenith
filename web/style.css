@@ -152,7 +152,8 @@ a:hover { text-decoration: underline; }
 }
 
 .tab { display: flex; flex-direction: column; gap: 14px; }
-.hidden { display: none !important; }
+/* 注意：.tab 的 display 会盖过 hidden 属性的 UA 规则，所以隐藏统一用 .hidden 类，并给 [hidden] 兜底 */
+.hidden, [hidden] { display: none !important; }
 
 .offline-bar {
   margin-bottom: 12px;

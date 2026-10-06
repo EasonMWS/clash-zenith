@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -577,5 +576,3 @@ func (a *App) Shutdown() {
 	os.Exit(0)
 }
 
-// ensure json round trip helpers are used
-var _ = json.Marshal

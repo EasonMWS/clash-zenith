@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -69,10 +68,6 @@ func regQuery(name string) string {
 func regSet(name, typ, value string) error {
 	_, err := HiddenCommand("reg", "add", `HKCU\`+regKeyPath, "/v", name, "/t", typ, "/d", value, "/f")
 	return err
-}
-
-func regDelete(name string) {
-	_, _ = HiddenCommand("reg", "delete", `HKCU\`+regKeyPath, "/v", name, "/f")
 }
 
 // NotifyWinInet tells running programs the proxy settings changed, otherwise
@@ -354,4 +349,3 @@ func HiddenCommand(name string, args ...string) (string, error) {
 	return string(out), nil
 }
 
-var _ = time.Now
