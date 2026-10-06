@@ -50,10 +50,12 @@ type App struct {
 	// the user's most recent deliberate node choice, respected for a while
 	userPicked   string
 	userPickedAt time.Time
-	quitting     bool
-	stopCh       chan struct{}
-	onQuit       func()
-	trafficSnap  Connections
+	// why the last auto-pick declined to act, surfaced through the API
+	lastPickDebug string
+	quitting      bool
+	stopCh        chan struct{}
+	onQuit        func()
+	trafficSnap   Connections
 }
 
 func NewApp(rootDir string) (*App, error) {
@@ -376,6 +378,9 @@ func (a *App) background() {
 		if !st.AutoPickOff && a.core.IsUp() && !a.opt.Running() {
 			if picked, changed := a.enforceFastest(); changed {
 				Log("auto-pick: switched to the fastest verified node %q (%.0fms)", picked.Name, picked.delay)
+			} else {
+				// nothing to do; the reason is in pickDebug
+				_ = picked
 			}
 		}
 
@@ -397,6 +402,21 @@ func (a *App) background() {
 				a.StartOptimize()
 			}
 		}
+	}
+}
+
+// pickDebug records why auto-pick declined to act, and keeps it in the log at a
+// low frequency. Without this, "auto-pick did nothing" is indistinguishable
+// from "auto-pick is broken".
+func (a *App) pickDebug(code int, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	a.mu.Lock()
+	line := fmt.Sprintf("auto-pick skip #%d: %s", code, msg)
+	changed := line != a.lastPickDebug
+	a.lastPickDebug = line
+	a.mu.Unlock()
+	if changed {
+		Log("%s", line)
 	}
 }
 
@@ -442,6 +462,7 @@ func (a *App) resetPickWatch() {
 func (a *App) enforceFastest() (pickResult, bool) {
 	optimized, _ := a.nodeSet()
 	if len(optimized) < 2 {
+		a.pickDebug(1, "only %d optimised node(s)", len(optimized))
 		return pickResult{}, false
 	}
 
@@ -462,11 +483,13 @@ func (a *App) enforceFastest() (pickResult, bool) {
 		}
 	}
 	if bestMS == 0 {
+		a.pickDebug(2, "no node has a usable measurement")
 		return pickResult{}, false
 	}
 
 	proxies, err := a.core.Proxies()
 	if err != nil {
+		a.pickDebug(3, "core /proxies failed: %v", err)
 		return pickResult{}, false
 	}
 	current := ""
@@ -474,6 +497,7 @@ func (a *App) enforceFastest() (pickResult, bool) {
 		current = g.Now
 	}
 	if current == best.Name {
+		a.pickDebug(4, "already on the fastest (%s)", current)
 		a.resetPickWatch()
 		return pickResult{}, false
 	}
@@ -486,6 +510,7 @@ func (a *App) enforceFastest() (pickResult, bool) {
 	a.mu.Unlock()
 	if picked != "" && current == picked {
 		if held := time.Since(pickedAt); held < userPickGrace {
+			a.pickDebug(5, "user picked %q %.0fs ago, inside the grace window", picked, held.Seconds())
 			return pickResult{}, false
 		}
 		// the grace window expired: fall through and resume normal ranking
@@ -517,6 +542,7 @@ func (a *App) enforceFastest() (pickResult, bool) {
 	// A dead node is still replaced, because a dead node is not a choice.
 	if !currentIsOptimised && current != "" && current != "AUTO" {
 		if curMS > 0 {
+			a.pickDebug(6, "current %q is not an optimised node (curMS=%.0f), leaving it", current, curMS)
 			return pickResult{}, false
 		}
 	}
@@ -526,6 +552,7 @@ func (a *App) enforceFastest() (pickResult, bool) {
 	if curMS > 0 {
 		delta := curMS - bestMS
 		if delta < pickNoiseFloorMS {
+			a.pickDebug(7, "delta %.1fms is inside the noise floor", delta)
 			a.resetPickWatch()
 			return pickResult{}, false
 		}
@@ -545,17 +572,22 @@ func (a *App) enforceFastest() (pickResult, bool) {
 			held := time.Since(a.pickSince)
 			a.mu.Unlock()
 			if held < pickPatience {
+				a.pickDebug(8, "marginal win, waiting %.1fs of %.1fs", held.Seconds(), pickPatience.Seconds())
 				return pickResult{}, false
 			}
 		}
 	}
 
 	if err := a.core.Select("PROXY", best.Name); err != nil {
+		a.pickDebug(9, "Select failed: %v", err)
 		return pickResult{}, false
 	}
 	a.core.CloseConnections()
 	_ = a.store.SetCurrent(best.Name)
 	a.resetPickWatch()
+	a.mu.Lock()
+	a.lastPickDebug = ""
+	a.mu.Unlock()
 	return pickResult{Name: best.Name, delay: bestMS}, true
 }
 
@@ -739,6 +771,7 @@ func (a *App) Status() map[string]interface{} {
 		"autoPick":     autoPick, // what the core's AUTO group currently chooses
 		"autoPickOn":   !st.AutoPickOff,
 		"fastestName":  fastest.Name,
+		"pickDebug":    a.lastPickDebug,
 		"fastestMS":    fastestMS,
 		"nodes":        list,
 		"nodeCount":    len(list),
