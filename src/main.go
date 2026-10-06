@@ -430,6 +430,14 @@ func openWindow(port int, st Settings, forceBrowser bool, dataDir string) (*os.P
 	if st.WindowX != 0 || st.WindowY != 0 {
 		args = append(args, fmt.Sprintf("--window-position=%d,%d", st.WindowX, st.WindowY))
 	}
+	// Opt-in diagnostics: dropping a file called ui-debug.flag into the data
+	// directory exposes the window's DevTools endpoint so the interface can be
+	// inspected and its console read. Off unless the file exists.
+	if _, err := os.Stat(filepath.Join(dataDir, "ui-debug.flag")); err == nil {
+		args = append(args, "--remote-debugging-port=9222",
+			"--remote-allow-origins=http://127.0.0.1:9222")
+		Log("UI diagnostics enabled on 127.0.0.1:9222", "WARN")
+	}
 
 	cmd := exec.Command(exe, args...)
 	if err := cmd.Start(); err != nil {

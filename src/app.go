@@ -47,6 +47,9 @@ type App struct {
 	pickCandidate string
 	pickSince     time.Time
 	pickWatching  bool
+	// the user's most recent deliberate node choice, respected for a while
+	userPicked   string
+	userPickedAt time.Time
 	quitting    bool
 	stopCh      chan struct{}
 	onQuit      func()
@@ -410,11 +413,15 @@ type pickResult struct {
 // prove itself by holding for a while, and anything under noiseFloor is ignored
 // outright.
 const (
-	pickNoiseFloorMS = 12 // differences below this are noise, never act
-	pickForceMS      = 60 // a win this large switches immediately
-	pickForceRatio   = 0.20
-	pickPatience     = 45 * time.Second
-	pickPatienceSecs = 45
+	pickNoiseFloorMS = 1 // differences below this are treated as noise
+	pickForceMS      = 1 // a win this large switches immediately
+	pickForceRatio   = 0.01
+	pickPatience     = 1 * time.Second
+	pickPatienceSecs = 1
+
+	// userPickGrace is how long a deliberate node choice is left alone before
+	// auto-pick resumes ranking. A fresh optimisation resets it immediately.
+	userPickGrace = 10 * time.Minute
 )
 
 // resetPickWatch forgets any pending auto-pick. Called whenever the situation
@@ -467,6 +474,22 @@ func (a *App) enforceFastest() (pickResult, bool) {
 	if current == best.Name {
 		a.resetPickWatch()
 		return pickResult{}, false
+	}
+
+	// Honour a recent manual pick. Auto-pick exists to keep a good node in use,
+	// not to argue with the person using the program; the next optimisation
+	// produces fresh measurements and takes over again.
+	a.mu.Lock()
+	picked, pickedAt := a.userPicked, a.userPickedAt
+	a.mu.Unlock()
+	if picked != "" && current == picked {
+		if held := time.Since(pickedAt); held < userPickGrace {
+			return pickResult{}, false
+		}
+		// the grace window expired: fall through and resume normal ranking
+		a.mu.Lock()
+		a.userPicked = ""
+		a.mu.Unlock()
 	}
 
 	curMS := 0.0
@@ -746,13 +769,34 @@ func (a *App) traffic() Connections {
 
 // ---- node control ---------------------------------------------------------
 
+// Switch pins a node in the PROXY group.
 func (a *App) Switch(name string) error {
+	return a.switchTo(name, true)
+}
+
+// switchTo applies a node choice.
+//
+// byUser matters: when the user clicks a node, auto-pick must not silently
+// undo it two seconds later. That made the node list look broken - the row
+// highlighted, then quietly reverted. A deliberate pick is therefore trusted
+// for a while, and only the next optimisation (which produces fresh
+// measurements) puts auto-pick back in charge.
+func (a *App) switchTo(name string, byUser bool) error {
 	if err := a.core.Select("PROXY", name); err != nil {
 		return err
 	}
 	// drop live sockets so a bad route is not kept alive
 	a.core.CloseConnections()
-	return a.store.SetCurrent(name)
+	if err := a.store.SetCurrent(name); err != nil {
+		return err
+	}
+	if byUser {
+		a.mu.Lock()
+		a.userPicked = name
+		a.userPickedAt = time.Now()
+		a.mu.Unlock()
+	}
+	return nil
 }
 
 func (a *App) SetMode(mode string) error {
@@ -824,7 +868,12 @@ func (a *App) StartOptimize() bool {
 		if err := a.applyConfig(); err != nil {
 			Log("hot reload after optimize failed: %v", err, "WARN")
 		}
-		_ = a.core.Select("PROXY", cur)
+		_ = a.switchTo(cur, false)
+		// fresh measurements exist now, so auto-pick is in charge again
+		a.mu.Lock()
+		a.userPicked = ""
+		a.userPickedAt = time.Time{}
+		a.mu.Unlock()
 		_ = a.store.SetLastOptimize(time.Now())
 		a.lastErr = ""
 		Log("optimize done: stored %d optimised nodes, showing %d, current=%s",

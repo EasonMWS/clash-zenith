@@ -165,11 +165,14 @@ function clockText() {
    但由 JS 直接写内联色，避免颜色只靠 class 传递时读到过渡中的旧值 */
 const DELAY_COLOR = { none: '#8b98b0', good: '#35d07f', mid: '#ffb020', bad: '#ff5c72' };
 
-/* 只改数字本身，ms 后缀留在 span 里，避免每次轮询都重建节点 */
+/* 只改数字本身，ms 后缀留在 span 里，避免每次轮询都重建节点。
+   注意：这里必须用「纯数字」，不能复用 delayText —— 它会带上 " ms"，
+   而 span#latency-unit 已经显示了单位，两处叠加就会变成 "218 msms"。 */
 function paintDelayNum(d) {
   const num = $('#latency-value');
   if (!num) return;
-  const text = delayText(d);                     // 0 或缺失时是「—」
+  const v = Number(d) || 0;
+  const text = v > 0 ? String(Math.round(v)) : '—';
   if (num.firstChild && num.firstChild.nodeType === 3) num.firstChild.nodeValue = text;
   else num.insertBefore(document.createTextNode(text), num.firstChild);
 }
