@@ -1,3 +1,3 @@
-module github.com/zenith-app/zenith
+module github.com/EasonMWS/Zenith
 
 go 1.24.5

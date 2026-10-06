@@ -5,6 +5,13 @@ works — there is nothing to install.
 
 [English](#english) · [中文](#中文)
 
+<p>
+<img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-4f8cff">
+<img alt="go" src="https://img.shields.io/badge/Go-1.21%2B-35d07f">
+<img alt="deps" src="https://img.shields.io/badge/dependencies-none-35d07f">
+<img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-ffb020">
+</p>
+
 ---
 
 ## English
