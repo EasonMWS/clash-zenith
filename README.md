@@ -38,6 +38,7 @@ winners. The core hot-reloads that config in place.
 | **Nothing to install** | One executable plus the core. No runtime, no dependencies |
 | **Multiple subscriptions** | Add, switch, refresh and delete any number of them from the UI |
 | **Automatic edge optimisation** | Scans a candidate pool, verifies each edge with a real WebSocket handshake, keeps the fastest N |
+| **Handles mixed subscriptions** | A subscription may mix several relays with direct nodes (Singapore / Japan / US). Every WebSocket tunnel is optimised on its own; direct nodes are left exactly as they are |
 | **Manual / automatic control** | One switch. On: Zenith keeps picking the fastest node. Off: it never touches your choice |
 | **Three modes** | Rule based split routing, global proxy, direct |
 | **Custom rules** | An advanced editor for your own routing rules, plus one-click templates |
@@ -47,10 +48,28 @@ winners. The core hot-reloads that config in place.
 
 ### Quick start
 
-1. Download or clone this repository.
-2. Double click `Zenith.exe`.
-3. Open 订阅 (Subscriptions), paste your subscription URL, press 添加.
-4. Press 立即优选 (Optimise now) once. It takes a couple of minutes on the first
+**Option A — download the ready binary (nothing else needed)**
+
+Take `Zenith-windows-amd64.zip` from the Releases page, unzip it anywhere and
+double click `Zenith.exe`. The proxy core and the rule databases are inside.
+
+**Option B — clone and build**
+
+```powershell
+git clone <this repository> Zenith
+cd Zenith
+.\build.ps1
+.\Zenith.exe
+```
+
+Needs Go 1.21 or newer. The core and the rule databases ship with the clone, so
+the first launch is ready in about two seconds with no download.
+
+Then, either way:
+
+1. Double click `Zenith.exe`.
+2. Open 订阅 (Subscriptions), paste your subscription URL, press 添加.
+3. Press 立即优选 (Optimise now) once. It takes a couple of minutes on the first
    run and then runs on a schedule.
 
 That is all. The window can be closed at any time — closing it stops the proxy
@@ -62,10 +81,15 @@ and restores your system settings.
 Zenith.exe                 open the window
 Zenith.exe -headless       backend only, no window
 Zenith.exe -browser        open the UI in your normal browser
+Zenith.exe -no-proxy       run without touching the system proxy
 Zenith.exe -stop           stop a running instance and exit
 Zenith.exe -port 7800      use a different UI port
 Zenith.exe -version        print the version
 ```
+
+`-no-proxy` exists because two instances on different UI ports would otherwise
+both try to own the system proxy, and whichever started last would silently
+take it.
 
 ### How it is put together
 
@@ -146,6 +170,7 @@ Zenith 是一个自用的 Windows 代理客户端，内核是
 | **零安装** | 一个可执行文件加内核，无运行时、无依赖 |
 | **多订阅** | 界面上添加、切换、刷新、删除任意多个订阅 |
 | **自动优选** | 扫描候选池，用真实 WebSocket 握手验证每个边缘，保留最快的若干个 |
+| **支持混合订阅** | 订阅里可能既有中转又有直连节点（新加坡 / 日本 / 美国）。每个 WebSocket 中转各优选一批，直连节点原样保留、绝不改动 |
 | **手动 / 自动开关** | 一个开关。打开时它自动挑最快的；关闭后它绝不碰你的选择 |
 | **三种模式** | 规则分流、全局代理、直连 |
 | **自定义规则** | 给高级用户准备的规则编辑器，附带常用模板一键插入 |
@@ -155,10 +180,28 @@ Zenith 是一个自用的 Windows 代理客户端，内核是
 
 ### 快速开始
 
-1. 下载或克隆本仓库。
-2. 双击 `Zenith.exe`。
-3. 打开「订阅」页，粘贴订阅地址，按「添加」。
-4. 按一次「立即优选」。首次需要一两分钟，之后会按计划自动运行。
+**方式 A — 直接下载现成的（什么都不用装）**
+
+从 Releases 页面下载 `Zenith-windows-amd64.zip`，解压到任意位置，双击
+`Zenith.exe`。内核和地理数据都在压缩包里。
+
+**方式 B — 克隆自己编译**
+
+```powershell
+git clone <本仓库> Zenith
+cd Zenith
+.\build.ps1
+.\Zenith.exe
+```
+
+需要 Go 1.21 或更新版本。内核和地理数据随仓库提供，所以首次启动约两秒就绪，
+不需要下载任何东西。
+
+然后两种方式都一样：
+
+1. 双击 `Zenith.exe`。
+2. 打开「订阅」页，粘贴订阅地址，按「添加」。
+3. 按一次「立即优选」。首次需要一两分钟，之后会按计划自动运行。
 
 就这样。窗口随时可以关闭——关掉它就停止代理并还原系统设置。
 
@@ -168,10 +211,14 @@ Zenith 是一个自用的 Windows 代理客户端，内核是
 Zenith.exe                 打开窗口
 Zenith.exe -headless       只跑后端，不开窗口
 Zenith.exe -browser        用默认浏览器打开界面
+Zenith.exe -no-proxy       运行但不碰系统代理
 Zenith.exe -stop           停止正在运行的实例
 Zenith.exe -port 7800      换个界面端口
 Zenith.exe -version        显示版本
 ```
+
+`-no-proxy` 是为这种情况准备的：两个实例用不同界面端口跑时，都会去抢系统代理，
+后启动的那个会悄悄把它拿走。
 
 ### 目录结构
 
