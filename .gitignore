@@ -12,6 +12,7 @@
 /data/config.yaml
 /data/proxy-snapshot.json
 /data/candidates.txt
+/data/cache.db
 /data/nodes.json
 /data/ui-profile/
 /data/GeoSite.dat
