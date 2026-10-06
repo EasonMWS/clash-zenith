@@ -106,7 +106,7 @@ func (a *App) bootCore() {
 	}
 	a.lastErr = ""
 	if a.store.Settings().SystemProxy {
-		if err := a.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
+		if _, err := a.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
 			Log("system proxy not enabled: %v", err, "WARN")
 		}
 	}
@@ -136,12 +136,19 @@ func (a *App) background() {
 				a.lastErr = ""
 			}
 		}
-		// take the system proxy once, as soon as the core is really listening
+		// take the system proxy once, as soon as the core is really listening.
+		// Enable returns early when the proxy is already ours, so the flag is set
+		// only on success - otherwise this line repeated every 10 seconds.
 		if !proxyArmed && st.SystemProxy && a.core.IsUp() {
-			proxyArmed = true
-			if err := a.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
+			if took, err := a.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
 				Log("system proxy not enabled: %v", err, "WARN")
+			} else if took {
+				proxyArmed = true
 			}
+		}
+		// re-arm when the user flips the switch back on in the UI
+		if proxyArmed && !st.SystemProxy {
+			proxyArmed = false
 		}
 		a.sysproxy.GuardDeadProxy()
 
@@ -242,25 +249,25 @@ func (a *App) Status() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"ok":          true,
-		"app":         AppName,
-		"version":     AppVersion,
-		"coreUp":      a.core.IsUp(),
-		"corePid":     a.core.Pid(),
-		"coreVersion": a.core.Version(),
-		"coreUptime":  a.core.Uptime(),
-		"mode":        st.Mode,
-		"current":     current,
-		"autoPick":    autoPick,
-		"nodes":       list,
-		"nodeCount":   len(list),
-		"isOptimized": isOptimized,
-		"settings":    st,
-		"systemProxy": a.sysproxy.Status(),
-		"optimizing":  a.opt.Running(),
-		"progress":    a.opt.Progress(),
+		"ok":           true,
+		"app":          AppName,
+		"version":      AppVersion,
+		"coreUp":       a.core.IsUp(),
+		"corePid":      a.core.Pid(),
+		"coreVersion":  a.core.Version(),
+		"coreUptime":   a.core.Uptime(),
+		"mode":         st.Mode,
+		"current":      current,
+		"autoPick":     autoPick,
+		"nodes":        list,
+		"nodeCount":    len(list),
+		"isOptimized":  isOptimized,
+		"settings":     st,
+		"systemProxy":  a.sysproxy.Status(),
+		"optimizing":   a.opt.Running(),
+		"progress":     a.opt.Progress(),
 		"lastOptimize": snap.LastOptimize,
-		"error":       a.lastErr,
+		"error":        a.lastErr,
 		"ports": map[string]int{
 			"mixed": st.MixedPort, "api": st.APIPort, "ui": st.UIPort, "control": st.ControlPort,
 		},
@@ -535,7 +542,7 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 	}
 	if sp, ok := patch["systemProxy"].(bool); ok {
 		if sp {
-			if err := a.sysproxy.Enable(next.MixedPort, next.ProxyBypass, false); err != nil {
+			if _, err := a.sysproxy.Enable(next.MixedPort, next.ProxyBypass, false); err != nil {
 				Log("could not enable system proxy: %v", err, "WARN")
 			}
 		} else {

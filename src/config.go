@@ -103,7 +103,11 @@ func proxyToYAML(p Proxy) string {
 	if p.Cipher != "" {
 		write("cipher", p.Cipher)
 	}
-	if p.AlterID != 0 {
+	// alterId must always be present for vmess, even when it is zero: mihomo
+	// refuses the node with "has unset fields: alterId" otherwise.
+	if p.Type == "vmess" {
+		write("alterId", p.AlterID)
+	} else if p.AlterID != 0 {
 		write("alterId", p.AlterID)
 	}
 	if p.Flow != "" {
@@ -226,9 +230,27 @@ func BuildConfig(nodes []Proxy, st Settings, secret string, current string, dnsP
 	}
 	names := make([]string, 0, len(nodes))
 	for _, p := range nodes {
-		b.WriteString("  - ")
+		// The reference layout mihomo accepts is:
+		//
+		//   proxies:
+		//   - name: "x"          <- first key inlined after "- "
+		//     type: "vmess"      <- two spaces
+		//     ws-opts:
+		//       headers:         <- four spaces
+		//
+		// proxyToYAML already emits that relative indentation, so the block is
+		// written verbatim with only the first line reshaped. Adding an extra
+		// offset (or trimming the indent) breaks nested keys - both were tried
+		// and mihomo answered "did not find expected key".
 		body := proxyToYAML(p)
-		b.WriteString(strings.TrimPrefix(body, "  "))
+		lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+		if len(lines) == 0 {
+			continue
+		}
+		b.WriteString("- " + strings.TrimSpace(lines[0]) + "\n")
+		for _, ln := range lines[1:] {
+			b.WriteString(ln + "\n")
+		}
 		names = append(names, p.Name)
 	}
 

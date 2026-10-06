@@ -39,7 +39,7 @@
 
   <!-- ==================== 主区域 ==================== -->
   <main class="main">
-    <div class="offline-bar" id="offline-bar">与后端失联，正在重试…</div>
+    <div class="offline-bar hidden" id="offline-bar">与后端失联，正在重试…</div>
 
     <!-- ---------- 概览 ---------- -->
     <section class="tab" id="tab-overview">
@@ -68,16 +68,13 @@
 
       <div class="grid-3">
         <div class="card stat">
-          <div class="stat-label">总下载</div>
-          <div class="stat-value" id="st-down">0 B</div>
+          <div class="stat-label">总下载</div><div class="stat-value" id="st-down">0 B</div>
         </div>
         <div class="card stat">
-          <div class="stat-label">总上传</div>
-          <div class="stat-value" id="st-up">0 B</div>
+          <div class="stat-label">总上传</div><div class="stat-value" id="st-up">0 B</div>
         </div>
         <div class="card stat">
-          <div class="stat-label">实时连接</div>
-          <div class="stat-value" id="st-conns">0</div>
+          <div class="stat-label">实时连接</div><div class="stat-value" id="st-conns">0</div>
         </div>
       </div>
 
@@ -156,7 +153,7 @@
         <div class="rule-edit">
           <textarea class="textarea" id="rules" spellcheck="false" placeholder="DOMAIN-SUFFIX,example.com,PROXY"></textarea>
         </div>
-        <div class="err hidden" id="rule-error"></div>
+        <div class="err hidden" id="rule-error">占位</div>
         <div class="form-row">
           <label class="mini-label" for="rule-target">插入出口</label>
           <select class="input select" id="rule-target"></select>

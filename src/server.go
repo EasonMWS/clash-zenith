@@ -318,7 +318,7 @@ func (s *Server) handleSystemProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	st := s.app.store.Settings()
 	if want {
-		if err := s.app.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
+		if _, err := s.app.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
 			writeJSON(w, 200, map[string]interface{}{"ok": false, "error": err.Error()})
 			return
 		}

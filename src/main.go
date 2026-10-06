@@ -89,7 +89,24 @@ func main() {
 		fmt.Printf("could not open a window: %v\nUI: http://127.0.0.1:%d/\n", err, uiPort)
 		select {}
 	}
+
+	// watchWindow calls Shutdown when the UI window really goes away. It can
+	// also return early: Chromium may hand the URL to an already running
+	// process, and the window count can fail to resolve. In those cases the
+	// backend MUST stay alive - letting the main goroutine fall through here
+	// used to end the process while the window was still on screen.
 	watchWindow(proc, uiPort, func() { app.Shutdown() })
+	Log("window watcher finished; Zenith keeps serving the open window")
+
+	// Fallback: also stop when no Zenith window remains, checked slowly so a
+	// transient query failure can never kill a live session.
+	for {
+		time.Sleep(20 * time.Second)
+		if n := countWindows(uiPort); n == 0 {
+			Log("no Zenith window left; shutting down")
+			app.Shutdown()
+		}
+	}
 }
 
 // resolveRoot finds the folder holding core/, web/ and data/. It works both when

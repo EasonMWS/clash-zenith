@@ -211,13 +211,22 @@ func foreignClients() []string {
 }
 
 // Enable points the system proxy at Zenith's mixed port.
+//
+// Returns took=true when this call actually changed the registry, and false
+// when Zenith already owned the setting - callers need that distinction to stop
+// retrying without logging the same line every few seconds.
 // force bypasses the "someone else owns it" guard (the user asked for it).
-func (s *SystemProxy) Enable(port int, bypass string, force bool) error {
+func (s *SystemProxy) Enable(port int, bypass string, force bool) (took bool, err error) {
 	cur := s.Status()
-	foreign := foreignClients()
 	curPort := portFromServer(cur.Server)
-	oursAlready := curPort == port
+	oursAlready := curPort == port && cur.Enabled
+	if oursAlready {
+		s.tookProxy = true
+		s.proxyPort = port
+		return false, nil
+	}
 
+	foreign := foreignClients()
 	blocker := ""
 	if foreign != nil && !oursAlready {
 		blocker = "检测到其他代理客户端正在运行（" + strings.Join(foreign, ", ") + "）"
@@ -228,30 +237,32 @@ func (s *SystemProxy) Enable(port int, bypass string, force bool) error {
 		s.blockedBy = blocker
 		s.tookProxy = false
 		Log("system proxy NOT taken: %s. Zenith listens on %d and leaves the registry alone.", blocker, port)
-		return nil
+		return false, nil
+	}
+	if blocker != "" {
+		s.blockedBy = blocker
 	}
 
 	if !IsPortListening(port) {
-		return fmt.Errorf("端口 %d 还没有监听，先启动内核再接管系统代理", port)
+		return false, fmt.Errorf("端口 %d 还没有监听，先启动内核再接管系统代理", port)
 	}
 	if err := s.saveSnapshot(); err != nil {
 		Log("could not save the proxy snapshot: %v", err, "WARN")
 	}
 	if err := regSet("ProxyEnable", "REG_DWORD", "1"); err != nil {
-		return err
+		return false, err
 	}
 	if err := regSet("ProxyServer", "REG_SZ", fmt.Sprintf("127.0.0.1:%d", port)); err != nil {
-		return err
+		return false, err
 	}
 	if bypass != "" {
 		_ = regSet("ProxyOverride", "REG_SZ", bypass)
 	}
 	s.tookProxy = true
 	s.proxyPort = port
-	s.blockedBy = ""
 	NotifyWinInet()
 	Log("system proxy enabled -> 127.0.0.1:%d", port)
-	return nil
+	return true, nil
 }
 
 // Disable only flips the switch; it does not restore anything.
