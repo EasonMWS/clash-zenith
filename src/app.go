@@ -52,10 +52,21 @@ type App struct {
 	userPickedAt time.Time
 	// why the last auto-pick declined to act, surfaced through the API
 	lastPickDebug string
-	quitting      bool
-	stopCh        chan struct{}
-	onQuit        func()
-	trafficSnap   Connections
+	// health checking of the node currently in use
+	healthFails  int
+	healthLastAt time.Time
+	healthBanned map[string]time.Time // node name -> when it was found dead
+	healthLastEv string               // last health event, surfaced through the API
+	// how many forced switches happened without a successful check in between;
+	// several in a row means the pool is stale, not just the current node
+	healthSwitches int
+	// how often each node has failed a liveness check. A node that keeps
+	// dropping out should lose to a slightly slower node that never does.
+	nodeFlaky   map[string]int
+	quitting    bool
+	stopCh      chan struct{}
+	onQuit      func()
+	trafficSnap Connections
 }
 
 func NewApp(rootDir string) (*App, error) {
@@ -370,17 +381,19 @@ func (a *App) background() {
 		}
 		a.sysproxy.GuardDeadProxy()
 
+		// Rank-based switching waits for a scan to finish, because a scan is
+		// about to replace the numbers this would rank by.
+		//
 		// Keep the fastest verified node in use. The core's own url-test only
 		// knows whether a node answers a 204 probe; Zenith knows the real
 		// WebSocket handshake time it measured. This reuses that measurement so
 		// "自动" means the fastest node Zenith actually proved, not the fastest
 		// one that happens to answer a ping.
-		if !st.AutoPickOff && a.core.IsUp() && !a.opt.Running() {
-			if picked, changed := a.enforceFastest(); changed {
+		if !st.AutoPickOff && a.core.IsUp() {
+			if a.opt.Running() {
+				a.pickDebug(10, "a scan is running; waiting for fresh measurements before re-ranking")
+			} else if picked, changed := a.enforceFastest(); changed {
 				Log("auto-pick: switched to the fastest verified node %q (%.0fms)", picked.Name, picked.delay)
-			} else {
-				// nothing to do; the reason is in pickDebug
-				_ = picked
 			}
 		}
 
@@ -420,6 +433,155 @@ func (a *App) pickDebug(code int, format string, args ...interface{}) {
 	}
 }
 
+// healthLoop runs the liveness check on its own fast timer.
+//
+// It is deliberately separate from background(): the housekeeping tick is ten
+// seconds and also carries subscription refreshes and proxy guards, none of
+// which should delay noticing that the node in use has stopped answering.
+func (a *App) healthLoop() {
+	t := time.NewTicker(healthInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.stopCh:
+			return
+		case <-t.C:
+		}
+		if a.store.Settings().AutoPickOff || !a.core.IsUp() {
+			continue
+		}
+		a.healthCheck()
+	}
+}
+
+// healthCheck measures the node that is actually in use and moves off it when
+// it stops working.
+//
+// This exists because ranking alone is not enough. An edge that passed the
+// WebSocket probe during the last scan can be unreachable an hour later, and
+// ranking by stale numbers will happily keep sending traffic into a black hole.
+// That is exactly what happened once: every foreign site timed out for minutes
+// while auto-pick reported "already on the fastest node", because "fastest"
+// was based on a measurement that was no longer true.
+func (a *App) healthCheck() {
+	optimized, _ := a.nodeSet()
+	if len(optimized) < 1 {
+		return
+	}
+	proxies, err := a.core.Proxies()
+	if err != nil {
+		return
+	}
+	current := ""
+	if g, ok := proxies["PROXY"]; ok {
+		current = g.Now
+	}
+	if current == "" {
+		return
+	}
+
+	// A pass-through node the user picked by hand is not ours to judge.
+	isOptimised := false
+	for _, p := range optimized {
+		if p.Name == current {
+			isOptimised = true
+			break
+		}
+	}
+	if !isOptimised {
+		return
+	}
+
+	delay, derr := a.core.Delay(current, healthTimeoutMS, "")
+	if derr == nil && delay > 0 {
+		a.mu.Lock()
+		if a.healthFails > 0 {
+			Log("health: %q is answering again (%dms)", current, delay)
+		}
+		a.healthFails = 0
+		a.healthSwitches = 0
+		a.healthLastEv = fmt.Sprintf("%s ok %dms", current, delay)
+		a.mu.Unlock()
+		return
+	}
+
+	a.mu.Lock()
+	a.healthFails++
+	fails := a.healthFails
+	if a.healthBanned == nil {
+		a.healthBanned = map[string]time.Time{}
+	}
+	if a.nodeFlaky == nil {
+		a.nodeFlaky = map[string]int{}
+	}
+	a.nodeFlaky[current]++
+	flaky := a.nodeFlaky[current]
+	a.healthBanned[current] = time.Now()
+	a.healthLastEv = fmt.Sprintf("%s failed %d/%d (累计 %d 次)", current, fails, healthFailLimit, flaky)
+	tooSoon := time.Since(a.healthLastAt) < healthRetryDelay
+	a.mu.Unlock()
+
+	reason := "timed out"
+	if derr != nil {
+		reason = derr.Error()
+	}
+	Log("health: %q did not answer (%s), failure %d/%d", current, reason, fails, healthFailLimit)
+
+	if fails < healthFailLimit || tooSoon {
+		return
+	}
+
+	// Pick the best node that is not known-dead and is not the one we are on.
+	next := ""
+	for _, p := range optimized {
+		if p.Name == current {
+			continue
+		}
+		a.mu.Lock()
+		bannedAt, banned := a.healthBanned[p.Name]
+		a.mu.Unlock()
+		if banned && time.Since(bannedAt) < 5*time.Minute {
+			continue
+		}
+		next = p.Name
+		break
+	}
+	if next == "" {
+		Log("health: %q is dead but no alternative is known-good; will re-optimise", current, "WARN")
+		a.mu.Lock()
+		a.healthLastEv = "current node dead, no alternative available"
+		a.mu.Unlock()
+		a.StartOptimize()
+		return
+	}
+
+	Log("health: switching away from the dead node %q to %q", current, next, "WARN")
+	if err := a.core.Select("PROXY", next); err != nil {
+		Log("health: switch failed: %v", err, "ERR")
+		return
+	}
+	a.core.CloseConnections()
+	_ = a.store.SetCurrent(next)
+	a.mu.Lock()
+	a.healthFails = 0
+	a.healthLastAt = time.Now()
+	a.healthLastEv = fmt.Sprintf("switched %s -> %s (previous node dead)", current, next)
+	a.healthSwitches++
+	switches := a.healthSwitches
+	a.mu.Unlock()
+
+	// If nodes keep dying one after another, the pool itself is stale - a fresh
+	// scan is the only real fix.
+	if switches >= healthRescanAfter && !a.opt.Running() {
+		a.mu.Lock()
+		a.healthSwitches = 0
+		a.healthLastEv = fmt.Sprintf("%d nodes failed in a row; re-optimising", switches)
+		a.mu.Unlock()
+		Log("health: %d nodes failed in a row, starting a fresh scan", switches, "WARN")
+		a.StartOptimize()
+	}
+}
+
 // pickResult is what enforceFastest decided.
 type pickResult struct {
 	Name  string
@@ -443,6 +605,22 @@ const (
 	// userPickGrace is how long a deliberate node choice is left alone before
 	// auto-pick resumes ranking. A fresh optimisation resets it immediately.
 	userPickGrace = 10 * time.Minute
+
+	// Health checking. Being the fastest node is worth nothing if it stopped
+	// working, and an edge that answered a handshake an hour ago may be
+	// unreachable now. Letting a dead node sit for a whole scan cycle is what
+	// turned a flaky edge into "the internet is broken", so this runs on its own
+	// fast timer instead of waiting for the ten second housekeeping tick.
+	healthInterval   = 1 * time.Second
+	healthTimeoutMS  = 4000
+	healthFailLimit  = 2                // consecutive failures before switching away
+	healthRetryDelay = 25 * time.Second // minimum gap between forced switches
+	// Each recent liveness failure adds this to a node's effective latency when
+	// auto-pick ranks candidates.
+	flakyPenaltyMS = 40.0
+	// After this many forced switches in a row, stop shuffling nodes and rescan:
+	// the whole pool is probably stale, not just the node we happened to be on.
+	healthRescanAfter = 3
 )
 
 // resetPickWatch forgets any pending auto-pick. Called whenever the situation
@@ -477,6 +655,17 @@ func (a *App) enforceFastest() (pickResult, bool) {
 		}
 		if ms <= 0 {
 			continue
+		}
+		// Reliability is part of being fast. Each recent failure adds a penalty
+		// to the effective latency, so an edge that intermittently stops
+		// answering loses to one that is a few milliseconds slower but steady.
+		if a.healthBanned != nil {
+			if at, bad := a.healthBanned[p.Name]; bad && time.Since(at) < 2*time.Minute {
+				continue // found dead moments ago, do not rank it at all
+			}
+		}
+		if a.nodeFlaky != nil {
+			ms += float64(a.nodeFlaky[p.Name]) * flakyPenaltyMS
 		}
 		if bestMS == 0 || ms < bestMS {
 			best, bestMS = p, ms
@@ -772,6 +961,8 @@ func (a *App) Status() map[string]interface{} {
 		"autoPickOn":   !st.AutoPickOff,
 		"fastestName":  fastest.Name,
 		"pickDebug":    a.lastPickDebug,
+		"healthEvent":  a.healthLastEv,
+		"flakyNodes":   a.nodeFlaky,
 		"fastestMS":    fastestMS,
 		"nodes":        list,
 		"nodeCount":    len(list),

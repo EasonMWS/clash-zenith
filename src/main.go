@@ -121,6 +121,9 @@ func main() {
 	// background() is an endless loop, so it MUST run in its own goroutine.
 	app.Boot()
 	go app.background()
+	// Liveness runs on its own fast timer; the housekeeping tick is ten seconds
+	// and carries unrelated work that must not delay noticing a dead node.
+	go app.healthLoop()
 
 	srv := NewServer(app, filepath.Join(rootDir, "web"), uiPort)
 	if err := srv.Listen(); err != nil {
