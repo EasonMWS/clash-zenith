@@ -42,11 +42,28 @@ dns:
     - '*.local'
     - 'localhost.ptlogin2.qq.com'
   default-nameserver: [223.5.5.5, 119.29.29.29]
-  nameserver: [https://doh.pub/dns-query, https://dns.alidns.com/dns-query]
-  fallback: [tls://8.8.4.4, tls://1.1.1.1]
+  # Resolving the node domains is the one job that must never depend on the
+  # proxy: a hostname-based subscription resolved through the tunnel would
+  # deadlock, and resolved through a Chinese resolver it comes back clean only
+  # because the node domains are themselves fronted by Cloudflare.
+  proxy-server-nameserver: [223.5.5.5, 119.29.29.29]
+  # Chinese domains go to a Chinese resolver, which is correct and fast for them.
+  nameserver: [223.5.5.5, 119.29.29.29]
+  # Everything else is resolved through the proxy. This is the only reliable
+  # route: Chinese resolvers return poisoned answers for foreign domains, and
+  # the public resolvers that would answer correctly are unreachable from here
+  # (1.1.1.1 times out on port 53 entirely). The bootstrap below resolves the
+  # DoH hostnames through the same clean Chinese resolvers, so the first query
+  # cannot deadlock.
+  nameserver-policy:
+    'geosite:cn,private': [223.5.5.5, 119.29.29.29]
+    'geosite:geolocation-!cn': ['https://1.1.1.1/dns-query#PROXY', 'https://8.8.8.8/dns-query#PROXY']
+  fallback: [223.5.5.5, 119.29.29.29]
   fallback-filter:
     geoip: true
     geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
 `
 
 // q always quotes a scalar; provider supplied names contain characters that

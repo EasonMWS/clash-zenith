@@ -60,6 +60,8 @@ type App struct {
 	// how many forced switches happened without a successful check in between;
 	// several in a row means the pool is stale, not just the current node
 	healthSwitches int
+	// when the last health-triggered rescan started, so rescans cannot loop
+	lastHealthRescan time.Time
 	// how often each node has failed a liveness check. A node that keeps
 	// dropping out should lose to a slightly slower node that never does.
 	nodeFlaky   map[string]int
@@ -574,11 +576,22 @@ func (a *App) healthCheck() {
 	// scan is the only real fix.
 	if switches >= healthRescanAfter && !a.opt.Running() {
 		a.mu.Lock()
-		a.healthSwitches = 0
-		a.healthLastEv = fmt.Sprintf("%d nodes failed in a row; re-optimising", switches)
+		rescanTooSoon := time.Since(a.lastHealthRescan) < healthRescanCooldown
+		if !rescanTooSoon {
+			a.lastHealthRescan = time.Now()
+			a.healthSwitches = 0
+		}
+		a.healthLastEv = fmt.Sprintf("%d nodes failed in a row", switches)
 		a.mu.Unlock()
-		Log("health: %d nodes failed in a row, starting a fresh scan", switches, "WARN")
-		a.StartOptimize()
+		if rescanTooSoon {
+			// A flapping network must not turn into a permanent scan loop: each
+			// scan competes with real traffic, so repeated rescans make the very
+			// problem they are trying to fix worse.
+			Log("health: %d nodes failed in a row but a scan ran recently; not rescanning yet", switches, "WARN")
+		} else {
+			Log("health: %d nodes failed in a row, starting a fresh scan", switches, "WARN")
+			a.StartOptimize()
+		}
 	}
 }
 
@@ -608,19 +621,31 @@ const (
 
 	// Health checking. Being the fastest node is worth nothing if it stopped
 	// working, and an edge that answered a handshake an hour ago may be
-	// unreachable now. Letting a dead node sit for a whole scan cycle is what
-	// turned a flaky edge into "the internet is broken", so this runs on its own
-	// fast timer instead of waiting for the ten second housekeeping tick.
-	healthInterval   = 1 * time.Second
-	healthTimeoutMS  = 4000
-	healthFailLimit  = 2                // consecutive failures before switching away
-	healthRetryDelay = 25 * time.Second // minimum gap between forced switches
+	// unreachable now.
+	//
+	// The interval is a compromise that was tuned the hard way. Checking once a
+	// second looked attractive and was actively harmful: the probes themselves
+	// rate limited the check endpoint, the resulting 504s were read as "node is
+	// dead", and the app then churned through nodes and rescans chasing a fault
+	// it had created. Ten seconds notices a real outage quickly and is rare
+	// enough not to cause one.
+	healthInterval   = 10 * time.Second
+	healthTimeoutMS  = 6000
+	healthFailLimit  = 3                // consecutive failures before switching away
+	healthRetryDelay = 30 * time.Second // minimum gap between forced switches
 	// Each recent liveness failure adds this to a node's effective latency when
 	// auto-pick ranks candidates.
-	flakyPenaltyMS = 40.0
+	flakyPenaltyMS = 60.0
 	// After this many forced switches in a row, stop shuffling nodes and rescan:
 	// the whole pool is probably stale, not just the node we happened to be on.
-	healthRescanAfter = 3
+	healthRescanAfter = 4
+	// A rescan may not start again until this long after the previous one, so a
+	// flapping network cannot put the app into a permanent scan loop.
+	healthRescanCooldown = 10 * time.Minute
+
+	// httpProbePath is the request used to prove an edge carries real traffic,
+	// not merely that it accepts a WebSocket upgrade.
+	httpProbePath = "/"
 )
 
 // resetPickWatch forgets any pending auto-pick. Called whenever the situation

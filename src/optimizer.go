@@ -243,6 +243,57 @@ func probeWS(ip, sni, path, host string, timeout time.Duration) (time.Duration, 
 	return probeWSVerbose(ip, sni, path, host, timeout, nil)
 }
 
+// probeHTTPS fetches a URL through the tunnel, end to end.
+//
+// Verifying the WebSocket upgrade is not enough on its own. A Cloudflare edge
+// has been observed completing the upgrade happily and then silently dropping
+// ordinary HTTP requests through the same tunnel: the core's own latency test
+// reported 239 ms while every real request through that node timed out. The
+// upgrade only proves the edge accepts the request, not that it carries the
+// response back, so a candidate must also return a real status line here.
+func probeHTTPS(ip, sni, host, requestPath string, timeout time.Duration) (time.Duration, bool) {
+	dialer := &tls.Dialer{
+		Config: &tls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		},
+	}
+	conn, err := dialer.Dial("tcp", ip+":443")
+	if err != nil {
+		return 0, false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	if requestPath == "" {
+		requestPath = "/"
+	}
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Zenith-probe\r\n"+
+		"Accept: */*\r\nConnection: close\r\n\r\n", requestPath, host)
+
+	start := time.Now()
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return 0, false
+	}
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return 0, false
+	}
+	elapsed := time.Since(start)
+	line := string(buf[:n])
+	if idx := strings.Index(line, "\r\n"); idx >= 0 {
+		line = line[:idx]
+	}
+	// Any real status line proves the edge carried the response back. The code
+	// itself does not matter: 200, 301, 403 and 404 all mean the tunnel works.
+	if !strings.HasPrefix(line, "HTTP/") {
+		return 0, false
+	}
+	return elapsed, true
+}
+
 // randomWSKey produces a valid Sec-WebSocket-Key: base64 of 16 random bytes.
 // An earlier version base64 encoded a zero-padded timestamp, which decodes to
 // sixteen zero bytes - Cloudflare answers 400 Bad Request for that, and every
@@ -598,10 +649,24 @@ func (o *Optimizer) scanPass(ips []string, template *Proxy, sni, path, host stri
 			var times []float64
 			ok := 0
 			for i := 0; i < rounds; i++ {
-				if d, good := probeWS(ip, sni, path, host, 6*time.Second); good {
-					times = append(times, d.Seconds())
-					ok++
+				wsTime, good := probeWS(ip, sni, path, host, 6*time.Second)
+				if !good {
+					continue
 				}
+				// The upgrade alone is not proof. Some edges accept it and then
+				// drop ordinary traffic, so every round must also fetch a real
+				// response through the same tunnel. The cost recorded is the
+				// round trip the user will actually experience.
+				httpTime, carried := probeHTTPS(ip, sni, host, httpProbePath, 6*time.Second)
+				if !carried {
+					continue
+				}
+				if httpTime > wsTime {
+					times = append(times, httpTime.Seconds())
+				} else {
+					times = append(times, wsTime.Seconds())
+				}
+				ok++
 			}
 			n := atomic.AddInt64(&done, 1)
 			if n%10 == 0 {
