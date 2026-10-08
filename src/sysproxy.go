@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -347,6 +348,47 @@ func (s *SystemProxy) GuardDeadProxy() {
 	if !s.Restore() {
 		s.Disable()
 	}
+}
+
+// NeutraliseFromOtherProcess is the last resort for the case where Zenith's
+// process dies without running its shutdown path - a crash, a task kill, a power
+// event. It is started detached by the watchdog helper, because a registry left
+// pointing at a dead local port means no internet at all, which is the worst
+// thing a proxy client can leave behind.
+//
+// It stands down while a live Zenith still owns the port, so a normal restart is
+// never disturbed.
+func NeutraliseFromOtherProcess(stateDir string, port int) {
+	s := NewSystemProxy(stateDir)
+	st := s.Status()
+	if !st.Enabled || portFromServer(st.Server) != port {
+		return // nothing of ours is in the registry any more
+	}
+	// Give a starting instance time to bind before deciding it is dead.
+	for i := 0; i < 24; i++ {
+		if IsPortListening(port) {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	Log("watchdog: port %d never came up; clearing the proxy so the machine is not left offline", port, "WARN")
+	if !s.Restore() {
+		s.Disable()
+	}
+}
+
+// ServeWatchdog is the entry point for the detached recovery process. It
+// returns false for every other invocation so normal startup is unaffected.
+func ServeWatchdog(args []string) bool {
+	if len(args) < 3 || args[0] != "-watchdog" {
+		return false
+	}
+	port := 0
+	fmt.Sscanf(args[2], "%d", &port)
+	if port > 0 {
+		NeutraliseFromOtherProcess(args[1], port)
+	}
+	return true
 }
 
 // ---- hidden command helper ------------------------------------------------

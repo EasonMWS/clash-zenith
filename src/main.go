@@ -36,6 +36,12 @@ func main() {
 	)
 	flag.Parse()
 
+	// Detached recovery path: when the process is killed without a chance to
+	// clean up, this child clears a proxy left pointing at a dead port.
+	if ServeWatchdog(flag.Args()) {
+		return
+	}
+
 	// A GUI-subsystem binary has no console, so an unhandled panic would vanish
 	// without a trace. Catch it and put it in the log instead.
 	defer func() {
@@ -121,9 +127,13 @@ func main() {
 	// background() is an endless loop, so it MUST run in its own goroutine.
 	app.Boot()
 	go app.background()
-	// Liveness runs on its own fast timer; the housekeeping tick is ten seconds
-	// and carries unrelated work that must not delay noticing a dead node.
+	// Liveness runs on its own timer, separate from the housekeeping tick so
+	// unrelated work can never delay noticing a dead node.
 	go app.healthLoop()
+	// Insurance against this process being killed outright: a detached child
+	// waits for the proxy port to come up and, if it never does, clears the
+	// registry entry so the machine is not left with no internet.
+	startWatchdog(app.dataDir, app.store.Settings().MixedPort)
 
 	srv := NewServer(app, filepath.Join(rootDir, "web"), uiPort)
 	if err := srv.Listen(); err != nil {
@@ -192,6 +202,33 @@ func main() {
 	// Keep the backend alive for as long as the process runs. The window may be
 	// closed and reopened many times; only the tray's 退出 does a real shutdown.
 	select {}
+}
+
+// startWatchdog launches a detached copy of this executable in -watchdog mode.
+//
+// It is the answer to "the app died and left my network broken": the child keeps
+// running after the parent is gone, waits for the proxy port to come up and,
+// when it never does, puts the registry back. It stays silent while a live
+// instance owns the port, so a normal restart is unaffected.
+func startWatchdog(dataDir string, port int) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, "-watchdog", dataDir, fmt.Sprint(port))
+	cmd.Dir = filepath.Dir(exe)
+	// detached: no console, no shared stdio, and it must outlive us
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000 | 0x00000008, // CREATE_NO_WINDOW | DETACHED_PROCESS
+	}
+	if err := cmd.Start(); err != nil {
+		Log("could not start the proxy watchdog: %v", err, "WARN")
+		return
+	}
+	// Reap it so no zombie entry lingers; the child keeps running regardless.
+	go func() { _ = cmd.Wait() }()
+	Log("proxy watchdog armed (port %d)", port)
 }
 
 // ---- tray menu ------------------------------------------------------------
