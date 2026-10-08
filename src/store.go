@@ -40,7 +40,16 @@ type Proxy struct {
 	// MeasuredMS is the WebSocket handshake time the optimiser measured for this
 	// edge, in milliseconds. It is what auto-pick ranks by, so the choice is
 	// based on the real tunnel rather than on a ping.
-	MeasuredMS float64                `json:"measuredMs,omitempty"`
+	MeasuredMS float64 `json:"measuredMs,omitempty"`
+	// OriginNode marks the hostname variant of a tunnel. It is not pinned to any
+	// one Cloudflare edge, so it cannot be killed by a single address being
+	// filtered; the health checker treats it as the safe option.
+	OriginNode bool `json:"originNode,omitempty"`
+	// OriginHost is the real server hostname behind the tunnel. When a node is
+	// pinned to an edge IP this is where the SNI and Host header values come
+	// from, so keeping it on the struct means they survive a scan instead of
+	// being re-derived by hand at every use.
+	OriginHost string                 `json:"originHost,omitempty"`
 	Extra      map[string]interface{} `json:"-"`
 }
 

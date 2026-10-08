@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -211,6 +212,124 @@ func looksLikeIPv4(s string) bool {
 		}
 	}
 	return true
+}
+
+// Candidate bookkeeping.
+//
+// A Cloudflare edge address that fails is usually blocked rather than briefly
+// busy, and the failure is permanent enough to matter: a pool that keeps
+// offering dead addresses wastes most of every scan re-proving that they are
+// still dead, and the few live addresses never get a turn. So each address
+// carries a strike count and the time it was last seen working, and the scan
+// spends its budget on the addresses most likely to answer.
+const (
+	candidateDeadStrikes = 2                // failures in a row before it is benched
+	candidateBenchFor    = 30 * time.Minute // how long a benched address sits out
+)
+
+type candidateStat struct {
+	Fails    int       `json:"fails"`
+	LastOK   time.Time `json:"lastOk,omitempty"`
+	LastFail time.Time `json:"lastFail,omitempty"`
+}
+
+func (o *Optimizer) candidateStatFile() string {
+	return filepath.Join(o.dataDir, "candidates.stat.json")
+}
+
+func (o *Optimizer) loadCandidateStats() map[string]candidateStat {
+	out := map[string]candidateStat{}
+	b, err := os.ReadFile(o.candidateStatFile())
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+func (o *Optimizer) saveCandidateStats(stats map[string]candidateStat) {
+	// Keep the file from growing without bound if the pool churns a lot.
+	if len(stats) > 4000 {
+		trimmed := make(map[string]candidateStat, 2000)
+		type kv struct {
+			k string
+			t time.Time
+		}
+		var all []kv
+		for k, v := range stats {
+			t := v.LastOK
+			if v.LastFail.After(t) {
+				t = v.LastFail
+			}
+			all = append(all, kv{k, t})
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].t.After(all[j].t) })
+		for i := 0; i < 2000 && i < len(all); i++ {
+			trimmed[all[i].k] = stats[all[i].k]
+		}
+		stats = trimmed
+	}
+	b, err := json.MarshalIndent(stats, "", " ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(o.candidateStatFile(), b, 0o644)
+}
+
+// rankCandidates orders the pool so the scan meets live addresses first:
+// addresses that worked recently, then ones never tried, then the failures - and
+// it drops addresses that are currently benched unless that would leave too few
+// to scan.
+func (o *Optimizer) rankCandidates(ips []string) []string {
+	stats := o.loadCandidateStats()
+	now := time.Now()
+
+	var good, fresh, benched, stale []string
+	for _, ip := range ips {
+		st, seen := stats[ip]
+		if !seen {
+			fresh = append(fresh, ip)
+			continue
+		}
+		if st.Fails >= candidateDeadStrikes {
+			if now.Sub(st.LastFail) < candidateBenchFor {
+				benched = append(benched, ip)
+			} else {
+				stale = append(stale, ip)
+			}
+			continue
+		}
+		good = append(good, ip)
+	}
+	// Most recently working first.
+	sort.SliceStable(good, func(i, j int) bool {
+		return stats[good[i]].LastOK.After(stats[good[j]].LastOK)
+	})
+
+	out := append(append(append(good, fresh...), stale...), benched...)
+	return out
+}
+
+// recordCandidateOutcome updates the bookkeeping after a scan pass.
+func (o *Optimizer) recordCandidateOutcome(worked, failed []string) {
+	stats := o.loadCandidateStats()
+	now := time.Now()
+	for _, ip := range worked {
+		st := stats[ip]
+		st.Fails = 0
+		st.LastOK = now
+		stats[ip] = st
+	}
+	for _, ip := range failed {
+		st := stats[ip]
+		st.Fails++
+		st.LastFail = now
+		stats[ip] = st
+	}
+	o.saveCandidateStats(stats)
+	if n := len(failed); n > 0 {
+		Log("candidate pool: %d address(es) did not answer this pass", n)
+	}
 }
 
 func (o *Optimizer) learnCandidates(ips []string) int {
@@ -477,7 +596,7 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Prox
 			g.index, g.ep.SNI, g.ep.Host, g.ep.Path, g.template.Name)
 	}
 
-	ips := o.Candidates()
+	ips := o.rankCandidates(o.Candidates())
 	total := len(ips)
 	if total == 0 {
 		return nil, nil, fmt.Errorf("候选 IP 池是空的")
@@ -569,6 +688,10 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Prox
 			p := oc.group.template
 			p.Server = r.IP
 			p.MeasuredMS = r.Median * 1000
+			p.OriginHost = oc.group.ep.Host
+			if p.OriginHost == "" {
+				p.OriginHost = oc.group.ep.SNI
+			}
 			// The IP already identifies the winner; the tunnel suffix only has to
 			// disambiguate when more than one relay is in play.
 			if len(groups) > 1 {
@@ -581,6 +704,40 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Prox
 	}
 	if len(out) == 0 {
 		return nil, nil, fmt.Errorf("没有一个边缘节点可用：可能是订阅已失效或网络本身有问题")
+	}
+
+	// Always keep a hostname-based node alongside the pinned IPs.
+	//
+	// This is the safety net for the failure that actually happens: individual
+	// Cloudflare edge addresses get blocked while the service itself is fine. A
+	// node pinned to a blocked IP is dead until the next scan finds a live one,
+	// but a node pointed at the hostname lets Cloudflare's anycast pick a working
+	// edge on every single connection. It is marginally slower and completely
+	// immune to one IP being filtered, which is exactly the trade worth making.
+	for _, oc := range outcomes {
+		if oc.err != nil || len(oc.results) == 0 {
+			continue
+		}
+		host := oc.group.ep.Host
+		if host == "" {
+			host = oc.group.ep.SNI
+		}
+		if host == "" || looksLikeIPv4(host) {
+			continue
+		}
+		d := oc.group.template
+		d.Server = host
+		// no measurement: it is picked for reachability, not for speed
+		d.MeasuredMS = 0
+		d.OriginNode = true
+		d.OriginHost = host
+		if len(groups) > 1 {
+			d.Name = fmt.Sprintf("兜底T%d · %s · 域名", oc.group.index, host)
+		} else {
+			d.Name = fmt.Sprintf("兜底 · %s · 域名", host)
+		}
+		out = append(out, d)
+		Log("added fallback node %q: it follows whatever edge Cloudflare picks, so one blocked IP cannot take it out", d.Name)
 	}
 
 	sort.Slice(allUsable, func(i, j int) bool { return allUsable[i].Score < allUsable[j].Score })
@@ -632,6 +789,7 @@ func (o *Optimizer) scanPass(ips []string, template *Proxy, sni, path, host stri
 	var done int64
 	sem := make(chan struct{}, workers)
 	results := make([]edgeResult, 0, total)
+	var dead []string
 	var resMu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -674,6 +832,9 @@ func (o *Optimizer) scanPass(ips []string, template *Proxy, sni, path, host stri
 					fmt.Sprintf("正在测试边缘节点 %d/%d", n, total))
 			}
 			if ok == 0 {
+				resMu.Lock()
+				dead = append(dead, ip)
+				resMu.Unlock()
 				return
 			}
 			sort.Float64s(times)
@@ -688,6 +849,13 @@ func (o *Optimizer) scanPass(ips []string, template *Proxy, sni, path, host stri
 	}
 	wg.Wait()
 	sort.Slice(results, func(i, j int) bool { return results[i].Score < results[j].Score })
+	// Feed the outcome back so the next scan spends its time on addresses that
+	// are likely to answer instead of re-proving that blocked ones are blocked.
+	worked := make([]string, 0, len(results))
+	for _, r := range results {
+		worked = append(worked, r.IP)
+	}
+	o.recordCandidateOutcome(worked, dead)
 	return results, nil
 }
 

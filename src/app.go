@@ -57,6 +57,8 @@ type App struct {
 	healthLastAt time.Time
 	healthBanned map[string]time.Time // node name -> when it was found dead
 	healthLastEv string               // last health event, surfaced through the API
+	// consecutive measurements over slowNodeMS; two in a row triggers a switch
+	slowStrikes int
 	// how many forced switches happened without a successful check in between;
 	// several in a row means the pool is stale, not just the current node
 	healthSwitches int
@@ -289,6 +291,26 @@ func (a *App) EnsureUsablePort() {
 		return
 	}
 
+	// PortFreeToBind can fail for reasons that are not "someone else has it":
+	// a core that just exited keeps its socket in a lingering state for a
+	// moment. Rotating the port in that case is actively harmful, because every
+	// program that stored the old port - including the system proxy setting the
+	// user's browser reads - silently loses its connection. So before giving up
+	// on the configured port, check the real listener table and wait briefly for
+	// the old owner to finish dying.
+	if !portHasListener(want) {
+		for i := 0; i < 20; i++ {
+			time.Sleep(300 * time.Millisecond)
+			if PortFreeToBind(want) {
+				Log("mixed port %d was briefly busy but is ours again; keeping it", want)
+				return
+			}
+			if portHasListener(want) {
+				break // a real foreign program has it after all
+			}
+		}
+	}
+
 	// If the thing sitting on the port is another Zenith instance, this process
 	// has no business running at all; the UI port check catches that case, so
 	// reaching here means a foreign proxy holds it.
@@ -307,7 +329,13 @@ func (a *App) EnsureUsablePort() {
 		Log("could not persist the new mixed port: %v", err, "WARN")
 		return
 	}
-	a.lastErr = fmt.Sprintf("端口 %d 已被其他程序占用，已自动改用 %d", want, free)
+	a.lastErr = fmt.Sprintf("端口 %d 已被其他程序占用，已自动改用 %d（旧端口上的连接会断开，重启一下浏览器即可）", want, free)
+}
+
+// portHasListener reports whether something is really listening on the port,
+// according to the OS rather than to a bind attempt.
+func portHasListener(port int) bool {
+	return len(ListeningPids(port)) > 0
 }
 
 func (a *App) bootCore() {
@@ -435,6 +463,72 @@ func (a *App) pickDebug(code int, format string, args ...interface{}) {
 	}
 }
 
+// reactToSlowness moves off a node whose measured round trip has degraded.
+//
+// Ranking alone cannot catch this. Auto-pick compares nodes against each other,
+// so when every node gets slower - which is exactly what happens when the
+// network, not the node, is having a bad hour - the fastest of a bad set still
+// wins and nothing changes. This compares the node against an absolute bar
+// instead, and falls back to the hostname node because it is the one option that
+// does not depend on any single address still being reachable.
+func (a *App) reactToSlowness(current string, delay float64) {
+	if delay < slowNodeMS {
+		a.mu.Lock()
+		a.slowStrikes = 0
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Lock()
+	// One slow measurement is noise; the bar is deliberately generous, so
+	// crossing it twice in a row means something real.
+	a.slowStrikes++
+	strikes := a.slowStrikes
+	tooSoon := time.Since(a.healthLastAt) < healthRetryDelay
+	a.slowStrikes = 0
+	a.mu.Unlock()
+
+	if strikes < 2 || tooSoon {
+		return
+	}
+
+	optimized, _ := a.nodeSet()
+	// Prefer the hostname node: a node that is merely far away is a worse bet
+	// than one that follows Cloudflare's routing.
+	target := ""
+	for _, p := range optimized {
+		if p.OriginNode && p.Name != current {
+			target = p.Name
+			break
+		}
+	}
+	if target == "" {
+		// Otherwise take the best-ranked alternative, which is the one the last
+		// scan verified fastest after the reliability penalty.
+		for _, p := range optimized {
+			if p.Name != current && p.MeasuredMS > 0 {
+				target = p.Name
+				break
+			}
+		}
+	}
+	if target == "" {
+		return
+	}
+
+	Log("health: %q measured %.0fms which is over the %dms bar; switching to %q",
+		current, delay, slowNodeMS, target, "WARN")
+	if err := a.core.Select("PROXY", target); err != nil {
+		Log("health: slow-node switch failed: %v", err, "ERR")
+		return
+	}
+	a.core.CloseConnections()
+	_ = a.store.SetCurrent(target)
+	a.mu.Lock()
+	a.healthLastAt = time.Now()
+	a.healthLastEv = fmt.Sprintf("%s was %.0fms, switched to %s", current, delay, target)
+	a.mu.Unlock()
+}
+
 // healthLoop runs the liveness check on its own fast timer.
 //
 // It is deliberately separate from background(): the housekeeping tick is ten
@@ -504,6 +598,12 @@ func (a *App) healthCheck() {
 		a.healthSwitches = 0
 		a.healthLastEv = fmt.Sprintf("%s ok %dms", current, delay)
 		a.mu.Unlock()
+
+		// Answering is not the same as answering well. A node can stay reachable
+		// while its real round trip degrades several times over, and ranking by
+		// numbers measured half an hour ago will not notice. This is the check
+		// that turns "delayed" into "switched".
+		a.reactToSlowness(current, float64(delay))
 		return
 	}
 
@@ -534,19 +634,34 @@ func (a *App) healthCheck() {
 	}
 
 	// Pick the best node that is not known-dead and is not the one we are on.
+	//
+	// The hostname node is considered first. If the individual edge addresses are
+	// being filtered, every pinned node fails in turn and switching between them
+	// is pointless - the hostname node asks Cloudflare for a fresh edge on each
+	// connection, so it keeps working when none of the pinned addresses do. It is
+	// preferred here rather than ranked, because this path is only reached after
+	// the fast options have already proved themselves dead.
 	next := ""
 	for _, p := range optimized {
-		if p.Name == current {
-			continue
+		if p.OriginNode && p.Name != current {
+			next = p.Name
+			break
 		}
-		a.mu.Lock()
-		bannedAt, banned := a.healthBanned[p.Name]
-		a.mu.Unlock()
-		if banned && time.Since(bannedAt) < 5*time.Minute {
-			continue
+	}
+	if next == "" {
+		for _, p := range optimized {
+			if p.Name == current {
+				continue
+			}
+			a.mu.Lock()
+			bannedAt, banned := a.healthBanned[p.Name]
+			a.mu.Unlock()
+			if banned && time.Since(bannedAt) < 5*time.Minute {
+				continue
+			}
+			next = p.Name
+			break
 		}
-		next = p.Name
-		break
 	}
 	if next == "" {
 		Log("health: %q is dead but no alternative is known-good; will re-optimise", current, "WARN")
@@ -639,6 +754,10 @@ const (
 	// After this many forced switches in a row, stop shuffling nodes and rescan:
 	// the whole pool is probably stale, not just the node we happened to be on.
 	healthRescanAfter = 4
+	// slowNodeMS is the absolute round trip above which the node in use is
+	// considered degraded rather than merely not-the-fastest. Healthy values sit
+	// near 250ms, so this only trips on a real collapse.
+	slowNodeMS = 1200
 	// A rescan may not start again until this long after the previous one, so a
 	// flapping network cannot put the app into a permanent scan loop.
 	healthRescanCooldown = 10 * time.Minute
@@ -834,7 +953,26 @@ func (a *App) nodeSet() (optimized []Proxy, base []Proxy) {
 	optimized = snap.Optimized
 	base = snap.BaseNodes
 	if n := snap.Settings.KeepNodes; n > 0 && len(optimized) > n {
-		optimized = optimized[:n]
+		// Truncate the ranked list but never drop a hostname node. Those are the
+		// safety net for a whole address range being filtered, and a display cap
+		// must not be able to remove the one node that still works when every
+		// pinned IP is dead. They are kept at the end so the fast nodes stay on
+		// top of the list.
+		var keep, origin []Proxy
+		for _, p := range optimized {
+			if p.OriginNode {
+				origin = append(origin, p)
+				continue
+			}
+			if len(keep) < n {
+				keep = append(keep, p)
+			}
+		}
+		if len(origin) > 0 {
+			optimized = append(keep, origin...)
+		} else {
+			optimized = keep
+		}
 	}
 	return optimized, base
 }

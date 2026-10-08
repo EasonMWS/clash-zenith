@@ -31,6 +31,28 @@ profile:
   store-fake-ip: false
 geo-auto-update: false
 geodata-mode: false
+# Sniffing is what keeps traffic from leaking where it is really going.
+#
+# Without it the core routes by whatever address it resolved, and a connection
+# that arrived as a bare IP stays a bare IP: the rule engine cannot recognise
+# the site, the request falls through to MATCH, and a domain that should have
+# gone direct ends up in the tunnel. Sniffing recovers the hostname from the TLS
+# handshake or the HTTP request and re-routes on it.
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    HTTP:
+      ports: [80, 8080, 8880, 2052, 2082, 2086, 2095]
+    TLS:
+      ports: [443, 8443, 2053, 2083, 2087, 2096]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - 'Mijia Cloud'
+    - '+.push.apple.com'
 dns:
   enable: true
   ipv6: false
