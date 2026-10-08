@@ -346,6 +346,22 @@ func BuildConfig(nodes []Proxy, optimised []string, st Settings, secret string, 
 		}
 		fmt.Fprintf(&b, "  - %s\n", q(r))
 	}
+	if !st.GamePlatformDirectOff {
+		// Game launchers and stores, placed before the CN rules on purpose.
+		//
+		// The problem this solves: a launcher opens, the login and store requests
+		// go out, and the pages hang or the sign-in fails, because those endpoints
+		// are blocked while the launcher itself never consults the system proxy
+		// for them. Naming the platforms explicitly is what fixes it.
+		//
+		// Only the store/community/login side is listed. The download CDNs are
+		// absent from these categories, which is exactly what we want: they are
+		// usually reachable directly and pulling game data through a proxy would
+		// be far slower.
+		for _, site := range gamePlatformSites {
+			fmt.Fprintf(&b, "  - %s\n", q("GEOSITE,"+site+",PROXY"))
+		}
+	}
 	if st.DirectCNDomains {
 		// geosite:cn is the reliable way to catch Chinese sites: DOMAIN-SUFFIX,cn
 		// alone misses the many .com ones (baidu.com, bilibili.com, taobao.com).
@@ -355,6 +371,30 @@ func BuildConfig(nodes []Proxy, optimised []string, st Settings, secret string, 
 	b.WriteString("  - \"DOMAIN-SUFFIX,cn,DIRECT\"\n")
 	b.WriteString("  - \"MATCH,PROXY\"\n")
 	return b.String()
+}
+
+// gamePlatformSites are the GeoSite categories covering the international game
+// launchers, stores and their login endpoints. Every name here was checked
+// against the bundled GeoSite.dat; a category that does not exist in the data
+// file makes the core refuse to start, so this list must not be guessed at.
+//
+// Deliberately absent: steamcn and similar China-specific entries, and any
+// category that only contains download CDN hostnames.
+var gamePlatformSites = []string{
+	"steam",       // store, community, login (NOT the download CDN)
+	"epicgames",   // Epic Games Store and launcher
+	"ea",          // EA app and Origin
+	"origin",      // older Origin endpoints still in use
+	"ubisoft",     // Ubisoft Connect
+	"blizzard",    // Battle.net and Blizzard login
+	"riot",        // Riot Client and League of Legends
+	"rockstar",    // Rockstar Games Launcher
+	"gog",         // GOG Galaxy
+	"nintendo",    // Nintendo eShop and account
+	"playstation", // PlayStation Network
+	"xbox",        // Xbox app and account
+	"discord",     // voice and chat, commonly used alongside games
+	"twitch",      // streaming, same audience
 }
 
 func contains(list []string, s string) bool {

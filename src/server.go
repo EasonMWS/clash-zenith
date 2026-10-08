@@ -273,12 +273,14 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		st := s.app.store.Settings()
 		writeJSON(w, 200, map[string]interface{}{
-			"ok":         true,
-			"rules":      st.CustomRules,
-			"targets":    RuleTargets,
-			"blockAds":   st.BlockAds,
-			"directCN":   st.DirectCNDomains,
-			"currentCfg": s.app.CurrentConfigPreview(),
+			"ok":       true,
+			"rules":    st.CustomRules,
+			"targets":  RuleTargets,
+			"blockAds": st.BlockAds,
+			"directCN": st.DirectCNDomains,
+			// inverted on purpose: true means the game platforms go direct
+			"gamePlatformDirectOff": st.GamePlatformDirectOff,
+			"currentCfg":            s.app.CurrentConfigPreview(),
 		})
 		return
 	}

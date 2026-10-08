@@ -91,6 +91,12 @@ type Settings struct {
 	ProxyBypass     string   `json:"proxyBypass"`     // system proxy bypass list
 	DirectCNDomains bool     `json:"directCNDomains"` // geosite:cn -> DIRECT
 	BlockAds        bool     `json:"blockAds"`        // geosite:category-ads-all -> REJECT
+	// GamePlatformThroughProxy routes the store, community and login endpoints of
+	// the international game platforms through the proxy. Their download CDNs are
+	// deliberately left out: those are mostly reachable directly and much faster
+	// that way. Stored inverted so an older settings file without the field
+	// defaults to on.
+	GamePlatformDirectOff bool `json:"gamePlatformDirectOff"`
 
 	// meta
 	WindowWidth  int    `json:"windowWidth"`

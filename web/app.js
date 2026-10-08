@@ -527,6 +527,8 @@ async function loadRules() {
   $('#rules').value = (r.rules || []).join('\n');
   $('#sw-directcn').checked = !!r.directCN;
   $('#sw-blockads').checked = !!r.blockAds;
+  // 反向存储：字段为 true 表示「游戏平台直连」，所以勾选状态要取反
+  $('#sw-gameplat').checked = !r.gamePlatformDirectOff;
   $('#current-cfg').textContent = r.currentCfg || '（配置为空）';
   $('#rule-target').innerHTML = (r.targets || ['PROXY'])
     .map((t) => '<option value="' + esc(t) + '">' + esc(t) + '</option>').join('');
@@ -832,11 +834,16 @@ function bindAdvanced() {
   $('#btn-save-rules').addEventListener('click', function () { saveRules(this); });
   $('#btn-cfg-refresh').addEventListener('click', function () { guard(this, loadRules); });
 
-  [['#sw-directcn', 'directCNDomains', '国内直连'], ['#sw-blockads', 'blockAds', '广告拦截']].forEach((t) => {
+  // 第三项是反向开关：存储的字段是 "...DirectOff"，所以勾选状态和存的值相反。
+  // 之所以反向存，是为了让没有这个字段的旧设置文件默认落成"开启"。
+  [['#sw-directcn', 'directCNDomains', '国内直连', false],
+   ['#sw-blockads', 'blockAds', '广告拦截', false],
+   ['#sw-gameplat', 'gamePlatformDirectOff', '游戏平台走代理', true]].forEach((t) => {
+    const inverted = t[3];
     $(t[0]).addEventListener('change', function () {
       const on = this.checked, el = this;
       guard(el, async () => {
-        const r = await api('/api/settings', patchOf(t[1], on));
+        const r = await api('/api/settings', patchOf(t[1], inverted ? !on : on));
         if (r.ok) { toast(t[2] + (on ? '已开启' : '已关闭'), 'ok'); loadRules(); }
         else { el.checked = !on; toast('设置失败：' + r.error, 'err'); }
       });
