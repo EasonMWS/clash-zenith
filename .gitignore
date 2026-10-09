@@ -34,8 +34,7 @@ desktop.ini
 
 # ---- go ----
 /vendor/
-# ---- runtime state that must never be committed ----
-#
+
 # config.last-good.yaml is the rollback copy of the generated configuration. It
 # is a full configuration: the same node credentials the subscription carries.
 # It was committed by accident when the configuration transaction was added, and
@@ -52,3 +51,33 @@ desktop.ini
 # does not read ACLs. Rotate it if it has ever been pushed: deleting a file from a
 # repository does not remove it from the history other people already have.
 /data/control.secret
+
+# ---- everything this program writes at runtime -----------------------------
+#
+# One rule per kind rather than one per file, because the per-file approach failed
+# twice: config.last-good.yaml was committed when the configuration transaction was
+# added, and data/control.secret was committed when the resident service was added -
+# seven commits, to a public repository, holding the key to the core's control API.
+# Both times the file was added by code and forgotten by the ignore list.
+#
+# Anything under data/ that this program generates belongs here. What is tracked
+# under data/ is only what ships: the rule databases, the icon, the marker file and
+# the candidate pool.
+/data/state.json
+/data/state.json.*
+/data/config.yaml
+/data/config.yaml.*
+/data/config.last-good.yaml
+/data/control.secret
+/data/proxy-snapshot.json
+/data/cache.db
+/data/nodes.json
+/data/ui-profile/
+/data/ASN.mmdb
+/data/*.part
+# the transaction records: both of them, whichever kind is added next
+/data/*-transaction.json
+# the activation record and the core-ownership record
+/data/activation-handover.json
+/data/activation.yield
+/data/service-state.json
