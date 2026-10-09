@@ -1968,3 +1968,125 @@ func TestTrafficReportIsRecordedOnTheTransaction(t *testing.T) {
 		t.Errorf("stage = %q, want 路由", back.Traffic.Stage)
 	}
 }
+
+// ---- the control secret belongs to the data directory ----------------------
+
+func TestControlSecretIsStableAcrossProcesses(t *testing.T) {
+	// Generated fresh on every start, the secret differed between the ordinary
+	// instance and the elevated helper reading the same data directory. The helper
+	// wrote a configuration with its secret and started a core with it, and the
+	// ordinary instance was left holding a value that no longer matched - a core
+	// that is up, reported as unavailable. Two processes reading the same directory
+	// must get the same secret.
+	dir := t.TempDir()
+
+	first, err := loadOrCreateSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) < 32 {
+		t.Fatalf("secret is too short to be strong: %d characters", len(first))
+	}
+	second, err := loadOrCreateSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("two reads of the same data directory produced different secrets")
+	}
+
+	// And it is on disk, so a separate process gets the same answer.
+	raw, err := os.ReadFile(secretPath(dir))
+	if err != nil {
+		t.Fatalf("the secret was not written to disk: %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != first {
+		t.Error("the file does not contain the secret that was returned")
+	}
+}
+
+func TestControlSecretIsRestrictedToThisAccount(t *testing.T) {
+	// The secret grants control of the core's configuration API, which is enough to
+	// redirect every connection this machine makes.
+	//
+	// The check is against the actual ACL rather than the POSIX mode, because on
+	// Windows the mode OpenFile takes does not restrict anything: the first version
+	// of this file read 0666 on disk while its comment claimed owner-only. Measured
+	// rather than assumed.
+	dir := t.TempDir()
+	if _, err := loadOrCreateSecret(dir); err != nil {
+		t.Fatal(err)
+	}
+	out, err := HiddenCommand("icacls", secretPath(dir))
+	if err != nil {
+		t.Skipf("icacls is unavailable, cannot check the ACL: %v", err)
+	}
+	// Broad principals that must not appear.
+	for _, broad := range []string{"Everyone", "BUILTIN\\Users", "Authenticated Users"} {
+		if strings.Contains(out, broad) {
+			t.Errorf("the secret file grants access to %q:\n%s", broad, out)
+		}
+	}
+	// The current account must appear, or the file was restricted to nobody.
+	user := os.Getenv("USERNAME")
+	if user != "" && !strings.Contains(out, user) {
+		t.Errorf("the secret file does not grant access to the current account %q:\n%s", user, out)
+	}
+}
+
+func TestControlSecretIsNotSilentlyReplaced(t *testing.T) {
+	// A core may be running with the value that is on disk. Replacing it would make
+	// that core unreachable with no explanation, so a present-but-unusable file is
+	// reported instead.
+	dir := t.TempDir()
+	if err := os.WriteFile(secretPath(dir), []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateSecret(dir); err == nil {
+		t.Fatal("an unusable secret file should be reported, not silently replaced")
+	}
+	// And the file is left as it was.
+	raw, _ := os.ReadFile(secretPath(dir))
+	if string(raw) != "short" {
+		t.Error("the unusable file was modified instead of reported")
+	}
+}
+
+func TestControlSecretIsDistinctPerDataDirectory(t *testing.T) {
+	// Two installations must not share a secret.
+	a, err := loadOrCreateSecret(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := loadOrCreateSecret(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Error("two different data directories produced the same secret")
+	}
+}
+
+func TestSecretIsUsableAsAnAPIHeader(t *testing.T) {
+	// It travels in a header, so it must not need escaping, and it must carry
+	// enough entropy to be worth calling a secret.
+	dir := t.TempDir()
+	s, err := loadOrCreateSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_'
+		if !ok {
+			t.Fatalf("the secret contains %q, which is not URL-safe", string(c))
+		}
+	}
+	if ensureSecretFileExists(t.TempDir()) {
+		t.Error("a directory with no secret should report none")
+	}
+	if !ensureSecretFileExists(dir) {
+		t.Error("a directory with a secret should report one")
+	}
+}

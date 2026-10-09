@@ -117,17 +117,32 @@ func NewApp(rootDir string) (*App, error) {
 	}
 	st := store.Settings()
 
+	// The control secret is owned by the data directory, not by this process.
+	//
+	// It used to be generated fresh on every start. That is fine for strength and
+	// fatal for a handover: an elevated helper is a separate process reading the
+	// same data directory, so it generated its own secret and the ordinary instance
+	// was left holding one that no longer matched the running core - which is the
+	// review's finding that a core can be up and still be called unavailable.
+	//
+	// Read once, here, and passed to everything that needs it, so there is exactly
+	// one value for this data directory.
+	secret, err := loadOrCreateSecret(dataDir)
+	if err != nil {
+		return nil, err
+	}
+
 	app := &App{
 		store:      store,
 		dataDir:    dataDir,
 		rootDir:    rootDir,
 		logDir:     logDir,
 		configPath: filepath.Join(dataDir, "config.yaml"),
-		// A cryptographic secret, not a timestamp. The control API is the one
-		// thing that can reconfigure the core, and the previous value was
+		// A cryptographic secret, not a timestamp. The control API is the one thing
+		// that can reconfigure the core, and the previous value was
 		// time.Now().UnixNano()%1_000_000 - a guessable value with a space of a
 		// million, which a local process could brute force in seconds.
-		secret:  randomToken(),
+		secret:  secret,
 		dnsPort: st.MixedPort + 300,
 		stopCh:  make(chan struct{}),
 	}
@@ -157,6 +172,11 @@ func (a *App) rebindDirs(dataDir string) {
 	a.store = store
 	a.dataDir = dataDir
 	a.configPath = filepath.Join(dataDir, "config.yaml")
+	// The secret belongs to the directory, so a rebind reads the new one rather
+	// than carrying the old secret into a tree it does not belong to.
+	if s, err := loadOrCreateSecret(dataDir); err == nil {
+		a.secret = s
+	}
 	st := store.Settings()
 	a.dnsPort = st.MixedPort + 300
 	// the core always lives next to the executable, never inside the data dir
