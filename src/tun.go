@@ -1355,6 +1355,9 @@ func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 	// behind could only be removed by hand as an administrator. A mode that can
 	// strand the user, that the program cannot undo, and that reports "protected"
 	// while doing it is worse than no mode at all.
+	// The mode goes back to off, and this is the same rule as the recovery path: a
+	// stored mode that does not describe the machine is worse than no mode, because
+	// everything that asks "is TUN on?" believes it.
 	if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
 		Log("TUN rollback: could not switch the mode back off: %v", err, "WARN")
 		txB.Steps = append(txB.Steps, tunStep{
@@ -1490,14 +1493,33 @@ func (a *App) RecoverTun() {
 			Log("TUN: mode %s is active and adapter %q is present", st.TunMode, st.TunDevice)
 			return
 		}
-		Log("TUN: settings say %s but adapter %q is not present; the tunnel is not up",
-			st.TunMode, st.TunDevice, "WARN")
+		// The stored mode is cleared, not just reported.
+		//
+		// This is the difference between a state that is described and a state that is
+		// wrong. The adapter is gone, so the tunnel is not up - and leaving
+		// `tunMode: compat` in the file means every part of the program that asks "is TUN
+		// on?" gets yes. The visible consequence is that the system proxy cannot be
+		// enabled, because the two are mutually exclusive and the program believes the
+		// other one holds the traffic:
+		//
+		//   settings say compat but adapter "Zenith" is not present; the tunnel is not up
+		//   开系统代理: ok=False  TUN 接管正在使用中
+		//
+		// A machine in that state has no tunnel and no proxy, and the interface reports a
+		// mode that is not running. Clearing it restores the arrangement the user can
+		// actually use - the system proxy - and the interface says plainly that TUN needs
+		// enabling again if they want it.
+		Log("TUN: settings say %s but adapter %q is not present; clearing the mode so the "+
+			"system proxy is usable again", st.TunMode, st.TunDevice, "WARN")
+		if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
+			Log("TUN: could not clear the stale mode: %v", err, "WARN")
+		}
 		a.mu.Lock()
 		if a.tunRun == nil {
 			a.tunRun = &tunRun{}
 		}
-		a.tunRun.Stage = "上次的 TUN 未生效，需要重新启用"
-		a.tunRun.Mode = st.TunMode
+		a.tunRun.Stage = "上次的 TUN 未生效，已恢复为系统代理；需要时请重新启用"
+		a.tunRun.Mode = TunOff
 		a.mu.Unlock()
 		return
 	}

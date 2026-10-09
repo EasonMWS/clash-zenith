@@ -130,6 +130,19 @@ func (d *scmDispatcher) requestStop() {
 // Stopped reports the channel the service body waits on.
 func (d *scmDispatcher) Stopped() <-chan struct{} { return d.stopCh }
 
+// svcEntryCalled is closed the first time the service entry point runs.
+//
+// A channel and a sync.Once rather than a package variable, because it is written on the
+// thread Windows created and read by a goroutine, and because "the entry point has run"
+// must be a fact that can only become true.
+var (
+	svcEntryOnce   sync.Once
+	svcEntryCalled = make(chan struct{})
+)
+
+// signalEntryPoint records that Windows called the service entry point.
+func signalEntryPoint() { svcEntryOnce.Do(func() { close(svcEntryCalled) }) }
+
 // svcInstance is the one dispatcher for this process.
 //
 // It reaches the handler through a package variable rather than through the
@@ -201,15 +214,25 @@ func RunAsService(name string, fn func(stop <-chan struct{}) error) error {
 		{name: nil, proc: 0},
 	}
 
-	// A watchdog on our own start-up. If the dispatcher connects but the callback is
-	// never invoked - a calling-convention mismatch, a runtime problem on a thread
-	// Windows created - the process would otherwise sit here forever and the SCM would
-	// report START_PENDING until it gave up. Saying so and exiting is far more useful:
-	// the SCM then sees a failed start and can retry, and the log names the step.
-	started := make(chan struct{})
+	// A bound on our own start-up, for the case where the dispatcher connects but the
+	// callback is never invoked - a calling-convention mismatch, or a runtime problem on
+	// the thread Windows created. Without it the process sits here forever and the SCM
+	// reports START_PENDING until it gives up.
+	//
+	// The signal comes from the ENTRY POINT, not from this call returning, and getting
+	// that wrong cost a working service. StartServiceCtrlDispatcherW does not return
+	// until the service has stopped - so a watchdog that waited for it to return fired
+	// twenty seconds into a completely healthy run and killed it:
+	//
+	//   23:26:24  service: reporting RUNNING
+	//   23:26:44  service: the service entry point was never called within 20s
+	//
+	// The service had been running and answering for those twenty seconds. The flag is
+	// therefore set by serviceMainTrampoline as its first act, which is the thing the
+	// watchdog is actually about.
 	go func() {
 		select {
-		case <-started:
+		case <-svcEntryCalled:
 		case <-time.After(20 * time.Second):
 			Log("service: the dispatcher connected but the service entry point was never "+
 				"called within 20s. Exiting so the SCM sees a failed start rather than a "+
@@ -220,7 +243,7 @@ func RunAsService(name string, fn func(stop <-chan struct{}) error) error {
 
 	ret, _, callErr := procStartServiceCtrlDisp.Call(uintptr(unsafe.Pointer(&table[0])))
 	if ret == 0 {
-		close(started)
+		signalEntryPoint()
 		Log("service: StartServiceCtrlDispatcherW returned 0 (%v)", callErr, "ERR")
 		return fmt.Errorf("无法连接到服务控制管理器：%v。"+
 			"这通常意味着这个进程不是由 SCM 启动的——用 -service 直接运行不会成功，"+
@@ -263,6 +286,11 @@ func serviceMainTrampoline(argcRaw, argvRaw uintptr) uintptr {
 	// The name is read from the vector the SCM supplies when it is there, and falls
 	// back to the name this program registered, so a mismatch in the argument shape
 	// cannot produce a hang.
+	// Tell the start-up watchdog that the entry point ran. This is the signal it
+	// waits for; the dispatcher returning means the service has stopped, which is a
+	// different event entirely.
+	signalEntryPoint()
+
 	svcName := serviceName
 	if argc >= 1 && argv != nil {
 		if p := *argv; p != nil {

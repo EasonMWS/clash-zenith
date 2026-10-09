@@ -4517,3 +4517,38 @@ func TestTheTraySaysWhyASwitchIsOff(t *testing.T) {
 		t.Error("the menu is not rebuilt when it is opened, so it can go stale")
 	}
 }
+
+func TestAStaleTunModeIsClearedNotJustReported(t *testing.T) {
+	// The stored mode said compat, the adapter was gone, and the visible consequence
+	// was that the system proxy could not be enabled - the two are mutually exclusive
+	// and the program believed the one that was not running:
+	//
+	//   settings say compat but adapter "Zenith" is not present; the tunnel is not up
+	//   开系统代理: ok=False  TUN 接管正在使用中
+	//
+	// A machine in that state has no tunnel and no proxy. Describing a wrong state is
+	// not enough; the state has to be corrected, and the recovery path is where that
+	// belongs because it is the only place that knows the machine is not what the file
+	// says.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "settings say %s but adapter %q is not present")
+	if i < 0 {
+		t.Fatal("the recovery path no longer notices a stale mode")
+	}
+	// The clearing call must be in the same branch, after the log line.
+	branch := text[i:]
+	if end := strings.Index(branch, "\n\t}\n"); end > 0 {
+		branch = branch[:end]
+	}
+	if !strings.Contains(branch, `"tunMode": string(TunOff)`) {
+		t.Error("the recovery reports the stale mode without clearing it, so the system " +
+			"proxy stays unusable and the interface shows a mode that is not running")
+	}
+	if !strings.Contains(branch, "已恢复为系统代理") {
+		t.Error("the message does not say what the machine has been restored to")
+	}
+}
