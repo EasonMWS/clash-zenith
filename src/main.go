@@ -124,13 +124,32 @@ func main() {
 		if err := os.MkdirAll(abs, 0o755); err != nil {
 			fatal("cannot create -datadir: %v", err)
 		}
-		free := abs + string(os.PathSeparator) + "free.flag"
-		if _, err := os.Stat(free); err != nil {
-			// First use of this directory: start from defaults and never take
-			// the system proxy.
-			_ = os.WriteFile(free, []byte("1"), 0o644)
-			_ = os.WriteFile(filepath.Join(abs, "state.json"),
-				[]byte(`{"settings":{"systemProxy":false}}`), 0o644)
+		// An isolated run must not destroy what is already there.
+		//
+		// This used to write an empty state.json whenever free.flag was absent,
+		// without checking whether the directory already held a real one. Pointing
+		// -datadir at a directory in use therefore wiped the user's subscriptions,
+		// nodes and settings - silently, and with nothing to restore from. That
+		// happened, to a real data directory, and it is the worst failure this
+		// program can have.
+		//
+		// The rule now: never overwrite an existing state.json. A directory is only
+		// initialised when it has none.
+		free := filepath.Join(abs, "free.flag")
+		stateFile := filepath.Join(abs, "state.json")
+		if _, err := os.Stat(free); err != nil || !fileExists(stateFile) {
+			if _, err := os.Stat(stateFile); err == nil {
+				// A real state file is present. Adopt it rather than replacing it,
+				// and say so, because the operator asked for isolation and is not
+				// getting it.
+				Log("isolated run: %s already holds a state file; using it as-is rather "+
+					"than initialising an empty one", abs, "WARN")
+				_ = os.WriteFile(free, []byte("1"), 0o644)
+			} else {
+				_ = os.WriteFile(free, []byte("1"), 0o644)
+				_ = os.WriteFile(stateFile,
+					[]byte(`{"settings":{"systemProxy":false}}`), 0o644)
+			}
 		}
 		app.rebindDirs(abs)
 		Log("isolated run: data dir=%s, system proxy disabled", abs, "WARN")
@@ -456,6 +475,12 @@ func trayMode(app *App, mode string) {
 
 // resolveRoot finds the folder holding core/, web/ and data/. It works both when
 // running from the repository and from a copied executable.
+// fileExists reports whether a path is an existing regular file.
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
 func resolveRoot() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {

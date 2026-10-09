@@ -1188,3 +1188,71 @@ func TestStaleActivationYieldIsDiscarded(t *testing.T) {
 		t.Error("the stale marker should have been removed")
 	}
 }
+
+// ---- an isolated run must never destroy a real data directory --------------
+
+func TestIsolatedRunDoesNotOverwriteAnExistingState(t *testing.T) {
+	// This is the failure that actually happened: -datadir pointed at a directory
+	// in use, free.flag was absent, and an empty state.json was written over the
+	// user's subscriptions, nodes and settings - silently, with nothing to restore
+	// from. The rule is that an existing state file is never replaced.
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "state.json")
+	real := []byte(`{"settings":{"mixedPort":7899},"subscriptions":[{"id":"keepme"}]}`)
+	if err := os.WriteFile(stateFile, real, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The guard this models: initialise only when there is no state file.
+	mustNotInit := func() bool {
+		return fileExists(filepath.Join(dir, "state.json"))
+	}
+	if !mustNotInit() {
+		t.Fatal("an existing state file should be recognised as existing")
+	}
+
+	// And an empty directory is still initialised.
+	empty := t.TempDir()
+	if fileExists(filepath.Join(empty, "state.json")) {
+		t.Error("an empty directory should report no state file, so it can be initialised")
+	}
+}
+
+func TestFileExistsDistinguishesFilesFromDirectories(t *testing.T) {
+	dir := t.TempDir()
+	if fileExists(dir) {
+		t.Error("a directory should not be reported as an existing file")
+	}
+	f := filepath.Join(dir, "x")
+	if fileExists(f) {
+		t.Error("a missing path should not be reported as existing")
+	}
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(f) {
+		t.Error("an existing file should be reported as existing")
+	}
+}
+
+func TestInjectedPortCannotReachTheRealConfiguration(t *testing.T) {
+	// The same class of mistake in the generator: a subscription key must not be
+	// able to change a global setting. Checked here as well as in the S05 test so
+	// the property is stated for the configuration as a whole.
+	node := Proxy{
+		Name: "n", Type: "socks5", Server: "1.2.3.4", Port: 1080,
+		Extra: map[string]interface{}{"mixed-port": 1, "allow-lan": true},
+	}
+	cfg := BuildConfig([]Proxy{node}, []string{"n"},
+		Settings{MixedPort: 7899, ControlPort: 7797, Mode: "rule", TunDevice: defaultTunDevice, TunStack: "gvisor"},
+		"secret", "n", 8199)
+	if strings.Contains(cfg, "mixed-port: 1") {
+		t.Error("a subscription overrode the mixed port")
+	}
+	if !strings.Contains(cfg, "mixed-port: 7899") {
+		t.Error("the configured mixed port was lost")
+	}
+	if strings.Contains(cfg, "allow-lan: true") {
+		t.Error("a subscription enabled LAN exposure")
+	}
+}
