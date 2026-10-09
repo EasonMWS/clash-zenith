@@ -446,8 +446,20 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]interface{}{"ok": false, "error": "缺少节点名"})
 		return
 	}
-	if err := s.app.Switch(name); err != nil {
-		writeJSON(w, 500, map[string]interface{}{"ok": false, "error": err.Error()})
+	// Only a node this program actually offers may be selected.
+	//
+	// The core's own proxy table contains the groups as well as the nodes - PROXY
+	// itself, AUTO, DIRECT - and switching to one of those was accepted because the
+	// name was passed straight through. Selecting AUTO therefore worked, and produced a
+	// state the interface could not describe: PROXY.Now is the string "AUTO" while the
+	// traffic goes through whichever node the url-test group chose, so nothing in the
+	// list matched and no node was shown as current.
+	//
+	// The interface never offered those names, so this was only reachable by calling the
+	// API directly - which is exactly the shape of gap worth closing, because the next
+	// caller is a script or a later version of the interface.
+	if err := s.app.SwitchNode(name); err != nil {
+		writeJSON(w, 400, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true, "current": s.app.store.Snapshot().Current})

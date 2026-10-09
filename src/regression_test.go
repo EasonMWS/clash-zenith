@@ -4340,3 +4340,67 @@ func TestThereIsAlwaysAHostnameNodeToFallBackTo(t *testing.T) {
 		t.Error("mergedNodes does not compose a hostname node when none exists")
 	}
 }
+
+// ---- only a node the program offers may be selected ------------------------
+
+func TestSwitchingRefusesAnythingThatIsNotANode(t *testing.T) {
+	// The core's proxy table holds the groups as well as the nodes: PROXY, AUTO,
+	// DIRECT. The switch endpoint passed the name straight through, so selecting AUTO
+	// worked - and produced a state the interface could not describe. PROXY.Now is the
+	// string "AUTO" while the traffic goes through whichever node the url-test group
+	// chose, so nothing in the node list matched and no entry was shown as current.
+	//
+	// The interface never offered those names, which is exactly the shape of gap worth
+	// closing: the next caller is a script, or a later version of the interface.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "func (a *App) SwitchNode(") {
+		t.Fatal("there is no checked switch, so any name the core knows can be selected")
+	}
+
+	// It must decide from what the program offers, not from a list of group names -
+	// otherwise a group a subscription defines is accepted, and the next group name
+	// has to be remembered.
+	i := strings.Index(text, "func (a *App) SwitchNode(")
+	j := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+j+3]
+	if !strings.Contains(body, "a.nodeSet()") {
+		t.Error("the check is not against the nodes this program offers")
+	}
+	if !strings.Contains(body, "没有这个节点") {
+		t.Error("a refusal does not say what was wrong")
+	}
+
+	// And the endpoint must use it.
+	srv, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Skipf("server.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(srv), "s.app.SwitchNode(name)") {
+		t.Error("the switch endpoint bypasses the check")
+	}
+}
+
+func TestSelectingAGroupStillNamesTheNodeInUse(t *testing.T) {
+	// Defence in depth for the same state, reached any other way - a subscription that
+	// defines its own group, a core that reports something unexpected. If PROXY is ever
+	// set to a group, the interface must still be able to name the node carrying the
+	// traffic, because a current node it cannot name is a current node the user cannot
+	// see.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, `group.Now == "AUTO"`) {
+		t.Error("the reported current node does not resolve a group selection to the " +
+			"node actually in use")
+	}
+	if !strings.Contains(text, `"currentPick"`) {
+		t.Error("the reported status does not distinguish what was selected from what is " +
+			"in use, so the interface cannot say \"AUTO, currently X\"")
+	}
+}

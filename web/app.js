@@ -153,6 +153,16 @@ function activeNode(st) {
   return n || null;
 }
 
+// 当前生效的是什么：用户选的条目，以及实际承载流量的节点。
+// 选 AUTO 时两者不同——PROXY 设的是 AUTO，流量走的是 url-test 挑的那个节点。
+// 主接口已经把 current 解析成实际节点，这里只负责把"设的是 AUTO"这件事说出来。
+function currentSelection(st) {
+  const pick = (st && st.currentPick) || (st && st.current) || '';
+  const node = activeNode(st);
+  const viaGroup = pick && node && pick !== node.name;
+  return { pick, node, viaGroup };
+}
+
 /* 手动测速的结果优先，其次是 /api/status 里带的延迟；未知按 0 处理 */
 function currentDelay(st, node) {
   if (!node) return 0;

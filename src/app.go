@@ -1459,6 +1459,33 @@ func hostnameFallback(base []Proxy) (Proxy, bool) {
 	return Proxy{}, false
 }
 
+// SwitchNode selects one of the nodes this program offers.
+//
+// It exists next to Switch because Switch talks to the core, and the core's proxy
+// table also holds the groups: PROXY, AUTO, DIRECT and anything a subscription brings
+// with it. Passing one of those through produced a state the interface could not
+// describe - PROXY set to "AUTO" is not a node, and every node in the list stopped
+// matching, so none was shown as current.
+//
+// The check is against what this program offers rather than against a hardcoded list of
+// group names, so a group a subscription happens to define is refused for the same
+// reason and without anybody having to remember to add it.
+func (a *App) SwitchNode(name string) error {
+	optimized, base := a.nodeSet()
+	for _, p := range optimized {
+		if p.Name == name {
+			return a.Switch(name)
+		}
+	}
+	for _, p := range base {
+		if p.Name == name {
+			return a.Switch(name)
+		}
+	}
+	return fmt.Errorf("没有这个节点：%q。它是内核的代理组，不是节点——"+
+		"节点列表里的条目才能选中", name)
+}
+
 // ---- config ---------------------------------------------------------------
 
 func (a *App) writeConfig(nodes []Proxy, st Settings) {
@@ -1510,10 +1537,29 @@ func (a *App) Status() map[string]interface{} {
 	proxies, _ := a.core.Proxies()
 	group := proxies["PROXY"]
 	autoGroup := proxies["AUTO"]
-	current := snap.Current
+
+	// What PROXY is set to, which may be a group rather than a node.
+	pick := snap.Current
 	if group != nil && group.Now != "" {
-		current = group.Now
+		pick = group.Now
 	}
+	// What is actually carrying the traffic.
+	//
+	// These are the same value until PROXY is set to AUTO, and then they are not:
+	// PROXY.Now is the string "AUTO" while the connections go through whichever node
+	// the url-test group last chose. Reporting the first as "the current node" meant
+	// the interface could not name the node in use - the list marks an entry active by
+	// matching this value against a node name, and "AUTO" matches nothing - so a user
+	// who selected AUTO saw no current node at all.
+	//
+	// Resolved here rather than in the interface, because the interface would need to
+	// know that one particular group name is special, and the next nested group would
+	// not be handled.
+	current := pick
+	if group != nil && group.Now == "AUTO" && autoGroup != nil && autoGroup.Now != "" {
+		current = autoGroup.Now
+	}
+
 	autoPick := ""
 	if autoGroup != nil {
 		autoPick = autoGroup.Now
@@ -1581,6 +1627,10 @@ func (a *App) Status() map[string]interface{} {
 		"coreUptime":  a.core.Uptime(),
 		"mode":        st.Mode,
 		"current":     current,
+		// What PROXY is set to. It differs from current only when a group is selected,
+		// and the interface uses it to say "AUTO (currently X)" instead of pretending
+		// the user picked X.
+		"currentPick": pick,
 		"autoPick":    autoPick, // what the core's AUTO group currently chooses
 		"autoPickOn":  !st.AutoPickOff,
 		"fastestName": fastest.Name,
