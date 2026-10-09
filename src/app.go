@@ -1230,21 +1230,25 @@ func (a *App) Status() map[string]interface{} {
 		// A copy, never the internal map. Handing the live map to the JSON
 		// encoder meant every status request read it while healthLoop could be
 		// writing it, which is a fatal runtime error rather than a wrong answer.
-		"flakyNodes":   a.flakyNodesCopy(),
-		"fastestMS":    fastestMS,
-		"nodes":        list,
-		"nodeCount":    len(list),
-		"optCount":     len(optimized),
-		"baseCount":    len(base),
-		"storedCount":  len(snap.Optimized),
-		"isOptimized":  isOptimized,
-		"settings":     st,
-		"systemProxy":  a.sysproxy.Status(),
-		"optimizing":   a.opt.Running(),
-		"progress":     a.opt.Progress(),
-		"optSummary":   a.opt.LastSummary(),
-		"lastOptimize": snap.LastOptimize,
-		"error":        a.lastErr,
+		"flakyNodes": a.flakyNodesCopy(),
+		"fastestMS":  fastestMS,
+		"nodes":      list,
+		"nodeCount":  len(list),
+		"optCount":   len(optimized),
+		"baseCount":  len(base),
+		// Whether the stored optimisation still describes the current subscription.
+		// A stale list is a real condition after a subscription change, and the
+		// interface can say so instead of silently showing nodes that are gone.
+		"optimizedCurrent": a.store.OptimizedIsCurrent(),
+		"storedCount":      len(snap.Optimized),
+		"isOptimized":      isOptimized,
+		"settings":         st,
+		"systemProxy":      a.sysproxy.Status(),
+		"optimizing":       a.opt.Running(),
+		"progress":         a.opt.Progress(),
+		"optSummary":       a.opt.LastSummary(),
+		"lastOptimize":     snap.LastOptimize,
+		"error":            a.lastErr,
 		"ports": map[string]int{
 			"mixed": st.MixedPort, "api": st.APIPort, "ui": st.UIPort, "control": st.ControlPort,
 		},
@@ -1341,14 +1345,25 @@ func (a *App) StartOptimize() bool {
 		if minWanted < 64 {
 			minWanted = 64
 		}
+		// Record the generation the scan starts from. A scan takes minutes, and a
+		// subscription change during that window would otherwise let results
+		// describing the old nodes overwrite the new ones.
+		startGen := a.store.SubscriptionGeneration()
 		best, _, err := a.opt.ScanEdges(snap.BaseNodes, st, minWanted)
 		if err != nil {
 			a.lastErr = err.Error()
 			Log("optimize failed: %v", err, "ERR")
 			return
 		}
-		if err := a.store.SetNodes(nil, best); err != nil {
+		installed, err := a.store.SetOptimizedIfCurrent(startGen, best)
+		if err != nil {
 			Log("could not save optimized nodes: %v", err, "ERR")
+		}
+		if !installed {
+			Log("optimisation finished after the subscription changed; discarding its "+
+				"results rather than installing nodes that may no longer exist", "WARN")
+			a.lastErr = "优选完成时订阅已改变，本次结果已丢弃（节点可能已不存在）。请重新优选"
+			return
 		}
 		// Keep the user's pick when it still exists somewhere, otherwise fall
 		// back to the fastest optimised node. A subscription node the user had

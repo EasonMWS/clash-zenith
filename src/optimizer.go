@@ -378,14 +378,19 @@ func probeWS(ip, sni, path, host string, timeout time.Duration, skipVerify bool)
 	return probeWSVerbose(ip, sni, path, host, timeout, nil, skipVerify)
 }
 
-// probeHTTPS fetches a URL through the tunnel, end to end.
+// probeHTTPS asks the edge for a real HTTP response over the same TLS connection
+// parameters the node uses.
 //
-// Verifying the WebSocket upgrade is not enough on its own. A Cloudflare edge
-// has been observed completing the upgrade happily and then silently dropping
-// ordinary HTTP requests through the same tunnel: the core's own latency test
-// reported 239 ms while every real request through that node timed out. The
-// upgrade only proves the edge accepts the request, not that it carries the
-// response back, so a candidate must also return a real status line here.
+// What this is: a second, independent check that the edge did not merely accept
+// the upgrade and then go quiet. An edge has been observed completing the
+// WebSocket upgrade and then dropping ordinary requests, and this catches that.
+//
+// What this is NOT, and was previously described as if it were: it does not carry
+// the proxy protocol. It speaks plain HTTP to the edge with the node's SNI and
+// Host, so it proves the edge's web layer answers - it does not prove the tunnel
+// forwards traffic to the far end, and it cannot see whether the remote service
+// is healthy. It is a stage check, not an end-to-end one. The end-to-end check is
+// verifySelectedEndToEnd, which runs a real request through the core's own proxy.
 func probeHTTPS(ip, sni, host, requestPath string, timeout time.Duration, skipVerify bool) (time.Duration, bool) {
 	dialer := &tls.Dialer{
 		Config: &tls.Config{
@@ -1165,3 +1170,86 @@ const seedCandidates = `# Zenith 边缘 IP 候选池
 131.0.72.200
 131.0.72.250
 `
+
+// ---- end-to-end verification ----------------------------------------------
+
+// EndToEndResult describes what a real proxy request through the selected node
+// did. The fields exist so a failure can say which stage broke rather than just
+// "it did not work".
+type EndToEndResult struct {
+	OK       bool   `json:"ok"`
+	Stage    string `json:"stage"` // core | proxy | request | response
+	Node     string `json:"node,omitempty"`
+	DelayMS  int    `json:"delayMs,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+	TestedAt string `json:"testedAt"`
+}
+
+// VerifySelectedEndToEnd runs a request through the core's own proxy and reports
+// what happened, stage by stage.
+//
+// This is the check the stage probes cannot provide. They speak to the edge; this
+// goes through the tunnel: the core authenticates to the proxy, the proxy
+// forwards to the target, and a response comes back. Success here is the only
+// evidence that the whole path works.
+//
+// It is used in two places: after a TUN activation, where claiming success
+// without it would be a lie, and on demand from the interface, so a user who is
+// unsure whether their setup works can find out rather than guess.
+func (a *App) VerifySelectedEndToEnd() EndToEndResult {
+	res := EndToEndResult{TestedAt: time.Now().Format(time.RFC3339)}
+	if a.core == nil || !a.core.IsUp() {
+		res.Stage = "core"
+		res.Detail = "内核没有运行"
+		return res
+	}
+	proxies, err := a.core.Proxies()
+	if err != nil {
+		res.Stage = "core"
+		res.Detail = "无法向内核查询当前节点：" + err.Error()
+		return res
+	}
+	current := ""
+	if g, ok := proxies["PROXY"]; ok {
+		current = g.Now
+	}
+	if current == "" {
+		res.Stage = "proxy"
+		res.Detail = "内核没有报告当前节点"
+		return res
+	}
+	res.Node = current
+
+	// Ask the core to make a real request through this node. The core performs the
+	// proxy authentication and the forward, which is exactly what the stage probes
+	// skip.
+	targets := []string{
+		"https://www.gstatic.com/generate_204",
+		"https://www.google.com/generate_204",
+		"http://cp.cloudflare.com/generate_204",
+	}
+	var lastErr error
+	for _, t := range targets {
+		delay, err := a.core.Delay(current, 10000, t)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if delay <= 0 {
+			lastErr = fmt.Errorf("内核报告延迟为 0")
+			continue
+		}
+		res.OK = true
+		res.Stage = "response"
+		res.DelayMS = delay
+		res.Detail = fmt.Sprintf("经 %s 完成一次真实请求，%dms", t, delay)
+		return res
+	}
+	res.Stage = "request"
+	if lastErr != nil {
+		res.Detail = "三个探测目标都没有回应：" + lastErr.Error()
+	} else {
+		res.Detail = "三个探测目标都没有回应"
+	}
+	return res
+}

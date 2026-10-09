@@ -209,22 +209,79 @@ func proxyToYAML(p Proxy) string {
 			fmt.Fprintf(&b, "    %s: %s\n", k, yamlScalar(v))
 		}
 	}
-	// keep unknown provider keys so nothing is silently lost
+	// Unknown provider keys are emitted only if they are on the allowlist below.
+	//
+	// They used to be written through verbatim, which made a subscription able to
+	// change the shape of the configuration rather than only fill it in: the key
+	// name goes into the YAML unescaped, so a key containing a colon, a newline or
+	// a control character can restructure the document instead of describing a
+	// proxy option. A subscription is data the user imported, not policy, and it
+	// must not be able to reach the controller, the DNS block, the TUN block or
+	// the rules.
+	//
+	// Anything not listed is kept on the node for display and diagnosis, and is
+	// deliberately not written. That loses a little fidelity for exotic providers
+	// and buys the boundary the review asked for.
 	if len(p.Extra) > 0 {
 		keys := make([]string, 0, len(p.Extra))
 		for k := range p.Extra {
+			if !allowedExtraKey(k) {
+				continue
+			}
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			if k == "alpn" {
-				fmt.Fprintf(&b, "  alpn: %s\n", yamlScalar(p.Extra[k]))
-				continue
-			}
 			fmt.Fprintf(&b, "  %s: %s\n", k, yamlScalar(p.Extra[k]))
 		}
 	}
 	return b.String()
+}
+
+// allowedExtra allows an optional per-proxy key through to the configuration.
+//
+// The list is an allowlist on purpose. A denylist would have to anticipate every
+// way a crafted key could escape its block, and the consequence of missing one is
+// a subscription that rewrites the running configuration.
+func allowedExtraKey(k string) bool {
+	// Reject anything that cannot be a bare YAML key before consulting the list.
+	// This is the structural guard; the list below is the semantic one.
+	if k == "" || len(k) > 64 {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.':
+		default:
+			return false
+		}
+	}
+	// Keys that describe how to reach and speak to the proxy. Anything to do with
+	// listeners, DNS, TUN, the controller or the rules is absent by design.
+	switch k {
+	case "alpn",
+		"packet-encoding", "xudp", "tfo", "mptcp", "smux", "udp-over-tcp",
+		"udp-over-tcp-version", "ip-version", "interface-name", "routing-mark",
+		"reality-opts", "ech-opts", "fingerprint", "certificate",
+		"private-key", "public-key", "short-id", "id", "auth", "auth-str",
+		"obfs", "obfs-param", "protocol", "protocol-param", "up", "down",
+		"ports", "hop-interval", "max-early-data", "early-data-header-name",
+		"idle-session-check-interval", "idle-session-timeout",
+		"min-idle-session", "health-check", "ss-opts", "vmess-opts",
+		"servername", "disable-sni", "reduce-rtt", "global-padding",
+		"authenticated-length", "congestion-controller", "udp-relay-mode",
+		"cwnd", "max-udp-relay-packet-size", "quic", "heartbeat",
+		"heartbeat-interval", "handshake-timeout", "max-connections",
+		"min-connections", "max-streams", "padding", "header-type",
+		"recv-window-conn", "recv-window", "hs", "hs-interval",
+		"max-packet-size", "brutal-opts", "down-mbps", "up-mbps":
+		return true
+	}
+	return false
 }
 
 // dedupeNames makes every node name unique, which mihomo requires.

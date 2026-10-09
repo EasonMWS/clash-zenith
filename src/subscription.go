@@ -480,10 +480,46 @@ func proxyFromMap(m map[string]interface{}) (Proxy, bool) {
 			"alterId", "flow", "udp", "tls", "sni", "servername", "skip-cert-verify",
 			"client-fingerprint", "network", "ws-opts", "grpc-opts", "h2-opts":
 		default:
+			// Only a plain key is kept. A key carrying a control character or a
+			// YAML separator is not a proxy option with an odd name; it is an
+			// attempt to change the structure of the generated document, and it is
+			// dropped here rather than relied on being filtered later.
+			if !safeExtraKeyName(k) {
+				continue
+			}
 			p.Extra[k] = v
 		}
 	}
 	return p, true
+}
+
+// safeExtraKeyName reports whether a key from a subscription is shaped like a
+// proxy option name rather than like something that could restructure a YAML
+// document.
+//
+// The generator has its own allowlist; this is the earlier, coarser gate, so a
+// dangerous key never reaches the node model at all. Both exist because the cost
+// of the second one missing a case is a subscription that rewrites the running
+// configuration.
+func safeExtraKeyName(k string) bool {
+	if k == "" || len(k) > 64 {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------

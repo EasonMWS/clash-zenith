@@ -712,25 +712,20 @@ func (a *App) DisableTun(releasePrivacy bool) error {
 
 // ---- verification ---------------------------------------------------------
 
-// verifyProxyCarries makes a real request through the proxy and insists on a real
-// response. A 4xx counts: it means the far end answered, which is what is being
-// tested. Only a transport failure is a failure.
+// verifyProxyCarries makes a real request through the selected node and vanishes
+// only if the whole path worked.
+//
+// It delegates to the core's own per-node test rather than dialling the local
+// port itself. That distinction matters: a request to the local port proves the
+// mixed listener answers, while a request the core makes through the node proves
+// the core authenticated to the proxy and the proxy carried the traffic. Only the
+// second is evidence that TUN mode is doing anything.
 func (a *App) verifyProxyCarries() error {
-	port := a.store.Settings().MixedPort
-	targets := []string{
-		"http://www.gstatic.com/generate_204",
-		"http://connectivitycheck.gstatic.com/generate_204",
-		"http://cp.cloudflare.com/generate_204",
+	res := a.VerifySelectedEndToEnd()
+	if res.OK {
+		return nil
 	}
-	var last error
-	for _, t := range targets {
-		if err := httpThroughProxy(port, t, 12*time.Second); err == nil {
-			return nil
-		} else {
-			last = err
-		}
-	}
-	return fmt.Errorf("三个探测目标都没有回应（最后一个错误：%v）", last)
+	return fmt.Errorf("%s 阶段失败：%s", res.Stage, res.Detail)
 }
 
 // ---- lifecycle: start-up recovery, repair, uninstall -----------------------

@@ -214,6 +214,13 @@ type State struct {
 	Current       string         `json:"current"`
 	LastOptimize  string         `json:"lastOptimize"`
 	SelectedSub   string         `json:"selectedSub"`
+	// SubGeneration increments every time the subscription material changes. An
+	// optimisation records the generation it started from, so a scan that finished
+	// after the user switched subscriptions can be recognised as belonging to the
+	// old one and discarded rather than installed.
+	SubGeneration int64 `json:"subGeneration"`
+	// OptimizedGeneration is the generation the stored results came from.
+	OptimizedGeneration int64 `json:"optimizedGeneration"`
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +423,11 @@ func (s *Store) SetSubscriptions(subs []Subscription) error {
 func (s *Store) SetNodes(base, optimized []Proxy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A change to the base nodes means the material optimisation works from has
+	// changed, so anything derived from the previous material is now stale.
+	if base != nil {
+		s.state.SubGeneration++
+	}
 	if base != nil {
 		s.state.BaseNodes = base
 	}
@@ -432,6 +444,53 @@ func (s *Store) SetCurrent(name string) error {
 	return s.saveLocked()
 }
 
+// SubscriptionGeneration reports the current generation of subscription material.
+func (s *Store) SubscriptionGeneration() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.SubGeneration
+}
+
+// BumpSubscriptionGeneration records that the subscription material changed.
+//
+// Anything derived from the old material - optimised edge lists in particular -
+// is now describing nodes that may no longer exist, so the generation is what a
+// late result is compared against before it is allowed to take effect.
+func (s *Store) BumpSubscriptionGeneration() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.SubGeneration++
+	_ = s.saveLocked()
+	return s.state.SubGeneration
+}
+
+// SetOptimizedIfCurrent stores optimisation results only when they still describe
+// the subscription they were computed from.
+//
+// It returns false when the results are stale, which the caller reports rather
+// than installing: a scan takes minutes, and a subscription change during that
+// window is exactly when stale results would otherwise overwrite good ones.
+func (s *Store) SetOptimizedIfCurrent(generation int64, optimized []Proxy) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generation != s.state.SubGeneration {
+		return false, nil
+	}
+	s.state.Optimized = optimized
+	s.state.OptimizedGeneration = generation
+	return true, s.saveLocked()
+}
+
+// OptimizedIsCurrent reports whether the stored optimisation still matches the
+// subscription it came from.
+func (s *Store) OptimizedIsCurrent() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.state.Optimized) == 0 {
+		return false
+	}
+	return s.state.OptimizedGeneration == s.state.SubGeneration
+}
 func (s *Store) SetLastOptimize(t time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

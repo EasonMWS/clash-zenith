@@ -829,3 +829,273 @@ func TestActiveSubscriptionSurvivesAReload(t *testing.T) {
 		t.Errorf("after a reload ActiveSubscription = %q, want y", got)
 	}
 }
+
+// ---- S05: a subscription is data, not policy -------------------------------
+
+func TestExtraKeysCannotRestructureTheConfiguration(t *testing.T) {
+	// The generator used to write unknown provider keys through verbatim, and the
+	// key name goes into the YAML unescaped. A key containing a colon, a newline or
+	// a control character can therefore change the shape of the document rather
+	// than describe a proxy option - which would let an imported subscription
+	// reach the controller, the DNS block, the TUN block or the rules.
+	node := Proxy{
+		Name: "hostile", Type: "vmess", Server: "1.2.3.4", Port: 443,
+		Network: "ws",
+		Extra: map[string]interface{}{
+			// a key that would close the proxy mapping and open a new top-level one
+			"x": nil,
+			// the ones that must never survive
+			"controller: 0.0.0.0:9090": "yes",
+			"a\nb":                     "yes",
+			"tun\x00":                  "yes",
+			"  dns:":                   "yes",
+			"- rules:":                 "yes",
+			"external-controller":      "0.0.0.0:9090",
+			"secret":                   "INJECTED-SECRET-VALUE",
+		},
+	}
+	cfg := BuildConfig([]Proxy{node}, []string{"hostile"},
+		Settings{MixedPort: 7890, ControlPort: 7797, Mode: "rule", TunDevice: defaultTunDevice, TunStack: "gvisor"},
+		"realsecret", "hostile", 8199)
+
+	// Distinctive strings, so a match can only come from an injected key and never
+	// from prose in the template's own comments. An earlier version of this test
+	// looked for the word "leak" and failed on the comment that says "leaking".
+	for _, forbidden := range []string{
+		"0.0.0.0:9090",          // the attacker's controller address
+		"INJECTED-SECRET-VALUE", // the attacker's secret value
+		"- rules: ",             // a key that would open a new top-level section
+		"\n  dns: ",             // likewise
+	} {
+		if strings.Contains(cfg, forbidden) {
+			t.Errorf("a subscription key reached the configuration: %q\n%s", forbidden, cfg)
+		}
+	}
+	// The legitimate header values must be unchanged. That is the precise claim: a
+	// subscription cannot alter the controller or the secret - not that those words
+	// are absent from a file that is supposed to contain them.
+	if !strings.Contains(cfg, "external-controller: 127.0.0.1:7797") {
+		t.Error("the real controller address was altered or lost")
+	}
+	if !strings.Contains(cfg, `secret: "realsecret"`) {
+		t.Error("the real secret was altered or lost")
+	}
+	if n := strings.Count(cfg, "external-controller"); n != 1 {
+		t.Errorf("the controller key appears %d times; a subscription injected a second one", n)
+	}
+	if n := strings.Count(cfg, "secret:"); n != 1 {
+		t.Errorf("the secret key appears %d times; a subscription injected a second one", n)
+	}
+	// The configuration must still be one the validator accepts: the point is that
+	// the hostile keys changed nothing, not that they broke the file.
+	if err := validateCandidateConfig(cfg); err != nil {
+		t.Errorf("the configuration with hostile keys is not valid: %v", err)
+	}
+}
+
+func TestAllowedExtraKeysStillPassThrough(t *testing.T) {
+	// The boundary must not throw away ordinary provider options, or real
+	// subscriptions would lose settings they depend on.
+	node := Proxy{
+		Name: "n", Type: "vmess", Server: "1.2.3.4", Port: 443, Network: "ws",
+		Extra: map[string]interface{}{
+			"alpn":             []interface{}{"h2", "http/1.1"},
+			"packet-encoding":  "xudp",
+			"tfo":              true,
+			"skip-cert-verify": false,
+			"mptcp":            true,
+		},
+	}
+	cfg := BuildConfig([]Proxy{node}, []string{"n"},
+		Settings{MixedPort: 7890, ControlPort: 7797, Mode: "rule", TunDevice: defaultTunDevice, TunStack: "gvisor"},
+		"secret", "n", 8199)
+	for _, want := range []string{"alpn:", "packet-encoding:", "tfo:", "mptcp:"} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("an allowed option was dropped: %q missing from\n%s", want, cfg)
+		}
+	}
+}
+
+func TestSafeExtraKeyName(t *testing.T) {
+	good := []string{"alpn", "packet-encoding", "udp-over-tcp", "reality-opts", "a.b", "x_1"}
+	for _, k := range good {
+		if !safeExtraKeyName(k) {
+			t.Errorf("safeExtraKeyName(%q) = false, want true", k)
+		}
+	}
+	bad := []string{
+		"", "controller: 9090", "a b", "a\tb", "a\nb", "a\rb", "a\x00b", "a\x1bb",
+		"  dns", "dns:", "- rules", "a[0]", "a{b}", "a,b", "a'b", `a"b`,
+		strings.Repeat("x", 65),
+	}
+	for _, k := range bad {
+		if safeExtraKeyName(k) {
+			t.Errorf("safeExtraKeyName(%q) = true, want false", k)
+		}
+	}
+}
+
+func TestAllowedExtraKeyIsAnAllowlist(t *testing.T) {
+	// Anything not named is refused. A denylist would have to anticipate every way
+	// a crafted key could escape its block, and missing one means a subscription
+	// that rewrites the running configuration.
+	if allowedExtraKey("external-controller") {
+		t.Error("the controller must never be settable from a subscription")
+	}
+	if allowedExtraKey("dns") || allowedExtraKey("tun") || allowedExtraKey("rules") {
+		t.Error("global sections must never be settable from a subscription")
+	}
+	if allowedExtraKey("bind-address") || allowedExtraKey("allow-lan") {
+		t.Error("listener settings must never be settable from a subscription")
+	}
+	if !allowedExtraKey("alpn") {
+		t.Error("ordinary transport options should pass")
+	}
+}
+
+// ---- R09: results must not outlive the material they describe --------------
+
+func TestStaleOptimisationResultsAreRefused(t *testing.T) {
+	// A scan takes minutes. If the user switches subscriptions inside that window,
+	// results describing the old nodes must be discarded rather than installed -
+	// otherwise the node list, the health history and the current selection all end
+	// up pointing at servers that are no longer in the subscription.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := []Proxy{{Name: "old-1", Server: "1.1.1.1"}, {Name: "old-2", Server: "2.2.2.2"}}
+	current := []Proxy{{Name: "new-1", Server: "3.3.3.3"}}
+
+	gen := st.SubscriptionGeneration()
+
+	// The subscription changes while the scan is running.
+	st.BumpSubscriptionGeneration()
+
+	ok, err := st.SetOptimizedIfCurrent(gen, stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("results from before the subscription change were installed")
+	}
+	snap := st.Snapshot()
+	for _, p := range snap.Optimized {
+		if strings.HasPrefix(p.Name, "old-") {
+			t.Errorf("a stale node reached the store: %q", p.Name)
+		}
+	}
+
+	// Results from the current generation are accepted.
+	ok, err = st.SetOptimizedIfCurrent(st.SubscriptionGeneration(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("results from the current generation were refused")
+	}
+	if got := len(st.Snapshot().Optimized); got != 1 {
+		t.Errorf("stored %d optimised nodes, want 1", got)
+	}
+}
+
+func TestBaseNodeChangesBumpTheGeneration(t *testing.T) {
+	// The generation has to move on every path that changes the material, or the
+	// staleness check silently stops protecting anything.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g0 := st.SubscriptionGeneration()
+	if err := st.SetNodes([]Proxy{{Name: "a", Server: "1.1.1.1"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	g1 := st.SubscriptionGeneration()
+	if g1 == g0 {
+		t.Error("changing the base nodes did not advance the generation")
+	}
+	st.BumpSubscriptionGeneration()
+	if st.SubscriptionGeneration() == g1 {
+		t.Error("an explicit bump did not advance the generation")
+	}
+}
+
+func TestOptimizedIsCurrentReflectsTheStore(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nothing optimised yet.
+	if st.OptimizedIsCurrent() {
+		t.Error("an empty optimisation should not report as current")
+	}
+	gen := st.SubscriptionGeneration()
+	if ok, err := st.SetOptimizedIfCurrent(gen, []Proxy{{Name: "n", Server: "1.1.1.1"}}); err != nil || !ok {
+		t.Fatalf("setup failed: ok=%v err=%v", ok, err)
+	}
+	if !st.OptimizedIsCurrent() {
+		t.Error("fresh results should report as current")
+	}
+	st.BumpSubscriptionGeneration()
+	if st.OptimizedIsCurrent() {
+		t.Error("results should stop being current once the subscription changes")
+	}
+}
+
+// ---- L4: the end-to-end verification must report where it broke ------------
+
+func TestEndToEndVerificationReportsTheStage(t *testing.T) {
+	// Success through the tunnel is the only evidence the whole path works, and a
+	// failure has to say which stage broke rather than just "it did not work".
+	// With no core running there is nothing to route through, and that is a
+	// specific, reportable condition.
+	a := &App{}
+	res := a.VerifySelectedEndToEnd()
+	if res.OK {
+		t.Fatal("verification reported success with no core running")
+	}
+	if res.Stage != "core" {
+		t.Errorf("stage = %q, want core; the report must name where it failed", res.Stage)
+	}
+	if res.Detail == "" {
+		t.Error("a failure must carry an explanation")
+	}
+	if res.TestedAt == "" {
+		t.Error("the result should record when it was taken")
+	}
+}
+
+func TestHTTPThroughProxyRejectsANonsensePort(t *testing.T) {
+	// The helper is kept as a building block for the local-listener check. A bad
+	// port must fail immediately rather than attempting a connection.
+	if err := httpThroughProxy(0, "http://example.invalid/", time.Second); err == nil {
+		t.Error("port 0 should be refused")
+	}
+	if err := httpThroughProxy(-1, "http://example.invalid/", time.Second); err == nil {
+		t.Error("a negative port should be refused")
+	}
+}
+
+func TestOptimizedCurrentIsReportedInStatus(t *testing.T) {
+	// A stale optimisation is a real condition after a subscription change, and
+	// the interface needs to be able to say so rather than showing nodes that are
+	// no longer in the subscription.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.OptimizedIsCurrent() {
+		t.Error("a store with no optimisation should not report current")
+	}
+	if ok, err := st.SetOptimizedIfCurrent(st.SubscriptionGeneration(),
+		[]Proxy{{Name: "n", Server: "1.1.1.1"}}); err != nil || !ok {
+		t.Fatalf("setup failed: ok=%v err=%v", ok, err)
+	}
+	if !st.OptimizedIsCurrent() {
+		t.Error("fresh results should report current")
+	}
+}

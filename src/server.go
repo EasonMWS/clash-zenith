@@ -94,6 +94,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/tun/disable", s.wrap(s.handleTunDisable))
 	s.mux.HandleFunc("/api/tun/repair", s.wrap(s.handleTunRepair))
 	s.mux.HandleFunc("/api/tun/uninstall", s.wrap(s.handleTunUninstall))
+	// A real request through the selected node, on demand. The stage probes the
+	// optimiser runs speak to the edge; this goes through the tunnel, which is the
+	// only way to tell whether the whole path works.
+	s.mux.HandleFunc("/api/verify", s.wrap(s.handleVerify))
 	s.mux.HandleFunc("/api/quit", s.wrap(s.handleQuit))
 	s.mux.HandleFunc("/", s.handleStatic)
 }
@@ -265,6 +269,18 @@ func (s *Server) handleTunUninstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// handleVerify runs a real proxy request and reports what happened, stage by
+// stage, so a failure says where it broke instead of just "it did not work".
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	res := s.app.VerifySelectedEndToEnd()
+	code := 200
+	if !res.OK {
+		// Not an error status: the request succeeded, the answer is "no".
+		code = 200
+	}
+	writeJSON(w, code, map[string]interface{}{"ok": true, "result": res})
 }
 
 // ---- end TUN --------------------------------------------------------------
