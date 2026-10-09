@@ -78,10 +78,15 @@ function patchOf(key, val) { const p = {}; p[key] = val; return p; }
 
 async function api(path, body) {
   try {
+    // 每次启动生成、由服务端注入本页的访问令牌。没有它，任何能访问回环端口的
+    // 本地程序，或一个被诱导的网页，都能读到订阅地址与生成的配置（内含内核
+    // secret、节点 UUID 与 ws path），或者直接切节点、退出程序。
+    const token = (document.querySelector('meta[name="zenith-token"]') || {}).content || '';
     // 只在带请求体时才加 Content-Type，避免 GET 触发无谓的预检
     const opt = { method: body === undefined ? 'GET' : 'POST' };
+    opt.headers = { 'X-Zenith-Token': token };
     if (body !== undefined) {
-      opt.headers = { 'Content-Type': 'application/json' };
+      opt.headers['Content-Type'] = 'application/json';
       opt.body = JSON.stringify(body);
     }
     const res = await fetch(path, opt);

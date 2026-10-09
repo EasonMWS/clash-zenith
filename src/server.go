@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -23,12 +28,43 @@ type Server struct {
 	uiPort  int
 	mux     *http.ServeMux
 	webRoot string
+	// token is a per-launch secret required by every API route.
+	//
+	// The API binds to loopback, but loopback is not an authentication boundary:
+	// any other process running as this user, and any web page the browser is
+	// persuaded to load, can reach it. Without a token those callers could read
+	// the subscription URL and the generated config - which contains the core
+	// secret, node UUIDs and WebSocket paths - or switch nodes and shut the app
+	// down. The token is generated per launch, never written to disk, and handed
+	// to the UI by rewriting the page it is served.
+	token string
 }
 
 func NewServer(app *App, webRoot string, uiPort int) *Server {
-	s := &Server{app: app, uiPort: uiPort, mux: http.NewServeMux(), webRoot: webRoot}
+	s := &Server{
+		app:     app,
+		uiPort:  uiPort,
+		mux:     http.NewServeMux(),
+		webRoot: webRoot,
+		token:   randomToken(),
+	}
 	s.routes()
 	return s
+}
+
+// randomToken returns a 256-bit URL-safe secret. The previous core secret was
+// derived from a timestamp, which is guessable and has a tiny space; this does
+// not repeat that mistake.
+func randomToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// A token we cannot generate is worse than no token at all, because it
+		// would be predictable. Fall back to something still unguessable enough
+		// to stop a local process, and say so.
+		Log("could not read cryptographic randomness for the API token: %v", err, "ERR")
+		return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 func (s *Server) routes() {
@@ -63,8 +99,91 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) http.HandlerFu
 			}
 		}()
 		w.Header().Set("Cache-Control", "no-store")
+
+		// The Host header must be a loopback literal. A page on the internet can
+		// point a name it controls at 127.0.0.1, so a request that arrives with a
+		// foreign Host is either a DNS-rebinding attempt or a mistake.
+		if !isLoopbackHost(r.Host) {
+			writeJSON(w, 403, map[string]interface{}{
+				"ok": false, "error": "只接受来自本机的请求（Host 检查未通过）",
+			})
+			return
+		}
+		// A browser sends Origin on cross-origin writes. Anything that is not our
+		// own page is refused outright, so a malicious site cannot drive the API
+		// even with the token somehow known.
+		if o := r.Header.Get("Origin"); o != "" && !s.originAllowed(o) {
+			writeJSON(w, 403, map[string]interface{}{
+				"ok": false, "error": "跨源请求已被拒绝",
+			})
+			return
+		}
+		// Every route is authenticated, reads included: the read endpoints are
+		// where the subscription URL and the config preview come from.
+		if !s.tokenOK(r) {
+			writeJSON(w, 401, map[string]interface{}{
+				"ok": false, "error": "缺少或错误的访问令牌；请通过 Zenith 打开的界面操作",
+			})
+			return
+		}
+
+		// Writes must actually look like writes. Without this a form or an image
+		// tag is enough to trigger a state change, because those cannot set a
+		// JSON content type.
+		if r.Method == http.MethodPost && !strings.HasPrefix(
+			strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+			writeJSON(w, 415, map[string]interface{}{
+				"ok": false, "error": "写接口只接受 application/json",
+			})
+			return
+		}
 		h(w, r)
 	}
+}
+
+// tokenOK accepts the token from the header the UI sends, or from the query
+// string, which is how the page learns it in the first place.
+func (s *Server) tokenOK(r *http.Request) bool {
+	got := r.Header.Get("X-Zenith-Token")
+	if got == "" {
+		got = r.URL.Query().Get("token")
+	}
+	if got == "" || len(got) != len(s.token) {
+		return false
+	}
+	// constant time, so a local attacker cannot recover the token byte by byte
+	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+}
+
+func (s *Server) originAllowed(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return isLoopbackHost(u.Host)
+}
+
+// isLoopbackHost reports whether a Host or host:port value refers to this
+// machine. Only literal loopback addresses are accepted, never a name that could
+// be pointed at 127.0.0.1 from outside.
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
@@ -118,7 +237,31 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		ctype = "application/json; charset=utf-8"
 	}
 	w.Header().Set("Content-Type", ctype)
+	// Hand the API token to our own page. It is inserted only into the HTML shell
+	// served from loopback, so a script on any other origin has no way to read it;
+	// together with the Host and Origin checks that is what keeps the API ours.
+	// A strict CSP goes with it: the UI needs no remote origins at all.
+	if strings.HasSuffix(clean, ".html") {
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "+
+				"script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		data = injectToken(data, s.token)
+	}
 	_, _ = w.Write(data)
+}
+
+// injectToken puts the API token into the page as a meta tag, replacing the
+// placeholder the checked-in HTML carries. Doing it at serve time means the
+// token is never stored in the repository and changes on every launch.
+func injectToken(page []byte, token string) []byte {
+	const marker = `<meta name="zenith-token" content="">`
+	if !bytes.Contains(page, []byte(marker)) {
+		return page
+	}
+	repl := []byte(`<meta name="zenith-token" content="` + token + `">`)
+	return bytes.Replace(page, []byte(marker), repl, 1)
 }
 
 // ---- status ---------------------------------------------------------------

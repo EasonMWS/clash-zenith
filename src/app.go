@@ -119,9 +119,13 @@ func NewApp(rootDir string) (*App, error) {
 		rootDir:    rootDir,
 		logDir:     logDir,
 		configPath: filepath.Join(dataDir, "config.yaml"),
-		secret:     "zenith-" + fmt.Sprint(time.Now().UnixNano()%1_000_000),
-		dnsPort:    st.MixedPort + 300,
-		stopCh:     make(chan struct{}),
+		// A cryptographic secret, not a timestamp. The control API is the one
+		// thing that can reconfigure the core, and the previous value was
+		// time.Now().UnixNano()%1_000_000 - a guessable value with a space of a
+		// million, which a local process could brute force in seconds.
+		secret:  randomToken(),
+		dnsPort: st.MixedPort + 300,
+		stopCh:  make(chan struct{}),
 	}
 	app.core = NewCore(filepath.Join(rootDir, "core", "mihomo.exe"),
 		dataDir, app.configPath, app.secret, st.ControlPort)
