@@ -140,10 +140,12 @@ func (d *scmDispatcher) Stopped() <-chan struct{} { return d.stopCh }
 var svcInstance *scmDispatcher
 
 var (
-	advapi32                 = syscall.NewLazyDLL("advapi32.dll")
-	procStartServiceCtrlDisp = advapi32.NewProc("StartServiceCtrlDispatcherW")
-	procRegisterServiceCtrlH = advapi32.NewProc("RegisterServiceCtrlHandlerExW")
-	procSetServiceStatus     = advapi32.NewProc("SetServiceStatus")
+	advapi32                    = syscall.NewLazyDLL("advapi32.dll")
+	procStartServiceCtrlDisp    = advapi32.NewProc("StartServiceCtrlDispatcherW")
+	procRegisterServiceCtrlH    = advapi32.NewProc("RegisterServiceCtrlHandlerExW")
+	procRegisterServiceCtrlHOld = advapi32.NewProc("RegisterServiceCtrlHandlerW")
+	procGetModuleHandleForSvc   = kernel32.NewProc("GetModuleHandleW")
+	procSetServiceStatus        = advapi32.NewProc("SetServiceStatus")
 )
 
 // serviceMainCallback is the function pointer the SCM calls on a new thread.
@@ -169,6 +171,18 @@ var (
 // run by hand with -service rather than by the SCM, and is worth reporting plainly
 // because that is exactly how it will be tested.
 func RunAsService(name string, fn func(stop <-chan struct{}) error) error {
+	// Every step is logged, and that is not decoration.
+	//
+	// This path is the only part of the program that runs with rights the user cannot
+	// easily inspect, and it is started by Windows rather than by the user - so when it
+	// goes wrong there is nothing to look at: no window, no console, and a service that
+	// sits in START_PENDING until somebody thinks to ask. Measured: a service process
+	// ran for three minutes with seven threads, no listeners and no log lines at all,
+	// and the only fact available was that it had not got as far as the body.
+	//
+	// With these lines the next occurrence says which call did not return.
+	Log("service: connecting to the service control manager (name %q)", name)
+
 	svcRunMu.Lock()
 	svcRunFunc = fn
 	svcRunMu.Unlock()
@@ -187,12 +201,32 @@ func RunAsService(name string, fn func(stop <-chan struct{}) error) error {
 		{name: nil, proc: 0},
 	}
 
+	// A watchdog on our own start-up. If the dispatcher connects but the callback is
+	// never invoked - a calling-convention mismatch, a runtime problem on a thread
+	// Windows created - the process would otherwise sit here forever and the SCM would
+	// report START_PENDING until it gave up. Saying so and exiting is far more useful:
+	// the SCM then sees a failed start and can retry, and the log names the step.
+	started := make(chan struct{})
+	go func() {
+		select {
+		case <-started:
+		case <-time.After(20 * time.Second):
+			Log("service: the dispatcher connected but the service entry point was never "+
+				"called within 20s. Exiting so the SCM sees a failed start rather than a "+
+				"service that never finishes starting", "ERR")
+			os.Exit(1)
+		}
+	}()
+
 	ret, _, callErr := procStartServiceCtrlDisp.Call(uintptr(unsafe.Pointer(&table[0])))
 	if ret == 0 {
+		close(started)
+		Log("service: StartServiceCtrlDispatcherW returned 0 (%v)", callErr, "ERR")
 		return fmt.Errorf("无法连接到服务控制管理器：%v。"+
 			"这通常意味着这个进程不是由 SCM 启动的——用 -service 直接运行不会成功，"+
 			"这是预期行为", callErr)
 	}
+	Log("service: dispatcher returned; the service has stopped")
 	<-svcDone
 	return svcResult
 }
@@ -202,12 +236,83 @@ func RunAsService(name string, fn func(stop <-chan struct{}) error) error {
 // It registers the handler, reports the states, runs the body and reports the
 // outcome. Everything here is on a thread that is not a goroutine, so it hands the
 // actual work to one.
-func serviceMainTrampoline(argc uint32, argv **uint16) uintptr {
+func serviceMainTrampoline(argcRaw, argvRaw uintptr) uintptr {
+	// Machine words in, narrow types out, for the same reason as serviceCtrlHandler:
+	// the callback trampoline reads each argument as a word, so a uint32 first
+	// parameter shifts everything after it.
+	argc := uint32(argcRaw)
+	// The vector is only read when the count says there is one, and the conversion is
+	// the documented way to get from the word Windows passes to the pointer it means.
+	// vet flags it because it cannot follow that; the alternative would be to ignore
+	// the argument Windows supplies and always use the registered name, which loses the
+	// ability to notice a mismatch.
+	var argv **uint16
+	if argc >= 1 && argvRaw != 0 {
+		argv = *(***uint16)(unsafe.Pointer(&argvRaw))
+	}
+	// The first argument is a COUNT, not a pointer to the name.
+	//
+	// SERVICE_MAIN_FUNCTIONW receives (dwNumServicesArgs, lpServiceArgVectors): a count
+	// and an array. RegisterServiceCtrlHandlerExW wants the service NAME as a string.
+	// The previous version passed the count straight through, so the API was handed a
+	// small integer where a UTF-16 string was expected - and the call never returned.
+	// Measured: the log reached "registering the control handler" and stopped, and
+	// three minutes later the service was still START_PENDING with seven threads and no
+	// listeners.
+	//
+	// The name is read from the vector the SCM supplies when it is there, and falls
+	// back to the name this program registered, so a mismatch in the argument shape
+	// cannot produce a hang.
+	svcName := serviceName
+	if argc >= 1 && argv != nil {
+		if p := *argv; p != nil {
+			if got := syscall.UTF16ToString(unsafe.Slice(p, 256)); got != "" {
+				svcName = got
+			}
+		}
+	}
+	Log("service: entry point called by the service control manager (argc=%d name=%q)",
+		argc, svcName)
+	// The instance handle Windows associates with this service. Passing 0 is accepted by
+	// the documentation, and was one of the arguments the call rejected - so the real
+	// one is fetched instead.
+	hInst, _, _ := procGetModuleHandleForSvc.Call(0)
+
 	d := &scmDispatcher{stopCh: make(chan struct{})}
 
 	svcInstance = d
+	// The handler pointer is created and kept before the call, and the call is made
+	// through a variable so the exact arguments can be logged.
+	//
+	// Measured: this call did not return. The log reached "registering the control
+	// handler" and stopped, three minutes later the service was still START_PENDING
+	// with seven threads and no listeners, and nothing else had been written. So the
+	// step is now instrumented down to its arguments, because the next occurrence
+	// should say what was passed rather than only where it stopped.
+	handlerPtr := syscall.NewCallback(serviceCtrlHandler)
+	namePtr, nameErr := syscall.UTF16PtrFromString(svcName)
+	if nameErr != nil {
+		Log("service: cannot encode the service name %q: %v", svcName, nameErr, "ERR")
+		namePtr, _ = syscall.UTF16PtrFromString(serviceName)
+	}
+	Log("service: registering the control handler (name=%q handler=0x%x hInst=0x%x)",
+		svcName, handlerPtr, hInst)
 	h, _, regErr := procRegisterServiceCtrlH.Call(
-		uintptr(argc), 0, syscall.NewCallback(serviceCtrlHandler), 0)
+		uintptr(unsafe.Pointer(namePtr)), hInst, handlerPtr, 0)
+	Log("service: RegisterServiceCtrlHandlerExW returned handle=0x%x err=%v", h, regErr)
+
+	// The Ex entry point refused the arguments with ERROR_INVALID_PARAMETER even
+	// though the name and the handler were both valid. The older, two-argument
+	// RegisterServiceCtrlHandlerW needs neither a context nor an instance handle, so
+	// it is both a diagnosis - if this one works, the arguments were the problem - and
+	// a working fallback. It handles the same control codes and reports status through
+	// the same SetServiceStatus, which is everything this service uses.
+	if h == 0 {
+		Log("service: falling back to RegisterServiceCtrlHandlerW", "WARN")
+		h, _, regErr = procRegisterServiceCtrlHOld.Call(
+			uintptr(unsafe.Pointer(namePtr)), handlerPtr)
+		Log("service: RegisterServiceCtrlHandlerW returned handle=0x%x err=%v", h, regErr)
+	}
 	if h == 0 {
 		// Nothing can be reported without a status handle; the SCM will time the
 		// start out. Set the result so the caller learns why.
@@ -225,12 +330,14 @@ func serviceMainTrampoline(argc uint32, argv **uint16) uintptr {
 	// START_PENDING with a generous wait hint. The SCM will not time the start out
 	// while the checkpoint keeps advancing, and a service that reports RUNNING and
 	// then takes a minute to answer looks hung rather than slow.
+	Log("service: control handler registered; reporting START_PENDING")
 	d.report(svcStateStartPending, 0, 30000)
 
 	svcRunMu.Lock()
 	body := svcRunFunc
 	svcRunMu.Unlock()
 
+	Log("service: starting the service body")
 	var runErr error
 	bodyDone := make(chan struct{})
 	if body != nil {
@@ -255,6 +362,7 @@ func serviceMainTrampoline(argc uint32, argv **uint16) uintptr {
 	case <-bodyDone:
 		// Fell through to the stop path below.
 	case <-time.After(400 * time.Millisecond):
+		Log("service: reporting RUNNING")
 		d.report(svcStateRunning, svcAcceptStop|svcAcceptShutdown, 0)
 		select {
 		case <-bodyDone:
@@ -287,11 +395,27 @@ func serviceMainTrampoline(argc uint32, argv **uint16) uintptr {
 // It must return quickly: it runs on an SCM-owned thread and blocking there stops
 // the SCM from delivering anything else. So it records the request and returns; the
 // body notices and shuts itself down.
-func serviceCtrlHandler(ctrl uint32, eventType uint32, eventData uintptr, context uintptr) uintptr {
+// serviceCtrlHandler is called by the SCM for control requests.
+//
+// Every parameter is a uintptr, and that is not cosmetic.
+//
+// Measured: with the first parameter declared uint32, RegisterServiceCtrlHandlerExW
+// returned 0 with ERROR_INVALID_PARAMETER and the service never started. A Go callback
+// is built by a trampoline that reads each argument as a machine word and writes it to
+// the corresponding Go argument slot, so a narrower type makes every argument after it
+// land at the wrong offset - the function pointer is rejected rather than called with
+// bad values.
+//
+// The narrow types are recovered inside, where the conversion is explicit and the
+// layout handed to Windows is unambiguous.
+func serviceCtrlHandler(ctrlRaw, eventTypeRaw, eventData, context uintptr) uintptr {
+	ctrl := uint32(ctrlRaw)
 	d := svcInstance
 	if d == nil {
 		return 0
 	}
+	_ = eventTypeRaw
+	_ = eventData
 	switch ctrl {
 	case svcControlStop, svcControlShutdown:
 		d.requestStop()

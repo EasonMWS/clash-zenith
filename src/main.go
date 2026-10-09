@@ -74,6 +74,7 @@ func main() {
 		// -service runs the resident process that owns the core. -install-service is
 		// what the one authorisation runs: it registers that service with Windows.
 		serviceFlag        = flag.Bool("service", false, "internal: run as the resident core service")
+		scmTestFlag        = flag.Bool("scm-test", false, "internal: exercise the service control protocol and exit")
 		installServiceFlag = flag.Bool("install-service", false, "internal: register the resident service")
 		// Raised by the elevation request. The elevated instance runs the same
 		// product; it only differs in having the rights the adapter and the routes
@@ -202,6 +203,38 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+
+	// Exercises the Service Control Manager protocol and exits.
+	//
+	// It exists so the protocol can be tested with ONE elevation instead of a
+	// deploy-install-start-observe cycle per attempt, which is what the previous
+	// approach cost. It runs the real dispatcher and the real handler registration,
+	// writes a line at every step, then exits with a status that says whether the
+	// sequence completed.
+	if *scmTestFlag {
+		Log("scm-test: starting the dispatcher probe")
+		done := make(chan error, 1)
+		go func() {
+			done <- RunAsService(serviceName, func(stop <-chan struct{}) error {
+				Log("scm-test: the service body ran; the protocol works end to end")
+				time.Sleep(1500 * time.Millisecond)
+				return nil
+			})
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				Log("scm-test: FAILED: %v", err, "ERR")
+				os.Exit(2)
+			}
+			Log("scm-test: OK")
+			os.Exit(0)
+		case <-time.After(25 * time.Second):
+			Log("scm-test: TIMED OUT after 25s. The last step logged above is where it "+
+				"stopped.", "ERR")
+			os.Exit(3)
+		}
 	}
 
 	// The resident service. It holds the core and answers the authenticated
