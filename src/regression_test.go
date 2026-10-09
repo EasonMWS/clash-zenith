@@ -3320,3 +3320,82 @@ func TestUUIDLikeRecognisesOnlyUUIDs(t *testing.T) {
 		}
 	}
 }
+
+// ---- an adapter name reaches a shell, so it must be a plain identifier -------
+
+func TestAdapterNameCannotEscapeIntoPowerShell(t *testing.T) {
+	// Measured before this was fixed. `tunDevice` was interpolated into
+	//     Get-NetAdapter -Name '<name>'
+	// and into Remove-NetAdapter inside the elevated helper, so a name containing a
+	// single quote closed the string. With
+	//
+	//     x'; Write-Host PWNED; #
+	//
+	// the generated command ran and printed PWNED.
+	//
+	// Escaping would be the other answer and is the wrong one: the name is also
+	// written into the configuration and passed to the core, so a value needing
+	// escaping in one place and not another will be escaped in one place and not
+	// another. A name that is not a plain identifier is refused.
+	hostile := []string{
+		`x'; Write-Host PWNED; #`,
+		`x'; Remove-NetAdapter -Name 'Ethernet' -Confirm:$false; '`,
+		"x`nWrite-Host PWNED",
+		`x$(Write-Host PWNED)`,
+		`x"; Write-Host PWNED; "`,
+		"x\ny", "x\ty", "x|y", "x&y", "x>y", "x<y", "x;y",
+		"", "  ", "---", "___",
+		strings.Repeat("a", 33),
+		"Zenith\x00",
+	}
+	for _, name := range hostile {
+		if validAdapterName(name) {
+			t.Errorf("validAdapterName(%q) = true; this name would be interpolated into a shell", name)
+		}
+	}
+
+	// And the settings accessor substitutes the default rather than passing it on.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateSettings(map[string]interface{}{
+		"tunDevice": `x'; Write-Host PWNED; #`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Settings().NormalizedTunDevice(); got != tunDefaultDevice {
+		t.Errorf("an unusable name reached the accessor as %q; it must be replaced", got)
+	}
+}
+
+func TestOrdinaryAdapterNamesAreAccepted(t *testing.T) {
+	// The rule must not be so strict that a legitimate name is refused, or the
+	// substitution would be the bug.
+	good := []string{
+		"Zenith", "zenith", "MyTun", "tun0", "Zenith-Tun", "Zenith_Tun",
+		"Local Area Connection", "Wintun 1", "a", "A1",
+	}
+	for _, name := range good {
+		if !validAdapterName(name) {
+			t.Errorf("validAdapterName(%q) = false, want true", name)
+		}
+	}
+	// And the default is obviously among them.
+	if !validAdapterName(tunDefaultDevice) {
+		t.Fatalf("the default name %q is refused by its own rule", tunDefaultDevice)
+	}
+}
+
+func TestAdapterLookupRefusesAnUnusableNameRatherThanPassingItOn(t *testing.T) {
+	// The second check, at the point the name reaches a shell. It cannot fire today
+	// because the accessor substitutes first; it exists so that relaxing the fixed
+	// name later does not quietly reopen the hole.
+	if tunAdapterExists(`x'; Write-Host PWNED; #`) {
+		t.Error("the adapter lookup accepted a name it should refuse")
+	}
+	if err := removeTunAdapter(`x'; Write-Host PWNED; #`); err == nil {
+		t.Error("adapter removal accepted a name it should refuse")
+	}
+}

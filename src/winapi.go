@@ -110,6 +110,16 @@ func adapterDescriptions() []string {
 // the name Zenith gave it rather than by a generic pattern, so another product's
 // adapter is never mistaken for ours.
 func tunAdapterExists(name string) bool {
+	// Belt as well as braces. The settings accessor already refuses anything that is
+	// not a plain identifier, and this is the point where the name reaches a shell -
+	// so the check that matters is repeated here rather than trusted to have
+	// happened upstream. A second check costs nothing and covers a future caller
+	// that builds a name some other way.
+	if !validAdapterName(name) {
+		Log("refusing to query the adapter table with an unusable name %q",
+			truncateForMessage(name, 40), "WARN")
+		return false
+	}
 	out, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
 		fmt.Sprintf("Get-NetAdapter -Name '%s' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name", name))
 	if err != nil {
@@ -124,6 +134,12 @@ func tunAdapterExists(name string) bool {
 func removeTunAdapter(name string) error {
 	if name == "" || name != defaultTunDevice {
 		return fmt.Errorf("拒绝删除非 Zenith 自己的网卡（%q）", name)
+	}
+	// The name is fixed by the check above, so this cannot fire today. It is here
+	// because this function runs inside the elevated helper and interpolates into
+	// PowerShell: if the fixed name is ever relaxed, the check stays.
+	if !validAdapterName(name) {
+		return fmt.Errorf("网卡名 %q 不可用作命令参数", truncateForMessage(name, 40))
 	}
 	if !tunAdapterExists(name) {
 		return nil

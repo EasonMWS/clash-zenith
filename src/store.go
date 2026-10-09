@@ -292,10 +292,21 @@ const (
 // - so the check reported one name, the generated configuration carried another,
 // and the adapter lookup searched for a third. Every path goes through here now.
 func (s Settings) NormalizedTunDevice() string {
-	if strings.TrimSpace(s.TunDevice) == "" {
+	name := strings.TrimSpace(s.TunDevice)
+	// An unusable name is replaced rather than escaped. It is interpolated into
+	// PowerShell commands inside the elevated helper, so a value carrying a quote
+	// would execute whatever followed it - measured, not assumed. A name that is not
+	// a plain identifier is not a name the user meant to type, and substituting the
+	// default is both safer and easier to explain than a quoting rule applied in one
+	// place and forgotten in another.
+	if !validAdapterName(name) {
+		if name != "" {
+			Log("settings: adapter name %q is not a usable name; using %q instead",
+				truncateForMessage(name, 40), tunDefaultDevice, "WARN")
+		}
 		return tunDefaultDevice
 	}
-	return strings.TrimSpace(s.TunDevice)
+	return name
 }
 
 // NormalizedTunStack returns the stack to use, filling in the default.

@@ -34,6 +34,56 @@ import (
 // sign of something other than an option name.
 const yamlKeyMaxLen = 64
 
+// validAdapterName reports whether a string is safe to use as a network adapter
+// name.
+//
+// This is not cosmetic validation. The name is interpolated into PowerShell
+// commands in single quotes, in two places that both matter:
+//
+//	Get-NetAdapter  -Name '<name>'
+//	Remove-NetAdapter -Name '<name>'
+//
+// and the second of those runs inside the elevated helper. A single quote in the
+// name closes the string, so a `tunDevice` set to
+//
+//	x'; Write-Host PWNED; #
+//
+// executes the text after it. Measured, not theorised: the generated command ran
+// and printed PWNED.
+//
+// Escaping would be the other answer, but it is the wrong one here for two
+// reasons. The name is also written into the generated configuration and passed to
+// the core, so a value that needed escaping in one place and not another is a value
+// that will be escaped in one place and not another. And an adapter name is a short
+// identifier - letters, digits, hyphens - so anything outside that is not a name the
+// user meant to type.
+//
+// The rule is therefore: a plain identifier, or nothing. The settings accessor
+// substitutes the default for anything that fails, so a corrupted settings file
+// cannot carry a payload into an elevated shell.
+func validAdapterName(name string) bool {
+	if name == "" || len(name) > 32 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == ' ':
+			// A space is allowed because Windows adapter names use them
+			// ("Local Area Connection"). It has no meaning to the shell inside a
+			// quoted string.
+		default:
+			return false
+		}
+	}
+	// A name that is only punctuation is not a name.
+	trimmed := strings.Trim(name, " -_")
+	return trimmed != ""
+}
+
 // validYAMLKey reports whether a key can be written without escaping.
 //
 // A key that consists only of letters, digits, `-`, `_` and `.` cannot terminate the
