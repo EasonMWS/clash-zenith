@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -2240,5 +2241,174 @@ func TestServiceStateSurvivesARestart(t *testing.T) {
 	}
 	if back.UpdatedAt == "" {
 		t.Error("the record should say when it was written")
+	}
+}
+
+// ---- P0-5: name the failure, and notice an exit as it happens --------------
+
+func TestCoreFailuresAreToldApart(t *testing.T) {
+	// Every startup failure used to produce the same sentence pointing at a log
+	// file, after the full deadline had passed. Telling them apart is what makes a
+	// failure actionable.
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	cases := []struct {
+		name string
+		log  string
+		want coreFailure
+	}{
+		{
+			"port already in use",
+			`time="2026-01-01T00:00:00Z" level=error msg="Mixed(http+socks) proxy listening error: listen tcp 127.0.0.1:7899: bind: address already in use"`,
+			coreFailurePortInUse,
+		},
+		{
+			"windows socket message",
+			`level=error msg="listen tcp 127.0.0.1:7899: bind: Only one usage of each socket address is normally permitted."`,
+			coreFailurePortInUse,
+		},
+		{
+			"tun driver refused",
+			`level=error msg="Start TUN listening error: configure tun interface: Access is denied."`,
+			coreFailureDriver,
+		},
+		{
+			"wintun mentioned",
+			`level=error msg="wintun: could not create adapter"`,
+			coreFailureDriver,
+		},
+		{
+			"configuration rejected",
+			`level=error msg="Parse config error: yaml: unmarshal errors: line 12: cannot unmarshal"`,
+			coreFailureConfig,
+		},
+		{
+			"rule database missing",
+			`level=error msg="can't initial GeoSite databse"`,
+			coreFailureGeodata,
+		},
+		{
+			"authentication",
+			`level=error msg="authentication failed: secret mismatch"`,
+			coreFailureAuth,
+		},
+	}
+
+	for _, c := range cases {
+		p := write(strings.ReplaceAll(c.name, " ", "_")+".log", c.log)
+		got, last := classifyCoreLog(p)
+		if got != c.want {
+			t.Errorf("%s: classified as %q, want %q", c.name, got.Label(), c.want.Label())
+		}
+		if last == "" {
+			t.Errorf("%s: the core's own last line should be reported alongside", c.name)
+		}
+	}
+
+	// An unrecognised failure must say so rather than picking the closest category.
+	p := write("unknown.log", `level=error msg="something nobody has seen before"`)
+	if got, _ := classifyCoreLog(p); got != coreFailureUnknown {
+		t.Errorf("an unrecognised failure was classified as %q", got.Label())
+	}
+	// And a missing log is not an error in itself.
+	if got, _ := classifyCoreLog(filepath.Join(dir, "nope.log")); got != coreFailureUnknown {
+		t.Error("a missing log should classify as unknown, not fail")
+	}
+}
+
+func TestEveryCoreFailureCarriesAdvice(t *testing.T) {
+	// A failure without a next step is one the user cannot act on, which was the
+	// complaint about the old single message.
+	for _, k := range []coreFailure{
+		coreFailureUnknown, coreFailurePortInUse, coreFailureAuth,
+		coreFailureConfig, coreFailureDriver, coreFailureGeodata,
+		coreFailureMissingBinary,
+	} {
+		if k.Label() == "" {
+			t.Errorf("failure %d has no label", k)
+		}
+		if k.Advice() == "" {
+			t.Errorf("failure %q has no advice", k.Label())
+		}
+	}
+	// The driver advice must name the likely cause, since authorisation that did
+	// not take effect is indistinguishable from a driver problem at this level.
+	if !strings.Contains(coreFailureDriver.Advice(), "管理员") {
+		t.Error("the driver advice should name the privilege possibility")
+	}
+}
+
+func TestCoreStartFailureIncludesTheEvidence(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "e.log")
+	line := `level=error msg="listen tcp 127.0.0.1:7899: bind: address already in use"`
+	if err := os.WriteFile(p, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := coreStartFailure(p, true, 4242)
+	msg := err.Error()
+	if !strings.Contains(msg, "立即退出") {
+		t.Error("the message should say the process exited rather than timing out")
+	}
+	if !strings.Contains(msg, "端口冲突") {
+		t.Error("the message should name the failure kind")
+	}
+	if !strings.Contains(msg, "address already in use") {
+		t.Error("the message should carry the core's own words as evidence")
+	}
+	if !strings.Contains(msg, "4242") {
+		t.Error("the message should carry the pid")
+	}
+	// And the classification is available without parsing the text back out.
+	var ce *coreStartError
+	if !errors.As(err, &ce) {
+		t.Fatal("the error should carry its classification")
+	}
+	if ce.Kind() != coreFailurePortInUse {
+		t.Errorf("kind = %q, want port in use", ce.Kind().Label())
+	}
+}
+
+func TestWaitForCoreUpNoticesAnExitImmediately(t *testing.T) {
+	// The defect this replaces: cmd.ProcessState stays nil until Wait is called, so
+	// the exit branch never fired and a core that died in its first second still
+	// cost the full deadline.
+	exited := make(chan struct{})
+	close(exited)
+	start := time.Now()
+	up, didExit := waitForCoreUp(func() bool { return false }, exited, 5*time.Second)
+	elapsed := time.Since(start)
+	if up {
+		t.Error("a core that never answers must not be reported as up")
+	}
+	if !didExit {
+		t.Error("the exit was not noticed")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("the exit took %v to notice; it should be immediate rather than waiting out the deadline", elapsed)
+	}
+
+	// A core that comes up is reported as up, and the exit flag is false.
+	up, didExit = waitForCoreUp(func() bool { return true }, make(chan struct{}), 3*time.Second)
+	if !up || didExit {
+		t.Errorf("a core that answers should be up=%v exit=%v", up, didExit)
+	}
+}
+
+func TestWaitForCoreUpToleratesAnExitAfterSuccess(t *testing.T) {
+	// The core can answer and then be replaced by an exit in a race. Reporting a
+	// failure there would be wrong.
+	exited := make(chan struct{})
+	close(exited)
+	up, _ := waitForCoreUp(func() bool { return true }, exited, 2*time.Second)
+	if !up {
+		t.Error("a core that is answering must be reported as up even if the exit channel is closed")
 	}
 }

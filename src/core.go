@@ -167,20 +167,29 @@ func (c *Core) Start() error {
 	c.proc = cmd
 	c.startedAt = time.Now()
 
+	// Watch for the child actually exiting.
+	//
+	// The previous check read cmd.ProcessState, which stays nil until Wait is
+	// called - so it never fired, and a core that died in its first second still
+	// cost the full deadline before anything was said. Worse, what was said was the
+	// same sentence whatever the cause. This channel is closed by the goroutine that
+	// waits on the process, so an exit is noticed as it happens and the reason is
+	// read from the core's own output.
+	exitCh := make(chan struct{})
+	pid := cmd.Process.Pid
+	go func() {
+		_ = cmd.Wait()
+		close(exitCh)
+	}()
+
 	// The first run of a fresh install has to unpack geodata (tens of MB), which
 	// can take a minute on a slow link, so the deadline is generous.
-	deadline := time.Now().Add(150 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(500 * time.Millisecond)
-		if c.IsUp() {
-			Log("core is up (pid %d, %s)", cmd.Process.Pid, c.Version())
-			return nil
-		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			return fmt.Errorf("内核启动后立即退出，请查看 logs/engine.log")
-		}
+	up, exited := waitForCoreUp(func() bool { return c.IsUp() }, exitCh, 150*time.Second)
+	if up {
+		Log("core is up (pid %d, %s)", pid, c.Version())
+		return nil
 	}
-	return fmt.Errorf("内核未在预期时间内响应，请查看 logs/engine.log")
+	return coreStartFailure(engineLogPath(c.dataDir), exited, pid)
 }
 
 func (c *Core) Stop() {
