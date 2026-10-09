@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,11 +53,21 @@ type App struct {
 	userPickedAt time.Time
 	// why the last auto-pick declined to act, surfaced through the API
 	lastPickDebug string
-	// health checking of the node currently in use
+
+	// ---- health state -------------------------------------------------------
+	//
+	// These live behind healthView, published by healthLoop and read by everyone
+	// else, rather than in maps that several goroutines touch directly.
+	//
+	// The earlier layout had healthLoop writing healthBanned and nodeFlaky under
+	// the mutex while enforceFastest read them without it and the status handler
+	// handed the raw map to the JSON encoder. A map read that overlaps a write is
+	// a fatal runtime error in Go that recover cannot catch, so any of those
+	// overlaps would take the whole process down - the exact "it just died"
+	// failure this client is supposed to survive.
 	healthFails  int
 	healthLastAt time.Time
-	healthBanned map[string]time.Time // node name -> when it was found dead
-	healthLastEv string               // last health event, surfaced through the API
+	healthLastEv string
 	// consecutive measurements over slowNodeMS; two in a row triggers a switch
 	slowStrikes int
 	// how many forced switches happened without a successful check in between;
@@ -64,9 +75,14 @@ type App struct {
 	healthSwitches int
 	// when the last health-triggered rescan started, so rescans cannot loop
 	lastHealthRescan time.Time
-	// how often each node has failed a liveness check. A node that keeps
-	// dropping out should lose to a slightly slower node that never does.
-	nodeFlaky   map[string]int
+	// node name -> when it was last found dead
+	healthBanned map[string]time.Time
+	// node name -> how often it has failed a liveness check
+	nodeFlaky map[string]int
+	// healthView is an immutable snapshot of the two maps above, swapped whole.
+	// Readers only ever load the pointer, so there is no map to race on.
+	healthView atomic.Value // *healthSnapshot
+
 	quitting    bool
 	stopCh      chan struct{}
 	onQuit      func()
@@ -474,20 +490,36 @@ func (a *App) pickDebug(code int, format string, args ...interface{}) {
 func (a *App) reactToSlowness(current string, delay float64) {
 	if delay < slowNodeMS {
 		a.mu.Lock()
+		// A fast measurement clears the count: the bar is about sustained
+		// slowness, not about accumulating unrelated hiccups.
 		a.slowStrikes = 0
 		a.mu.Unlock()
 		return
 	}
+
 	a.mu.Lock()
 	// One slow measurement is noise; the bar is deliberately generous, so
 	// crossing it twice in a row means something real.
+	//
+	// The counter must survive between calls for that to mean anything. An
+	// earlier version reset it to zero in this same critical section - before the
+	// threshold check - so strikes was always 1, the comparison below never
+	// passed, and this whole function was dead code.
 	a.slowStrikes++
 	strikes := a.slowStrikes
+	if strikes < slowStrikesNeeded {
+		a.mu.Unlock()
+		return
+	}
 	tooSoon := time.Since(a.healthLastAt) < healthRetryDelay
-	a.slowStrikes = 0
+	if !tooSoon {
+		// Reset only when the switch is actually going to happen, so a retry
+		// delay does not silently consume the evidence.
+		a.slowStrikes = 0
+	}
 	a.mu.Unlock()
 
-	if strikes < 2 || tooSoon {
+	if tooSoon {
 		return
 	}
 
@@ -621,6 +653,9 @@ func (a *App) healthCheck() {
 	a.healthBanned[current] = time.Now()
 	a.healthLastEv = fmt.Sprintf("%s failed %d/%d (累计 %d 次)", current, fails, healthFailLimit, flaky)
 	tooSoon := time.Since(a.healthLastAt) < healthRetryDelay
+	// Publish the new counts as one immutable snapshot before releasing the lock,
+	// so no reader can observe a map mid-update.
+	a.publishHealth()
 	a.mu.Unlock()
 
 	reason := "timed out"
@@ -649,15 +684,17 @@ func (a *App) healthCheck() {
 		}
 	}
 	if next == "" {
+		// One snapshot for the whole walk; it is immutable, so the answer cannot
+		// change halfway through the loop.
+		view := a.HealthView()
 		for _, p := range optimized {
 			if p.Name == current {
 				continue
 			}
-			a.mu.Lock()
-			bannedAt, banned := a.healthBanned[p.Name]
-			a.mu.Unlock()
-			if banned && time.Since(bannedAt) < 5*time.Minute {
-				continue
+			if view != nil {
+				if bannedAt, banned := view.Banned[p.Name]; banned && time.Since(bannedAt) < 5*time.Minute {
+					continue
+				}
 			}
 			next = p.Name
 			break
@@ -710,6 +747,58 @@ func (a *App) healthCheck() {
 	}
 }
 
+// healthSnapshot is the immutable view of health bookkeeping.
+//
+// The maps are copied on publish instead of shared. That costs a small
+// allocation whenever the counts change - which is rare, on the order of once
+// per liveness check - and in exchange no reader ever holds a reference to a map
+// that a writer might be updating underneath it.
+type healthSnapshot struct {
+	Banned map[string]time.Time
+	Flaky  map[string]int
+}
+
+// publishHealth copies the current bookkeeping into a fresh snapshot and swaps
+// it in. Callers must hold a.mu.
+func (a *App) publishHealth() {
+	snap := &healthSnapshot{
+		Banned: make(map[string]time.Time, len(a.healthBanned)),
+		Flaky:  make(map[string]int, len(a.nodeFlaky)),
+	}
+	for k, v := range a.healthBanned {
+		snap.Banned[k] = v
+	}
+	for k, v := range a.nodeFlaky {
+		snap.Flaky[k] = v
+	}
+	a.healthView.Store(snap)
+}
+
+// HealthView returns the current snapshot. A nil result means nothing has been
+// published yet, which callers treat as "no node is known bad".
+func (a *App) HealthView() *healthSnapshot {
+	if v := a.healthView.Load(); v != nil {
+		if s, ok := v.(*healthSnapshot); ok {
+			return s
+		}
+	}
+	return nil
+}
+
+// flakyNodesCopy returns a detached copy of the per-node failure counts for
+// reporting. Callers get their own map, so encoding it cannot race with the
+// health loop updating the real one.
+func (a *App) flakyNodesCopy() map[string]int {
+	if h := a.HealthView(); h != nil {
+		out := make(map[string]int, len(h.Flaky))
+		for k, v := range h.Flaky {
+			out[k] = v
+		}
+		return out
+	}
+	return map[string]int{}
+}
+
 // pickResult is what enforceFastest decided.
 type pickResult struct {
 	Name  string
@@ -758,6 +847,9 @@ const (
 	// considered degraded rather than merely not-the-fastest. Healthy values sit
 	// near 250ms, so this only trips on a real collapse.
 	slowNodeMS = 1200
+	// slowStrikesNeeded is how many consecutive slow measurements are required
+	// before the node is abandoned. Two, so a single spike is ignored.
+	slowStrikesNeeded = 2
 	// A rescan may not start again until this long after the previous one, so a
 	// flapping network cannot put the app into a permanent scan loop.
 	healthRescanCooldown = 10 * time.Minute
@@ -803,13 +895,15 @@ func (a *App) enforceFastest() (pickResult, bool) {
 		// Reliability is part of being fast. Each recent failure adds a penalty
 		// to the effective latency, so an edge that intermittently stops
 		// answering loses to one that is a few milliseconds slower but steady.
-		if a.healthBanned != nil {
-			if at, bad := a.healthBanned[p.Name]; bad && time.Since(at) < 2*time.Minute {
+		//
+		// The snapshot is loaded once per pass, not per node: it is immutable, so
+		// it stays consistent for the whole ranking even if healthLoop publishes a
+		// newer one halfway through.
+		if h := a.HealthView(); h != nil {
+			if at, bad := h.Banned[p.Name]; bad && time.Since(at) < 2*time.Minute {
 				continue // found dead moments ago, do not rank it at all
 			}
-		}
-		if a.nodeFlaky != nil {
-			ms += float64(a.nodeFlaky[p.Name]) * flakyPenaltyMS
+			ms += float64(h.Flaky[p.Name]) * flakyPenaltyMS
 		}
 		if bestMS == 0 || ms < bestMS {
 			best, bestMS = p, ms
@@ -1111,21 +1205,24 @@ func (a *App) Status() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"ok":           true,
-		"app":          AppName,
-		"version":      AppVersion,
-		"coreUp":       a.core.IsUp(),
-		"corePid":      a.core.Pid(),
-		"coreVersion":  a.core.Version(),
-		"coreUptime":   a.core.Uptime(),
-		"mode":         st.Mode,
-		"current":      current,
-		"autoPick":     autoPick, // what the core's AUTO group currently chooses
-		"autoPickOn":   !st.AutoPickOff,
-		"fastestName":  fastest.Name,
-		"pickDebug":    a.lastPickDebug,
-		"healthEvent":  a.healthLastEv,
-		"flakyNodes":   a.nodeFlaky,
+		"ok":          true,
+		"app":         AppName,
+		"version":     AppVersion,
+		"coreUp":      a.core.IsUp(),
+		"corePid":     a.core.Pid(),
+		"coreVersion": a.core.Version(),
+		"coreUptime":  a.core.Uptime(),
+		"mode":        st.Mode,
+		"current":     current,
+		"autoPick":    autoPick, // what the core's AUTO group currently chooses
+		"autoPickOn":  !st.AutoPickOff,
+		"fastestName": fastest.Name,
+		"pickDebug":   a.lastPickDebug,
+		"healthEvent": a.healthLastEv,
+		// A copy, never the internal map. Handing the live map to the JSON
+		// encoder meant every status request read it while healthLoop could be
+		// writing it, which is a fatal runtime error rather than a wrong answer.
+		"flakyNodes":   a.flakyNodesCopy(),
 		"fastestMS":    fastestMS,
 		"nodes":        list,
 		"nodeCount":    len(list),

@@ -25,6 +25,18 @@ import (
 // ---------------------------------------------------------------------------
 
 func main() {
+	// Detached recovery path, and it has to be handled BEFORE flag.Parse.
+	//
+	// flag.Parse exits the process with status 2 on an unknown flag, so a
+	// watchdog that is dispatched after it can never run at all. That is exactly
+	// what happened: the helper was spawned, the child died on its own argument,
+	// and the crash protection the user was told about did not exist. The check
+	// therefore happens first and does not rely on the flag package.
+	if isWatchdogInvocation() {
+		runWatchdogFromArgs()
+		return
+	}
+
 	var (
 		headless = flag.Bool("headless", false, "run the backend only, without a window")
 		browser  = flag.Bool("browser", false, "open the UI in the default browser")
@@ -35,12 +47,6 @@ func main() {
 		dataFlag = flag.String("datadir", "", "use a different data directory")
 	)
 	flag.Parse()
-
-	// Detached recovery path: when the process is killed without a chance to
-	// clean up, this child clears a proxy left pointing at a dead port.
-	if ServeWatchdog(flag.Args()) {
-		return
-	}
 
 	// A GUI-subsystem binary has no console, so an unhandled panic would vanish
 	// without a trace. Catch it and put it in the log instead.

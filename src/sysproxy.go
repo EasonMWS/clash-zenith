@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -377,18 +378,38 @@ func NeutraliseFromOtherProcess(stateDir string, port int) {
 	}
 }
 
-// ServeWatchdog is the entry point for the detached recovery process. It
-// returns false for every other invocation so normal startup is unaffected.
-func ServeWatchdog(args []string) bool {
-	if len(args) < 3 || args[0] != "-watchdog" {
+// isWatchdogInvocation reports whether this process was started as the detached
+// recovery helper.
+//
+// It deliberately does not use the flag package. flag.Parse terminates the
+// process on an unknown flag, so a helper that is recognised only after parsing
+// can never run: the child was spawned with -watchdog, died on its own argument,
+// and the crash protection silently did not exist. This runs before any parsing.
+//
+// A watchdog also only ever has a data directory and a port, and it never has a
+// window, so the shape of the argument list is unambiguous.
+func isWatchdogInvocation() bool {
+	if len(os.Args) < 4 {
 		return false
 	}
-	port := 0
-	fmt.Sscanf(args[2], "%d", &port)
-	if port > 0 {
-		NeutraliseFromOtherProcess(args[1], port)
+	if os.Args[1] != "-watchdog" {
+		return false
 	}
-	return true
+	// args: exe -watchdog <dataDir> <port>
+	_, err := strconv.Atoi(os.Args[3])
+	return err == nil
+}
+
+// runWatchdogFromArgs is the detached recovery path. It runs as its own process,
+// outlives the parent, and only touches the system proxy if the parent never
+// managed to bring its port up - meaning it died without running its shutdown
+// path and left the registry pointing at nothing.
+func runWatchdogFromArgs() {
+	port, err := strconv.Atoi(os.Args[3])
+	if err != nil || port <= 0 {
+		return
+	}
+	NeutraliseFromOtherProcess(os.Args[2], port)
 }
 
 // ---- hidden command helper ------------------------------------------------
