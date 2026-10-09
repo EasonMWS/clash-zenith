@@ -3311,8 +3311,8 @@ func TestUUIDLikeRecognisesOnlyUUIDs(t *testing.T) {
 			t.Errorf("uuidLike(%q) = false, want true", v)
 		}
 	}
-	no := []string{"", "short", "187d8fa9-569b-49e4-bd00-bbb318a4f29",
-		"187d8fa9x569b-49e4-bd00-bbb318a4f295", "example.com",
+	no := []string{"", "short", "deadbeef-569b-49e4-bd00-bbb318a4f29555",
+		"deadbeefx569b-49e4-bd00-bbb318a4f29", "example.com",
 		"00000000-1111-2222-3333-4444444444445"}
 	for _, v := range no {
 		if uuidLike(v) {
