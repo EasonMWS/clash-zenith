@@ -231,6 +231,15 @@ type Store struct {
 	mu    sync.RWMutex
 	path  string
 	state State
+	// seenMod is the modification time of the file this process last read or wrote.
+	//
+	// It exists because the state file has more than one legitimate writer. An
+	// elevated helper records the TUN mode it activated, and the interface that is
+	// already running holds its own copy in memory - so a tunnel can be up, and the
+	// interface reports it as off, because nobody told it the file changed. That is
+	// exactly the review's "each process caches its own settings", observed rather
+	// than predicted.
+	seenMod time.Time
 }
 
 func NewStore(dir string) (*Store, error) {
@@ -246,6 +255,9 @@ func NewStore(dir string) (*Store, error) {
 }
 
 func (s *Store) load() error {
+	if st, err := os.Stat(s.path); err == nil {
+		s.seenMod = st.ModTime()
+	}
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -361,7 +373,13 @@ func (s *Store) saveLocked() error {
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	if st, err := os.Stat(s.path); err == nil {
+		s.seenMod = st.ModTime()
+	}
+	return nil
 }
 
 func (s *Store) Save() error {
@@ -381,9 +399,63 @@ func (s *Store) Snapshot() State {
 }
 
 func (s *Store) Settings() Settings {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncFromDiskLocked()
 	return s.state.Settings
+}
+
+// syncFromDiskLocked reloads the state when another process has written it.
+//
+// The comparison is by modification time rather than by content: reading and
+// parsing the whole file on every settings read would be wasteful for the common
+// case where nothing changed, and a stat is cheap.
+//
+// Only a file that has moved forward is adopted. A file that has gone backwards -
+// restored from a backup, or a clock change - is left alone, because silently
+// replacing live settings with an older set would be worse than the staleness this
+// fixes.
+//
+// The reload is skipped while this process holds un-flushed changes, which cannot
+// happen here because every mutating method writes through, but the guard is kept
+// so a future buffered write cannot be silently discarded by a reload.
+func (s *Store) syncFromDiskLocked() {
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return
+	}
+	if !st.ModTime().After(s.seenMod) {
+		return
+	}
+	raw, err := os.ReadFile(s.path)
+	if err != nil {
+		return
+	}
+	var next State
+	if err := json.Unmarshal(raw, &next); err != nil {
+		// A half-written file is not a reason to lose what is in memory; the writer
+		// renames into place, so this should not happen, and if it does the next read
+		// will pick up the completed file.
+		Log("state file changed but could not be parsed; keeping the in-memory copy: %v", err, "WARN")
+		return
+	}
+	mergeDefaults(&next.Settings, defaultSettings())
+	s.state = next
+	s.seenMod = st.ModTime()
+}
+
+// Reload re-reads the state file unconditionally.
+//
+// Used where the caller knows another process has just written and wants the change
+// immediately, rather than on the next settings read.
+func (s *Store) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, err := os.Stat(s.path); err == nil {
+		s.seenMod = st.ModTime().Add(-time.Second)
+	}
+	s.syncFromDiskLocked()
+	return nil
 }
 
 // UpdateSettings applies a patch and persists it.

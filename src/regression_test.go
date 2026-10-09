@@ -2670,3 +2670,182 @@ func TestHandoverMACCoverEveryDecisiveField(t *testing.T) {
 		t.Error("an empty key must not sign")
 	}
 }
+
+// ---- a second writer must be noticed ---------------------------------------
+
+func TestSettingsPickUpAnotherProcessesWrite(t *testing.T) {
+	// The state file has more than one legitimate writer: an elevated helper records
+	// the TUN mode it activated, while the interface that is already running holds
+	// its own copy in memory. Observed on this machine - a tunnel was up, the adapter
+	// was up, the default route went through it, and the interface reported TUN as
+	// off, because nobody told it the file had changed.
+	dir := t.TempDir()
+	a, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Settings().TunMode; got != TunOff {
+		t.Fatalf("tunMode starts as %q, want off", got)
+	}
+
+	// A second store, standing in for the other process.
+	b, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.UpdateSettings(map[string]interface{}{"tunMode": string(TunCompat)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first store must see it on its next read, not on its next restart.
+	if got := a.Settings().TunMode; got != TunCompat {
+		t.Errorf("tunMode = %q after another process wrote compat; the change was not noticed", got)
+	}
+
+	// And the other direction, so this is not one-way.
+	if _, err := a.UpdateSettings(map[string]interface{}{"tunMode": string(TunPrivacy)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.Settings().TunMode; got != TunPrivacy {
+		t.Errorf("tunMode = %q in the other store; the change was not noticed", got)
+	}
+}
+
+func TestSettingsReloadDoesNotLoseThisProcessesWrites(t *testing.T) {
+	// A reload must not discard what this process just wrote. The guard is by
+	// modification time, and the writer updates it, so this asserts the property
+	// rather than the mechanism.
+	dir := t.TempDir()
+	a, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.UpdateSettings(map[string]interface{}{"mixedPort": 7901}); err != nil {
+		t.Fatal(err)
+	}
+	// Several reads in a row, each of which now checks the file.
+	for i := 0; i < 5; i++ {
+		if got := a.Settings().MixedPort; got != 7901 {
+			t.Fatalf("read %d: mixedPort = %d, want 7901", i, got)
+		}
+	}
+}
+
+func TestSettingsSyncIgnoresAnOlderFile(t *testing.T) {
+	// A file that has gone backwards - restored from a backup, or a clock change -
+	// must not silently replace live settings with an older set.
+	dir := t.TempDir()
+	a, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.UpdateSettings(map[string]interface{}{"mixedPort": 7902}); err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite an older state and backdate it.
+	old := []byte(`{"settings":{"mixedPort":7000}}`)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), old, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "state.json"), past, past); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Settings().MixedPort; got != 7902 {
+		t.Errorf("mixedPort = %d; an older file replaced the live settings", got)
+	}
+}
+
+func TestReloadAdoptsAChangeImmediately(t *testing.T) {
+	// Reload is for a caller that knows another process has just written.
+	dir := t.TempDir()
+	a, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.UpdateSettings(map[string]interface{}{"mode": "global"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Settings().Mode; got != "global" {
+		t.Errorf("mode = %q after Reload, want global", got)
+	}
+}
+
+func TestSettingsSyncToleratesAMissingFile(t *testing.T) {
+	// The data directory can be removed underneath a running program. Reading
+	// settings must not fail in a way that takes the caller down; the in-memory copy
+	// is what it has.
+	dir := t.TempDir()
+	a, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.UpdateSettings(map[string]interface{}{"mixedPort": 7903}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "state.json")); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Settings().MixedPort; got != 7903 {
+		t.Errorf("mixedPort = %d after the file disappeared; the in-memory copy should remain", got)
+	}
+}
+
+func TestOurOwnCoreOnThePortIsAdoptedNotRotatedAwayFrom(t *testing.T) {
+	// The state this was observed in: an activation left a core holding the
+	// configured port, the interface started afterwards, decided its own core was a
+	// foreign program, and moved itself to a different port. The tunnel was up and
+	// carrying traffic the whole time, and the program disagreed with itself - the
+	// system proxy could not follow because nothing was listening on the new port.
+	//
+	// Ownership is judged by the command line naming this data directory, because
+	// every client that ships a core calls it mihomo.exe.
+	dir := t.TempDir()
+
+	// This process's own core is not a mihomo, so it must not be adopted.
+	if coreOwnsDataDir(os.Getpid(), dir, t.TempDir()) {
+		t.Error("a process that is not a core must not be reported as one")
+	}
+	// Nor is pid 0.
+	if coreOwnsDataDir(0, dir, t.TempDir()) {
+		t.Error("pid 0 must not be reported as a core")
+	}
+	// A pid that does not exist is not a core.
+	if coreOwnsDataDir(0x7FFFFFF0, dir, t.TempDir()) {
+		t.Error("a pid that does not exist must not be reported as a core")
+	}
+}
+
+func TestAdoptedCoreIsRecorded(t *testing.T) {
+	// Recording it is what lets the rest of the program tell "there is no core" from
+	// "there is a core I did not start". Those are different situations and were
+	// previously the same.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st}
+
+	a.mu.Lock()
+	before := a.adoptedCorePID
+	a.mu.Unlock()
+	if before != 0 {
+		t.Errorf("adoptedCorePID starts as %d, want 0", before)
+	}
+
+	a.adoptRunningCore(4242)
+	a.mu.Lock()
+	got := a.adoptedCorePID
+	a.mu.Unlock()
+	if got != 4242 {
+		t.Errorf("adoptedCorePID = %d after adopting, want 4242", got)
+	}
+}

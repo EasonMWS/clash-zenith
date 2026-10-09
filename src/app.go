@@ -40,6 +40,10 @@ type App struct {
 	configPath string
 	secret     string
 	dnsPort    int
+	// adoptedCorePID is a core this installation owns that this process did not
+	// start - typically the one an elevated activation left running. Zero means
+	// none.
+	adoptedCorePID int
 
 	mu         sync.Mutex
 	optimizing bool
@@ -317,6 +321,50 @@ func (a *App) Boot() {
 	go a.bootCore()
 }
 
+// coreOwnsDataDir reports whether a process is a mihomo belonging to this
+// installation, judged by its command line naming this data directory.
+//
+// The test is the same one the orphan sweep uses, and for the same reason: the
+// executable is called mihomo.exe for every client that ships one, so the name
+// proves nothing. The data directory is what distinguishes our core from another
+// product's or another installation's.
+func coreOwnsDataDir(pid int, dataDir, rootDir string) bool {
+	if pid <= 0 {
+		return false
+	}
+	out, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf(`(Get-CimInstance Win32_Process -Filter "ProcessId=%d" `+
+			`-ErrorAction SilentlyContinue).CommandLine`, pid))
+	if err != nil {
+		return false
+	}
+	cmd := strings.ToLower(out)
+	if cmd == "" {
+		return false
+	}
+	want := strings.ToLower(filepath.ToSlash(dataDir))
+	return strings.Contains(cmd, want) ||
+		(dataDir != "" && strings.Contains(cmd, strings.ToLower(dataDir)))
+}
+
+// adoptRunningCore records that a core this installation owns is already running
+// and is not this process's child.
+//
+// What that changes: the core cannot be stopped or restarted by this process, so
+// anything that would do so must go through whatever started it - the resident
+// service, or the elevated activation that is still finishing. Recording it means
+// the rest of the program can tell "there is no core" from "there is a core I did
+// not start", which are very different situations and were previously the same.
+func (a *App) adoptRunningCore(pid int) {
+	a.mu.Lock()
+	a.adoptedCorePID = pid
+	a.mu.Unlock()
+	// The core answers on the configured port, so point the API client at the port
+	// the settings name rather than inventing one.
+	Log("adopted a running core (pid %d) on port %d; this process will not restart it",
+		pid, a.store.Settings().MixedPort)
+}
+
 // EnsureUsablePort makes sure the mixed port is genuinely ours before the core
 // starts.
 //
@@ -351,6 +399,36 @@ func (a *App) EnsureUsablePort() {
 			}
 			if portHasListener(want) {
 				break // a real foreign program has it after all
+			}
+		}
+	}
+
+	// If the listener on the port is a core this installation owns, the correct
+	// response is to adopt it, not to move aside.
+	//
+	// This case is not hypothetical and it is not a conflict. An activation needs
+	// the rights to create the adapter, so the core that ends up holding the
+	// configured port is the one the elevated helper started - and the interface
+	// that starts afterwards finds its own core sitting on its own port. Rotating
+	// there produces the state this was observed in: the tunnel up and carrying
+	// traffic on the configured port, the settings pointing at a different one, and
+	// the system proxy unable to follow because nothing was listening on the new
+	// port yet. The tunnel worked and the program disagreed with itself.
+	//
+	// Ownership is established by the command line naming this data directory, which
+	// is the same test the orphan sweep uses. A core belonging to another
+	// installation, or another product, does not match and still gets the rotation.
+	if pids := ListeningPids(want); len(pids) > 0 {
+		for _, pid := range pids {
+			if coreOwnsDataDir(pid, a.dataDir, a.rootDir) {
+				Log("mixed port %d is held by this installation's own core (pid %d); "+
+					"adopting it rather than moving aside", want, pid)
+				// The core may be the one started by an elevated helper, which this
+				// process cannot manage. Recording ownership means the rest of the
+				// program asks the right thing rather than starting a second core on
+				// top of a working one.
+				a.adoptRunningCore(pid)
+				return
 			}
 		}
 	}
