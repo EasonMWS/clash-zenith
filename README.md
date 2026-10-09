@@ -121,7 +121,8 @@ This is not "a better Clash client". It is a Windows client built around solving
 one problem properly. Judged as a general client it is a one-person project
 against [clash-verge-rev](https://github.com/clash-verge-rev/clash-verge-rev)
 (149k stars) and [FlClash](https://github.com/chen08209/FlClash) (54k stars): no
-macOS or Linux, no TUN mode, no plugin ecosystem, no test suite.
+macOS or Linux, no plugin ecosystem, no interface themes, no translations. TUN
+takeover exists and has completed once, in compat mode, on one machine.
 
 Judged as "make my Cloudflare relay actually fast", it does something the
 mainstream clients leave to external scripts.
@@ -215,22 +216,43 @@ wrong.
 **Uninstall removes only Zenith's own adapter.** The driver file is deliberately
 left in place, because another application may be using the same one.
 
-**What is not verified, stated plainly.**
+**What is verified, and what is not.** The distinction is kept because the value of
+the first list depends on the honesty of the second.
 
-- **The service registration and the one-authorisation install have not been run
-  end to end.** They need an interactive UAC approval this environment cannot
-  answer — `sc create` returns `Access is denied` without it. The registration code
-  is written and reviewed; the channel itself is verified (`/alive` answers without
-  a credential, everything that acts returns 401 without one and 200 with it), and
-  the fallback path is verified, since that is what runs on a machine with no
-  service.
-- **A TUN activation has never completed successfully.** Each attempt stopped at a
-  specific, explainable cause, and each cause was found and fixed — the dispatch
-  order, the wrong root directory, two processes fighting for the core, a settings
-  key missing from the reload list, a known-good configuration overwritten before
-  it was proven. But the success state itself has not been observed.
-- **Privacy mode has not been tested against a determined bypass**, and neither have
-  sleep/wake, multiple network adapters, or coexistence with another VPN.
+Verified on a real Windows 11 machine, by a person clicking through the prompt:
+
+- An activation completed. The log reads
+
+      TUN enabled in compat mode; adapter "Zenith" is up, the default route uses it,
+      and a proxy-free request completed through it
+
+  and the machine agrees: the adapter is up on its own interface index, the default
+  route goes through it at metric 0, a request with no proxy configured anywhere
+  returns a real status, and the core's own connection table shows it carried that
+  request. That chain is what the code requires before it will say the word
+  "enabled" — the check was written first and this is the first time it has passed.
+- The fallback path ran for real, because the service install failed on a
+  permissions defect at the time. A machine with no service still works.
+- The resident service's channel answers correctly: `/alive` without a credential,
+  and every endpoint that acts returns 401 without the secret and 200 with it,
+  checked against a live process.
+
+Not verified:
+
+- **The one-authorisation service install has not completed.** The service is
+  registered on the test machine and will not start without elevation, which this
+  environment cannot supply — `sc create` and `sc start` both return `Access is
+  denied` without it. The registration code is written and reviewed, and the
+  service process itself is verified when run directly.
+- **The adapter has been created but privacy mode has never been exercised**, and
+  neither have sleep/wake, multiple network adapters, or coexistence with another
+  VPN. An activation succeeded in compat mode; that is the extent of what has been
+  observed.
+- **A core started under elevation cannot be restarted by the process that did not
+  start it.** The consequence is that the port and the configuration on disk can
+  disagree, and the interface can report a port that nothing is listening on. The
+  resident service is what removes this class of problem, which is the reason it
+  exists — and it is the piece that has not run.
 
 ### What this does not do
 
@@ -440,7 +462,8 @@ Cloudflare 是 Anycast。同一个边缘 IP 在不同时段可能被调度到不
 客户端。如果按通用客户端来评判，它是一个人对着
 [clash-verge-rev](https://github.com/clash-verge-rev/clash-verge-rev)（14.9 万星）和
 [FlClash](https://github.com/chen08209/FlClash)（5.4 万星）写的项目：没有 macOS 和
-Linux、没有插件生态、没有界面主题、没有多语言，**TUN 接管有实现但从未成功跑通过一次**。
+Linux、没有插件生态、没有界面主题、没有多语言。**TUN 接管有实现，并且在兼容模式下
+成功跑通过一次**——一台机器，一次。
 
 但如果按"让我的 Cloudflare 中转真的快起来"来评判，它做到了主流客户端交给外部脚本
 去做的那件事。
@@ -517,17 +540,32 @@ TUN 在流量前面放一块虚拟网卡来补上这个缺口。
 
 **卸载只删除 Zenith 自己的网卡。** 驱动文件**故意不删**，因为别的软件可能正在用同一个。
 
-**哪些没有验证，如实写在这里：**
+**哪些验证过、哪些没有** —— 分开写，因为前一份清单的价值取决于后一份的诚实程度。
 
-- **服务向 Windows 服务管理器的注册、以及"一次授权完成安装"的端到端流程没有实测。**
-  它们需要交互式 UAC 确认，当前环境答不了——没有它 `sc create` 返回 `Access is denied`。
-  注册代码写完并审过；**通道本身验证过了**（`/alive` 无凭据返回 200，
-  所有会改变状态的端点无凭据返回 401、正确凭据返回 200），**回退路径也验证过了**，
-  因为没装服务的机器跑的就是它。
-- **TUN 激活从未成功完成过一次。** 每次尝试都停在一个具体、可解释的原因上，
-  每个原因都定位并修复了——分派顺序、根目录错误、两个进程抢内核、设置项漏在重载列表外、
-  回滚用的配置在验证前就被覆盖。**但"成功"这个状态本身没有被观测到。**
-- **隐私模式没有做过对抗性旁路测试**，睡眠唤醒、多网卡、与其他 VPN 共存也都没有实测。
+**在真实 Windows 11 上、由人点过一次授权之后验证过的：**
+
+- **一次激活完整跑通了。** 日志原话：
+
+      TUN enabled in compat mode; adapter "Zenith" is up, the default route uses it,
+      and a proxy-free request completed through it
+
+  机器也确认了：网卡在它自己的接口上处于 Up、默认路由指向它且 metric 为 0、
+  在**没有任何代理设置**的情况下请求拿到了真实响应、内核自己的连接表里有这次请求。
+  这正是代码在说出"已启用"之前要求的证据链——**这条检查是先写的，这是它第一次通过**。
+- **回退路径真实跑过**（当时服务因为一个权限缺陷装不上）。没装服务的机器确实能用。
+- **常驻服务的通道应答正确**：`/alive` 无需凭据，所有会改变状态的端点无凭据返回 401、
+  正确凭据返回 200，都是对着一个真实运行的进程验的。
+
+**没有验证的：**
+
+- **"一次授权完成安装"没有走完过。** 服务在测试机上已注册，但没有管理员权限就起不来，
+  而当前环境提供不了——`sc create` 和 `sc start` 没有它都返回 `Access is denied`。
+  注册代码写完并审过；服务进程本身在直接运行时验证过了。
+- **网卡建起来过，但隐私模式从未被实际使用过**，睡眠唤醒、多网卡、
+  与其他 VPN 共存也都没有实测。成功的那次是兼容模式——观测到的就这么多。
+- **提权启动的内核，不能被"不是它父进程"的那个进程重启。** 后果是磁盘上的端口和配置
+  可能不一致，界面可能报一个没人在听的端口。**常驻服务就是用来消除这一类问题的，
+  这也正是它存在的理由——而它恰恰是没跑起来的那一块。**
 
 ### 这个软件做不到什么
 
@@ -535,8 +573,7 @@ TUN 在流量前面放一块虚拟网卡来补上这个缺口。
 
 - **默认是系统代理客户端，不是整机隧道。** 不读系统代理的程序——大多数游戏、
   任何走原始 UDP 的东西、任何自带网络栈的软件——都会直连。**TUN 接管能覆盖这部分**，
-  但它需要一次管理员授权来安装常驻服务，而且**它从未被成功跑通过一次**（见上）。
-  除此之外，这里没有任何东西是"整机保证"。
+  它在兼容模式下成功跑通过一次；除此之外，这里没有任何东西是"整机保证"。
 - **嗅探不是拦截。** 流量嗅探能从**已经进入内核**的连接里还原出域名，好让规则匹配它。
   它管不了根本没进内核的流量。
 - **一次出口检测成功不代表 DNS 干净。** 出口 IP 和 DNS 是某一时刻的抽样，
