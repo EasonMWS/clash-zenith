@@ -3004,3 +3004,159 @@ func TestPrivacyBlockStatusQuietWhenNothingIsAsked(t *testing.T) {
 		t.Error("no rules should be present in a fresh data directory")
 	}
 }
+
+// ---- a subscription must not be able to add a field to the document --------
+
+func TestNestedTransportKeysCannotInjectTopLevelFields(t *testing.T) {
+	// The review verified this against the source and it held: the flat allowlist on
+	// Extra did not cover the nested maps, and `ws-opts` was written through a
+	// separate branch that emitted its keys and sub-keys untouched.
+	//
+	// The chain that makes it reachable: the subscription parser unquotes with
+	// strconv.Unquote, which turns an escaped \n inside a quoted key into a real
+	// newline, and the generator then writes that key verbatim at whatever
+	// indentation it chose - so the text after the newline becomes a new field in
+	// the document rather than part of a proxy option.
+	hostile := "x\n  audit-marker: injected"
+	node := Proxy{
+		Name: "n", Type: "vmess", Server: "1.2.3.4", Port: 443, Network: "ws",
+		WSOpts: map[string]interface{}{
+			"path": "/ws",
+			"headers": map[string]interface{}{
+				hostile: "yes",
+			},
+			// And a nested key at the outer level, same shape.
+			"bad\n  other-marker: injected": "yes",
+		},
+	}
+	cfg := BuildConfig([]Proxy{node}, []string{"n"},
+		Settings{MixedPort: 7890, ControlPort: 7797, Mode: "rule",
+			TunDevice: tunDefaultDevice, TunStack: tunDefaultStack},
+		"secret", "n", 8199)
+
+	for _, forbidden := range []string{"audit-marker", "other-marker", "injected"} {
+		if strings.Contains(cfg, forbidden) {
+			t.Errorf("a subscription key reached the configuration as %q:\n%s", forbidden, cfg)
+		}
+	}
+	// The legitimate option must survive, or the fix would be a regression in what
+	// subscriptions can express.
+	if !strings.Contains(cfg, "path:") {
+		t.Errorf("the legitimate option was dropped:\n%s", cfg)
+	}
+}
+
+func TestNestedOptionAllowlistRefusesUnknownAndUnsafeKeys(t *testing.T) {
+	// An allowlist, for the same reason the flat one is: a denylist has to
+	// anticipate every way a crafted key could escape its block.
+	allowed := []string{"path", "host", "headers", "grpc-service-name", "h2-host"}
+	for _, k := range allowed {
+		if !nestedKeyAllowed(k) {
+			t.Errorf("nestedKeyAllowed(%q) = false, want true", k)
+		}
+	}
+	refused := []string{
+		"", "a b", "a\tb", "a\nb", "a\rb", "a\x00b",
+		"key: value", "- item", "  indented", "a[0]", "a{b}", "a,b", "a'b", `a"b`,
+		"#comment", "|block", ">folded", "&anchor", "*alias", "%directive",
+		strings.Repeat("x", 65),
+		// Names that are valid YAML keys but are not options for these transports.
+		"extra-global", "external-controller", "dns", "tun",
+	}
+	for _, k := range refused {
+		if nestedKeyAllowed(k) {
+			t.Errorf("nestedKeyAllowed(%q) = true, want false", k)
+		}
+	}
+}
+
+func TestValueValidationWalksNestedMaps(t *testing.T) {
+	// The defect was a nested map a flat check did not see, so the check walks.
+	good := map[string]interface{}{
+		"path": "/ws",
+		"headers": map[string]interface{}{
+			"User-Agent": "x",
+			"Host":       "example.com",
+		},
+	}
+	for k, v := range good {
+		if err := subscriptionValueIsSafe(k, v, 0); err != nil {
+			t.Errorf("%q should be safe: %v", k, err)
+		}
+	}
+
+	// A control character in a value is refused, because some parsers treat one as
+	// a document boundary.
+	if err := subscriptionValueIsSafe("k", "a\x00b", 0); err == nil {
+		t.Error("a NUL in a value must be refused")
+	}
+	// An unsafe key at depth two is still found.
+	if err := subscriptionValueIsSafe("headers",
+		map[string]interface{}{"a\nb": "x"}, 0); err == nil {
+		t.Error("an unsafe nested key must be found by the walk")
+	}
+	// And depth is bounded, so validation cannot be turned into a stack overflow.
+	deep := interface{}("leaf")
+	for i := 0; i < 12; i++ {
+		deep = map[string]interface{}{"k": deep}
+	}
+	if err := subscriptionValueIsSafe("root", deep, 0); err == nil {
+		t.Error("unbounded nesting must be refused")
+	}
+}
+
+func TestSanitizeKeepsGoodOptionsAndDropsBadOnes(t *testing.T) {
+	// Dropping rather than failing the whole subscription: one unusual option should
+	// not cost the user every node they have.
+	in := map[string]interface{}{
+		"path":    "/ws",
+		"host":    "example.com",
+		"bogus":   "x",
+		"a\nb":    "y",
+		"headers": map[string]interface{}{"User-Agent": "z"},
+	}
+	out := sanitizeNestedOpts("ws-opts", in)
+	if out == nil {
+		t.Fatal("nothing survived")
+	}
+	if _, ok := out["path"]; !ok {
+		t.Error("a legitimate option was dropped")
+	}
+	if _, ok := out["host"]; !ok {
+		t.Error("a legitimate option was dropped")
+	}
+	if _, ok := out["bogus"]; ok {
+		t.Error("an unknown option was kept")
+	}
+	if _, ok := out["a\nb"]; ok {
+		t.Error("an unsafe key was kept")
+	}
+	// An empty result is nil rather than an empty map, so the generator's
+	// len(m) == 0 branch still skips writing the block at all.
+	if sanitizeNestedOpts("ws-opts", map[string]interface{}{"bogus": 1}) != nil {
+		t.Error("a map with nothing usable should be nil")
+	}
+}
+
+func TestSubscriptionParsingCannotProduceAnUnsafeNestedKey(t *testing.T) {
+	// End to end through the real parser, which is where the escaped newline is
+	// decoded. If this holds, no path from subscription text to the generator
+	// carries an unsafe key.
+	doc := `{"outbounds":[{"type":"vmess","tag":"n","server":"1.2.3.4","server_port":443,` +
+		`"uuid":"00000000-0000-0000-0000-000000000000","transport":{"type":"ws",` +
+		`"path":"/ws","headers":{"x\n  audit-marker: injected":"yes"}}}]}`
+	for _, p := range ParseSubscription(doc) {
+		for transport, m := range map[string]map[string]interface{}{
+			"ws-opts": p.WSOpts, "grpc-opts": p.GrpcOpts, "h2-opts": p.H2Opts,
+		} {
+			for k, v := range m {
+				if !nestedKeyAllowed(k) {
+					t.Errorf("%s carries %q, which the allowlist refuses", transport, k)
+				}
+				if err := subscriptionValueIsSafe(k, v, 0); err != nil {
+					t.Errorf("%s carries an unsafe value at %q: %v", transport, k, err)
+				}
+			}
+		}
+	}
+}

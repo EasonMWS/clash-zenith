@@ -183,6 +183,13 @@ func proxyToYAML(p Proxy) string {
 		case "h2-opts":
 			m = p.H2Opts
 		}
+		// Every key and sub-key below comes from a subscription, and this builder
+		// writes keys verbatim. The flat check on Extra did not cover these maps, so
+		// a key containing an escaped newline produced a new field in the document
+		// rather than a proxy option - verified by the review, and confirmed here by
+		// reading the branch. Sanitising at the point of writing means a transport
+		// added later cannot be written without passing through it.
+		m = sanitizeNestedOpts(key, m)
 		if len(m) == 0 {
 			continue
 		}
@@ -232,6 +239,13 @@ func proxyToYAML(p Proxy) string {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			if !validYAMLKey(k) {
+				continue
+			}
+			if err := subscriptionValueIsSafe(k, p.Extra[k], 0); err != nil {
+				Log("subscription: dropped extra option %q: %v", k, err)
+				continue
+			}
 			fmt.Fprintf(&b, "  %s: %s\n", k, yamlScalar(p.Extra[k]))
 		}
 	}
