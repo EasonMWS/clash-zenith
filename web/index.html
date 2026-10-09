@@ -228,6 +228,57 @@
 
     <!-- ---------- 设置 ---------- -->
     <section class="tab hidden" id="tab-settings">
+      <div class="card" id="tun-card">
+        <div class="card-head">
+          <h3>TUN 接管</h3>
+          <span class="pill" id="tun-state-pill">未启用</span>
+        </div>
+        <p class="hint" id="tun-scope">
+          当前是<strong>系统代理兼容模式</strong>：只有遵循系统代理的应用走 Zenith，
+          游戏、原始 UDP 和自带网络栈的程序会直连。
+        </p>
+
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">TUN 接管（兼容策略）</div>
+            <div class="switch-desc">
+              创建一块 Zenith 自己的虚拟网卡接管支持范围内的流量，仍按你的规则分流，
+              <strong>允许直连</strong>。不等于"全部流量经代理"，也没有断线封锁。
+            </div>
+          </div>
+          <label class="switch"><input type="checkbox" id="sw-tun-compat"><span class="slider"></span></label>
+        </div>
+
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">隐私保护</div>
+            <div class="switch-desc">
+              在 TUN 接管之上要求受保护流量<strong>只走批准线路</strong>，
+              断线时保持阻断而不是回退直连。<strong>退出保护会恢复常规联网，必须由你主动确认。</strong>
+            </div>
+          </div>
+          <label class="switch"><input type="checkbox" id="sw-tun-privacy"><span class="slider"></span></label>
+        </div>
+
+        <div id="tun-progress" class="hidden">
+          <div class="switch-title">正在：<span id="tun-stage">—</span></div>
+          <ul class="tun-steps" id="tun-steps"></ul>
+        </div>
+
+        <div id="tun-error" class="hidden"></div>
+
+        <details id="tun-detail">
+          <summary>环境检查与组件</summary>
+          <div id="tun-env"></div>
+        </details>
+
+        <div class="row-actions">
+          <button class="btn sm" id="btn-tun-check">重新检查环境</button>
+          <button class="btn sm" id="btn-tun-repair">离线修复 / 解除保护</button>
+          <button class="btn sm danger" id="btn-tun-uninstall">移除 Zenith 网卡</button>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-head"><h3>常规</h3></div>
         <div class="switch-row">

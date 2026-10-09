@@ -92,6 +92,24 @@ if (Test-Path $icoPath) {
     }
 }
 
+# ---------------------------------------------------------------- tests
+# The regression tests cover the defects a review found: the watchdog entry that
+# could never be reached, the health-map race that could crash the process, the
+# slow-node counter that never incremented, the TUN component check, loopback and
+# token enforcement, and the refusal to fetch a subscription over plain http.
+# They run before the build so a regression fails here rather than in the field.
+Write-Step '运行回归测试…'
+Push-Location $SrcDir
+try {
+    $env:CGO_ENABLED = '0'
+    $testArgs = @('test', './...')
+    if ($Race) { $testArgs += '-race' }
+    & $go @testArgs
+    if ($LASTEXITCODE -ne 0) { throw "测试未通过 (exit $LASTEXITCODE)" }
+} finally {
+    Pop-Location
+}
+
 # ---------------------------------------------------------------- build
 Write-Step '编译中…'
 Push-Location $SrcDir

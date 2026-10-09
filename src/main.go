@@ -45,6 +45,11 @@ func main() {
 		version  = flag.Bool("version", false, "print the version and exit")
 		portFlag = flag.Int("port", 0, "UI port (default 7799)")
 		dataFlag = flag.String("datadir", "", "use a different data directory")
+		// Raised by the elevation request. The elevated instance runs the same
+		// product; it only differs in having the rights the adapter and the routes
+		// need, and it is the one that performs the activation transaction.
+		tunElevated = flag.Bool("tun-elevated", false, "internal: continue a TUN enable with administrator rights")
+		tunModeFlag = flag.String("tun-mode", "", "internal: the TUN mode the elevated instance should activate")
 	)
 	flag.Parse()
 
@@ -132,6 +137,21 @@ func main() {
 	// once, even on a first run where the geodata files still need unpacking.
 	// background() is an endless loop, so it MUST run in its own goroutine.
 	app.Boot()
+	// Reconcile the remembered TUN state with what the machine actually has. A
+	// reboot or another VPN can make the stored switch wrong, and believing it
+	// would mean reporting protection that is not there.
+	app.RecoverTun()
+	// An elevated instance continues an enable that the普通 instance started; it
+	// does not open its own window or tray icon, and it exits when the activation
+	// finishes so no elevated process is left running by default.
+	if *tunElevated {
+		mode := TunMode(*tunModeFlag)
+		if !mode.Valid() || mode == TunOff {
+			mode = TunCompat
+		}
+		app.RunElevatedActivation(mode)
+		return
+	}
 	go app.background()
 	// Liveness runs on its own timer, separate from the housekeeping tick so
 	// unrelated work can never delay noticing a dead node.

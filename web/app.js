@@ -688,6 +688,9 @@ async function poll() {
 async function refresh() {
   const st = await api('/api/status');
   if (st.ok) { S.status = st; renderStatus(st); }
+  // TUN state is refreshed alongside the rest: the remembered switch is not
+  // evidence of anything, so the panel is redrawn from what the app reports.
+  if ($('#tun-state-pill')) { await loadTun(); }
   return st;
 }
 
@@ -908,6 +911,196 @@ function bindSettings() {
   });
 }
 
+/* --------------------------------------------------------------- TUN 面板 */
+
+// TUN 的三种状态在界面上必须分得清：系统代理兼容、TUN 接管、隐私保护。
+// 把"网卡建好了"说成"已经保护"是这块代码最需要避免的错误。
+const TUN_POLL_MS = 1500;
+let tunPoll = null;
+
+function renderTunEnv(env, run, mode) {
+  const pill = $('#tun-state-pill');
+  const err = $('#tun-error');
+  const prog = $('#tun-progress');
+  const scope = $('#tun-scope');
+
+  const running = run && run.active;
+  const m = (mode || '') + '';
+  const failed = run && run.error;
+
+  // 状态胶囊：只反映真实情况，不因为开关在某个位置就显示成功。
+  if (running) {
+    pill.textContent = run.stage || '进行中';
+    pill.className = 'pill warn';
+  } else if (failed) {
+    pill.textContent = '未启用';
+    pill.className = 'pill err';
+  } else if (m === 'privacy') {
+    pill.textContent = '隐私保护已生效';
+    pill.className = 'pill on';
+  } else if (m === 'compat') {
+    pill.textContent = 'TUN 接管已启用';
+    pill.className = 'pill on';
+  } else {
+    pill.textContent = '未启用';
+    pill.className = 'pill';
+  }
+
+  // 保护范围的说明随实际状态变化，不用一句笼统的话糊过去。
+  if (m === 'privacy') {
+    scope.innerHTML = '当前是<strong>隐私保护模式</strong>：受保护流量只走批准线路，' +
+      '断线时保持阻断。退出保护需要你主动确认。';
+  } else if (m === 'compat') {
+    scope.innerHTML = '当前是<strong>TUN 接管（兼容策略）</strong>：接管支持范围内的流量并按规则分流，' +
+      '<strong>仍允许直连</strong>。这不是"所有流量经代理"，也没有 Kill Switch。';
+  } else {
+    scope.innerHTML = '当前是<strong>系统代理兼容模式</strong>：只有遵循系统代理的应用走 Zenith，' +
+      '游戏、原始 UDP 和自带网络栈的程序会直连。';
+  }
+
+  const boxes = [$('#sw-tun-compat'), $('#sw-tun-privacy')];
+  boxes.forEach((b) => { if (b) b.disabled = !!running; });
+  if ($('#sw-tun-compat')) $('#sw-tun-compat').checked = (m === 'compat');
+  if ($('#sw-tun-privacy')) $('#sw-tun-privacy').checked = (m === 'privacy');
+
+  // 进度：把每一步的真实结果列出来，而不是一个百分比。
+  if (running || failed) {
+    prog.classList.remove('hidden');
+    $('#tun-stage').textContent = run.stage || '—';
+    const ul = $('#tun-steps');
+    ul.innerHTML = '';
+    (run.steps || []).forEach((s) => {
+      const li = document.createElement('li');
+      li.textContent = s;
+      ul.appendChild(li);
+    });
+  } else {
+    prog.classList.add('hidden');
+  }
+
+  if (failed) {
+    err.classList.remove('hidden');
+    err.textContent = run.error;
+  } else {
+    err.classList.add('hidden');
+    err.textContent = '';
+  }
+
+  // 环境检查结果，技术细节放在折叠区。
+  if (env) {
+    const box = $('#tun-env');
+    box.innerHTML = '';
+    const rows = [];
+    rows.push(['结论', env.ok ? '这台机器可以启用 TUN' : '当前不能启用', env.ok ? 'good' : 'bad']);
+    rows.push(['架构', (env.arch || '') + ' / ' + (env.os || ''), '']);
+    const c = env.component || {};
+    rows.push(['组件', (c.name || '') + ' ' + (c.version || '') +
+      (c.verified ? '（摘要与签名校验通过）' : '（未通过校验）'), c.verified ? 'good' : 'bad']);
+    if (c.signer) rows.push(['签名者', c.signer, 'good']);
+    if (c.detail) rows.push(['组件详情', c.detail, c.verified ? '' : 'bad']);
+    rows.push(['可用节点', String(env.nodes || 0), (env.nodes ? '' : 'bad')]);
+    rows.push(['网卡名', env.adapter || '', '']);
+    rows.push(['管理员', env.admin ? '是' : '否（启用时会请求一次授权）', '']);
+    Object.keys(env.checks || {}).forEach((k) => rows.push(['检查·' + k, env.checks[k], '']));
+    (env.otherVpns || []).forEach((v) => rows.push(['其他隧道', v + '（不会被动到）', 'warn']));
+    (env.warnings || []).forEach((w) => rows.push(['提示', w, 'warn']));
+    (env.blockers || []).forEach((b) => rows.push(['阻断', b, 'bad']));
+
+    rows.forEach(([k, v, cls]) => {
+      const d = document.createElement('div');
+      d.className = 'tun-env-row';
+      const a = document.createElement('div'); a.className = 'tun-env-key'; a.textContent = k;
+      const b = document.createElement('div');
+      b.className = 'tun-env-val' + (cls ? ' ' + cls : '');
+      b.textContent = v;
+      d.appendChild(a); d.appendChild(b);
+      box.appendChild(d);
+    });
+  }
+}
+
+async function loadTun() {
+  const r = await api('/api/tun/check');
+  if (!r.ok) {
+    const pill = $('#tun-state-pill');
+    if (pill) { pill.textContent = '状态未知'; pill.className = 'pill err'; }
+    return null;
+  }
+  renderTunEnv(r.env, r.run, r.mode);
+  return r;
+}
+
+function startTunPoll() {
+  if (tunPoll) return;
+  tunPoll = setInterval(async () => {
+    const r = await loadTun();
+    // 结束或失败就停止轮询，不要一直打接口。
+    if (!r || !r.run || !r.run.active) { stopTunPoll(); }
+  }, TUN_POLL_MS);
+}
+function stopTunPoll() {
+  if (tunPoll) { clearInterval(tunPoll); tunPoll = null; }
+}
+
+function bindTun() {
+  const setMode = async (mode) => {
+    const r = await api('/api/tun/enable', { mode });
+    if (!r.ok) {
+      toast(r.error || '启用失败', 'err');
+      await loadTun();
+      return;
+    }
+    toast('已开始启用，请留意系统授权提示', 'ok');
+    startTunPoll();
+    await loadTun();
+  };
+
+  $('#sw-tun-compat').addEventListener('change', function () {
+    if (this.checked) { setMode('compat'); }
+    else { disableTun(false); }
+  });
+  $('#sw-tun-privacy').addEventListener('change', function () {
+    if (this.checked) { setMode('privacy'); }
+    else { disableTun(true); }
+  });
+
+  $('#btn-tun-check').addEventListener('click', function () {
+    guard(this, async () => { await loadTun(); toast('已重新检查环境', 'ok'); });
+  });
+
+  $('#btn-tun-repair').addEventListener('click', function () {
+    const el = this;
+    guard(el, async () => {
+      // 离线修复不需要网络，也能在界面或服务损坏时把机器恢复回来。
+      const r = await api('/api/tun/repair', { release: true });
+      if (r.ok) { toast('已解除保护并检查组件', 'ok'); await loadTun(); }
+      else { toast(r.error || '修复失败', 'err'); }
+    });
+  });
+
+  $('#btn-tun-uninstall').addEventListener('click', function () {
+    const el = this;
+    guard(el, async () => {
+      if (!confirm('只移除 Zenith 自己创建的虚拟网卡。其他 VPN 的网卡不会被改动。继续？')) return;
+      const r = await api('/api/tun/uninstall', {});
+      if (r.ok) { toast('已移除 Zenith 网卡', 'ok'); await loadTun(); }
+      else { toast(r.error || '移除失败', 'err'); }
+    });
+  });
+}
+
+async function disableTun(privacy) {
+  // 退出隐私保护是用户的决定，所以要问一次，而不是默默解除。
+  if (privacy && !confirm('退出隐私保护会恢复常规联网，断线时不再保持阻断。确认退出保护？')) {
+    await loadTun();
+    return;
+  }
+  const r = await api('/api/tun/disable', { releasePrivacy: !!privacy });
+  if (r.ok) { toast('TUN 已关闭', 'ok'); }
+  else { toast(r.error || '关闭失败', 'err'); }
+  await loadTun();
+}
+
 /* --------------------------------------------------------------- 启动流程 */
 
 function boot() {
@@ -916,6 +1109,7 @@ function boot() {
 
   bindNav();
   bindOverview();
+  bindTun();
   bindNodes();
   bindSubs();
   bindAdvanced();
@@ -926,6 +1120,10 @@ function boot() {
   setInterval(() => { if (S.logAuto && !document.hidden) loadLogs(); }, 4000);
   poll();
   loadSubs();
+  // The TUN panel is drawn from the app's own report, not from a remembered
+  // switch, so it is loaded explicitly at start-up rather than only when the
+  // settings tab happens to be opened.
+  loadTun();
 }
 
 document.addEventListener('DOMContentLoaded', boot);

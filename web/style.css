@@ -700,3 +700,70 @@ a:hover { text-decoration: underline; }
   .latency-value { font-size: 52px; letter-spacing: -1px; }
   .latency-unit { font-size: 17px; }
 }
+
+/* ---- TUN panel ---------------------------------------------------------- */
+
+.pill {
+  margin-left: auto;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--bg-3, #23262e);
+  color: var(--fg-2, #9aa4b2);
+  white-space: nowrap;
+}
+.pill.on { background: rgba(53, 208, 127, .16); color: #35d07f; }
+.pill.warn { background: rgba(255, 176, 32, .16); color: #ffb020; }
+.pill.err { background: rgba(255, 92, 92, .16); color: #ff5c5c; }
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.tun-steps {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--fg-2, #9aa4b2);
+  line-height: 1.7;
+}
+.tun-steps li.done::marker { color: #35d07f; }
+.tun-steps li.failed { color: #ff5c5c; }
+
+#tun-progress { margin-top: 14px; }
+#tun-error {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 92, 92, .12);
+  color: #ff8f8f;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+#tun-detail { margin-top: 14px; font-size: 13px; }
+#tun-detail summary {
+  cursor: pointer;
+  color: var(--fg-2, #9aa4b2);
+  padding: 6px 0;
+  user-select: none;
+}
+#tun-detail summary:hover { color: var(--fg-1, #e6e9ef); }
+
+.tun-env-row {
+  display: flex;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line, #2a2e37);
+}
+.tun-env-row:last-child { border-bottom: 0; }
+.tun-env-key { flex: 0 0 96px; color: var(--fg-2, #9aa4b2); }
+.tun-env-val { flex: 1; word-break: break-all; }
+.tun-env-val.bad { color: #ff8f8f; }
+.tun-env-val.good { color: #35d07f; }
+.tun-env-val.warn { color: #ffb020; }

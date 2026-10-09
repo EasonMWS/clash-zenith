@@ -16,7 +16,7 @@ import (
 
 const (
 	AppName    = "Zenith"
-	AppVersion = "1.0.2"
+	AppVersion = "1.2.0"
 
 	// coreStartGrace is how long the watchdog waits before it decides the core
 	// is broken. A first run against an empty data directory downloads the rule
@@ -87,6 +87,10 @@ type App struct {
 	stopCh      chan struct{}
 	onQuit      func()
 	trafficSnap Connections
+
+	// tunRun is the progress of an enable attempt, so the interface can show which
+	// step it is on rather than an indeterminate spinner. Guarded by mu.
+	tunRun *tunRun
 }
 
 func NewApp(rootDir string) (*App, error) {

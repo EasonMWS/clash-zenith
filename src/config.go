@@ -267,6 +267,38 @@ func BuildConfig(nodes []Proxy, optimised []string, st Settings, secret string, 
 	}
 	fmt.Fprintf(&b, configHeadTemplate, st.MixedPort, mode, logLevel, st.ControlPort, secret, dnsPort)
 
+	// TUN block, emitted only when the user has asked for it.
+	//
+	// The fields are chosen so that nothing about the machine's configuration is
+	// guessed at:
+	//   auto-route            installs the routes that pull traffic into the tunnel
+	//   auto-detect-interface keeps the core's own outbound on the real adapter, so
+	//                         the tunnel cannot swallow its own upstream connection
+	//   strict-route          refuses traffic that would otherwise escape the tunnel
+	//   stack: gvisor         userspace TCP/IP, which is what makes UDP work
+	//   dns-hijack            53/udp is taken over, so lookups cannot go out in clear
+	//
+	// wintun.dll is loaded by bare name, and Windows searches the executable's own
+	// directory first, which is why the verified copy lives next to the core.
+	if st.TunMode != TunOff {
+		stack := st.TunStack
+		if stack == "" {
+			stack = "gvisor"
+		}
+		fmt.Fprintf(&b, `tun:
+  enable: true
+  device: %s
+  stack: %s
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: %v
+  mtu: 9000
+  dns-hijack:
+    - any:53
+  route-exclude-address: []
+`, q(st.TunDevice), q(stack), st.TunMode == TunPrivacy)
+	}
+
 	b.WriteString("\nproxies:\n")
 	if len(nodes) == 0 {
 		// mihomo rejects an empty proxies list, so emit a harmless placeholder

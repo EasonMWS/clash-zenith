@@ -1,0 +1,17 @@
+{
+  "comment": "Components Zenith loads at runtime, with the digests it verifies them against. A file with the right name but the wrong bytes is refused.",
+  "components": [
+    {
+      "name": "wintun",
+      "purpose": "Windows TUN driver, required for TUN mode",
+      "file": "core/wintun/wintun-amd64.dll",
+      "arch": "amd64",
+      "version": "0.14.1",
+      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+      "source": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+      "sourceSha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+      "signer": "CN=WireGuard LLC, O=WireGuard LLC, L=Boulder, S=Colorado, C=US",
+      "license": "core/wintun/LICENSE-wintun.txt"
+    }
+  ]
+}

@@ -53,6 +53,44 @@ type Proxy struct {
 	Extra      map[string]interface{} `json:"-"`
 }
 
+// TunMode is how far Zenith goes in taking over traffic.
+//
+// The three values are deliberately distinct in the interface as well as in the
+// code. Reporting "protected" because an adapter exists is the mistake this type
+// exists to prevent: taking over traffic and forbidding direct connections are
+// separate promises, and only the third one makes the second.
+type TunMode string
+
+const (
+	// TunOff means applications reach the proxy through the system proxy setting,
+	// and anything that ignores it goes direct.
+	TunOff TunMode = ""
+	// TunCompat routes the traffic it can reach through the user's rules, with
+	// direct still allowed. This is "TUN is on", not "nothing can leak".
+	TunCompat TunMode = "compat"
+	// TunPrivacy additionally requires that protected traffic can only leave
+	// through an approved route, and keeps refusing when the core is down.
+	TunPrivacy TunMode = "privacy"
+)
+
+// Valid reports whether a stored value is one this version understands. An
+// unrecognised value is treated as off rather than guessed at.
+func (m TunMode) Valid() bool {
+	return m == TunOff || m == TunCompat || m == TunPrivacy
+}
+
+// Label is the honest description of what the mode does, for the interface.
+func (m TunMode) Label() string {
+	switch m {
+	case TunCompat:
+		return "TUN 接管已启用（仍按规则允许直连，不承诺全部流量经代理）"
+	case TunPrivacy:
+		return "隐私保护已生效（受保护流量只走批准线路，断线保持阻断）"
+	default:
+		return "系统代理兼容模式（仅对遵循系统代理的应用生效）"
+	}
+}
+
 // Subscription is one user added source of nodes.
 type Subscription struct {
 	ID         string `json:"id"`
@@ -113,6 +151,19 @@ type Settings struct {
 	// Only needed when the subscription sits behind a self-signed certificate.
 	AllowInsecureSubscription bool `json:"allowInsecureSubscription"`
 
+	// ---- TUN ----------------------------------------------------------------
+	//
+	// TunMode separates "take over traffic" from "forbid direct connections".
+	// They are different promises and the UI must not conflate them: a virtual
+	// adapter existing is not the same as being protected.
+	TunMode   TunMode `json:"tunMode"`
+	TunDevice string  `json:"tunDevice"` // adapter name Zenith creates and owns
+	TunStack  string  `json:"tunStack"`  // gvisor | system | mixed
+	// TunBlockOnFailure keeps the tunnel's refusal in place when the core dies.
+	// Only meaningful in privacy mode, where recovering connectivity by falling
+	// back to a direct connection would be the opposite of the intent.
+	TunBlockOnFailure bool `json:"tunBlockOnFailure"`
+
 	// meta
 	WindowWidth  int    `json:"windowWidth"`
 	WindowHeight int    `json:"windowHeight"`
@@ -142,6 +193,10 @@ func defaultSettings() Settings {
 		SubscriptionIntervalHours: 6,
 		DirectCNDomains:           true,
 		BlockAds:                  false,
+		TunMode:                   TunOff,
+		TunDevice:                 defaultTunDevice,
+		TunStack:                  "gvisor",
+		TunBlockOnFailure:         true,
 		WindowWidth:               1200,
 		WindowHeight:              780,
 		ProxyBypass: "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;" +

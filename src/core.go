@@ -33,6 +33,9 @@ type Core struct {
 	proc       *exec.Cmd
 	startedAt  time.Time
 	logFile    *os.File
+	// lastErr records why the most recent start failed, so a refused TUN enable
+	// can report the core's own words instead of guessing.
+	lastErr string
 }
 
 func NewCore(exePath, dataDir, configPath, secret string, apiPort int) *Core {
@@ -82,6 +85,14 @@ func (c *Core) api(method, path string, body interface{}, timeout time.Duration)
 		return map[string]interface{}{"raw": string(data)}, nil
 	}
 	return out, nil
+}
+
+// LastError returns the most recent core startup failure, so a failed enable can
+// say what the core objected to instead of just "the adapter did not appear".
+func (c *Core) LastError() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastErr
 }
 
 func (c *Core) IsUp() bool {

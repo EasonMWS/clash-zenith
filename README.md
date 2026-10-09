@@ -1,12 +1,20 @@
 # Zenith
 
 **A Windows Clash client whose point is one thing: it finds the fastest
-Cloudflare edge for you, and proves it works before using it.**
+Cloudflare edge for you, and checks it responds before using it.**
 
-Most clients pick nodes with a ping. Zenith opens a real WebSocket tunnel to each
-candidate edge and times the handshake — because an edge that answers a ping is
-not necessarily an edge that will carry your traffic. Then it keeps you on the
+Most clients pick nodes with a ping. Zenith opens a WebSocket upgrade against each
+candidate edge and times it — because an edge that answers a ping is not
+necessarily an edge that will accept your tunnel. Then it keeps you on the
 winner.
+
+**What that check is and is not.** It is a real TLS connection to the edge with
+the node's own SNI, followed by a real `Upgrade: websocket` request, and only an
+HTTP `101` counts. It is *not* a full end-to-end proof: the probe speaks the
+WebSocket handshake at the edge but does not complete the proxy protocol
+authentication inside it, so a passing probe means "this edge accepts this
+tunnel", not "this edge has been proven to carry your traffic to the far end".
+Treat the result as a strong filter, not a guarantee.
 
 It also happens to be a single 7 MB executable with no runtime and no
 dependencies. Clone it, double click it, it works.
@@ -15,7 +23,7 @@ dependencies. Clone it, double click it, it works.
 
 <p>
 <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-4f8cff">
-<img alt="go" src="https://img.shields.io/badge/Go-1.21%2B-35d07f">
+<img alt="go" src="https://img.shields.io/badge/Go-1.24%2B-35d07f">
 <img alt="deps" src="https://img.shields.io/badge/dependencies-none-35d07f">
 <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-ffb020">
 </p>
@@ -46,16 +54,38 @@ The usual fixes fall short in one specific way:
 
 1. Builds a candidate pool of Cloudflare edge addresses (256 to start; every IP
    it verifies gets appended, so the pool sharpens with use).
-2. Opens a **real WebSocket tunnel** to each one — TLS to the edge IP with the
+2. Opens a WebSocket upgrade against each one — TLS to the edge IP with the
    node's own SNI, then an actual `Upgrade: websocket` request.
    **Only an HTTP `101` counts.** Repeatedly, an edge completes TLS and then
-   answers the upgrade with `400 Bad Request`; ranking by reachability would have
-   put a dead edge at the top.
+   answers the upgrade with `400 Bad Request`; ranking by reachability alone would
+   have put a dead edge at the top.
 3. Ranks by median over several rounds, penalising edges that failed any round.
-4. Rewrites the node list with the winners and hot-reloads the core — no restart,
-   no dropped connections.
-5. Keeps you on the fastest verified node, ranked by those measured handshake
-   times rather than by a ping.
+4. Rewrites the node list with the winners and hot-reloads the core — no core
+   restart, and no reconnect for connections already established.
+5. Keeps you on the fastest verified node, ranked by those measured upgrade times
+   rather than by a ping.
+
+Steps 2 and 3 are a filter over the edge, not a proof of the whole path. The
+upgrade proves the edge will accept this tunnel; it does not complete the proxy
+protocol's own authentication, so it cannot tell you the far end is healthy. The
+client treats a passing edge as a good candidate, and the live connection is what
+ultimately confirms it.
+
+### Reliability: what happens when a node dies
+
+An individual Cloudflare edge address can be filtered while the service itself is
+fine. That used to mean the client sat on a dead node until the next scan, so:
+
+- every scan also produces a **hostname node**. It is pinned to no address, so
+  Cloudflare's anycast picks a working edge for each connection. It is not
+  immune to a DNS or anycast problem and it is not faster — it exists so that one
+  filtered address cannot take the connection down.
+- the health check moves off a node after three consecutive failures, and prefers
+  the hostname node once the pinned addresses have proved themselves dead.
+- a candidate that fails twice in a row is benched for thirty minutes, so scans
+  stop re-proving that blocked addresses are still blocked.
+- a node whose measured round trip stays above 1200 ms twice in a row is
+  abandoned even if it is still the best of a bad set.
 
 ### Why the ping is not good enough (measured, not asserted)
 
@@ -100,20 +130,90 @@ mainstream clients leave to external scripts.
 
 | | |
 |---|---|
-| **Real WebSocket verification** | An edge is only used if it completes the upgrade |
-| **Automatic edge optimisation** | Scans the pool, ranks by median handshake time, rewrites the node list, hot-reloads |
-| **Always uses the fastest verified node** | Ranked by measured handshake time, not a ping. A clear win switches at once; a marginal one is confirmed first, so noise never bounces you between equivalent nodes |
+| **WebSocket upgrade verification** | An edge is only kept if it answers the upgrade with `101`. This filters the edge, not the whole path |
+| **Automatic edge optimisation** | Scans the pool, ranks by median upgrade time, rewrites the node list, hot-reloads the core |
+| **A hostname node as a safety net** | One node is never pinned to an address, so Cloudflare picks a working edge per connection and a single filtered IP cannot take the connection down |
+| **Always uses the fastest verified node** | Ranked by measured upgrade time, not a ping. A clear win switches at once; a marginal one is confirmed first, so noise never bounces you between equivalent nodes |
+| **Abandons a node that degrades** | Three consecutive failed checks, or a round trip that stays above 1200 ms, moves traffic off it — even when it is still the best of a bad set |
 | **A manual pick is respected** | Click a node and it stays for a while. Auto-pick chooses among verified edges; it does not overrule you |
 | **Handles mixed subscriptions** | Every WebSocket relay optimised on its own; direct nodes (trojan / ss / hysteria2) left exactly as they are |
 | **Nothing to install** | One executable plus the core. No runtime, no dependencies |
 | **Lives in the tray** | Closing the window keeps it running. The tray menu opens the window, switches mode, toggles the system proxy, starts an optimisation or quits |
 | **No stray console window** | Built as a GUI binary, so double clicking it opens only the interface |
-| **No surprise restarts** | Node changes go through the core API; the window never flickers |
+| **Node changes do not restart the core** | They go through the core API, so the window never flickers and existing connections are not dropped |
 | **Multiple subscriptions** | Add, switch, refresh and delete any number of them from the UI |
 | **Three modes** | Rule based split routing, global proxy, direct |
 | **Custom rules** | A rule editor with one-click templates for power users |
+| **Game platform routing** | 14 GeoSite categories for launcher stores and logins. Download CDNs stay direct, which is much faster for them |
 | **Safe with the system proxy** | Refuses to steal the proxy from another running client, and always hands it back — or switches it off if the old owner is gone |
+| **Strict TLS by default** | Subscriptions and probes verify certificates; plain http and cross-host redirects are refused. A self-signed subscription needs an explicit opt-in |
+| **A local API that is actually local** | Every API route requires a per-launch token, the Host must be loopback, cross-origin requests are refused, and writes must be JSON |
+| **TUN takeover, one click** | Click enable, approve the system prompt, and the rest is automatic: the signed driver is verified by digest and signature, the adapter is created, routes and DNS are configured, and a real request is made through the tunnel before anything is called a success |
+| **TUN state you can trust** | `system proxy` / `TUN takeover` / `privacy` are three separate states with three separate descriptions. An adapter existing is never reported as protection |
+| **Bounded by what it can undo** | Enabling runs as two recorded transactions. A failure restores only what that attempt changed, so another VPN's adapter or your own routes are never touched |
 | **Built in logs** | Application and core logs, viewable in the app |
+
+### TUN takeover
+
+The system proxy only reaches applications that read it — not games, not raw UDP,
+not anything with its own network stack. TUN closes that gap by putting a virtual
+adapter in front of the traffic.
+
+**One click, and the rest is automatic.** On a machine that has never had a VPN
+client, pressing enable does all of this without any manual step:
+
+1. Checks the architecture, the OS, your node set, and any other tunnel already
+   present — before asking for a password, so a machine that cannot support TUN is
+   told that first.
+2. Verifies the Wintun driver **by SHA-256 and Authenticode signature**, not by
+   file name. A substituted file, or one borrowed from another VPN's directory, is
+   refused.
+3. Raises one elevation prompt. Only that one; declining it stops the process and
+   nothing is retried.
+4. Starts the core with TUN, waits for the adapter **by name from the OS**, and
+   then makes a real HTTP request through the tunnel.
+
+If any step fails it rolls back exactly what it changed and says why. The adapter
+is removed, the mode returns to off, and nothing is reported as working when it is
+not.
+
+**Three states, described honestly:**
+
+| State | What it means |
+|---|---|
+| System proxy | Only applications that honour the system proxy are routed. Games and UDP go direct |
+| TUN takeover (compat) | Supported traffic is taken over and your rules still apply. **Direct is still allowed** — this is not "everything is proxied" and there is no kill switch |
+| Privacy | Protected traffic may only leave through an approved route, and a dropped connection keeps refusing rather than falling back to direct. Leaving this state is a decision you make explicitly |
+
+**Uninstall removes only Zenith's own adapter.** The driver file is deliberately
+left in place, because another application may be using the same one.
+
+**What is not verified.** The one-click flow requires an interactive UAC approval,
+so the elevated path has been verified by construction and by unit tests, not by a
+person clicking through it on a clean machine. That end-to-end acceptance run is
+still outstanding, and is listed as such in the CHANGELOG.
+
+### What this does not do
+
+Stated plainly, because a proxy client that overstates its reach is worse than one
+that does less:
+
+- **Without TUN it is a system-proxy client, not a full tunnel.** Applications that
+  ignore the system proxy — most games, anything speaking raw UDP, anything with
+  its own network stack — go direct in that mode. TUN mode closes that gap for the
+  traffic it can reach, but it is not a kill switch unless you turn on privacy.
+- **Sniffing is not interception.** Traffic sniffing recovers the hostname of
+  connections that already reach the core, so rules can match them. It cannot do
+  anything about traffic that never enters the core.
+- **One successful check does not prove DNS is clean.** The exit IP and DNS were
+  sampled at a point in time; that does not cover system DNS, IPv6, or a second
+  network adapter.
+- **A 403 or 401 from a site is not a failure.** It means the connection worked
+  and the far end answered. Only a transport error counts against a node.
+- **Privacy mode has not been verified against a determined bypass.** It is built
+  so that a failed activation keeps refusing rather than falling back, and the
+  unit tests cover the decision logic, but the external packet-capture acceptance
+  run on a clean machine has not been done.
 
 ### Quick start
 
@@ -131,7 +231,7 @@ cd Zenith
 .\Zenith.exe
 ```
 
-Needs Go 1.21 or newer. The core and the rule databases ship with the clone, so
+Needs Go 1.24 or newer (the version recorded in go.mod). The core and the rule databases ship with the clone, so
 the first launch is ready in about two seconds with no download.
 
 Then, either way:
@@ -178,7 +278,7 @@ to. Everything is bound to loopback, so nothing is reachable from your network.
 
 ### Build from source
 
-Needs Go 1.21 or newer.
+Needs Go 1.24 or newer.
 
 ```powershell
 .\build.ps1
@@ -244,13 +344,30 @@ Cloudflare 是 Anycast。同一个边缘 IP 在不同时段可能被调度到不
 
 1. 建一个 Cloudflare 边缘地址候选池（初始 256 个；之后**每验证通过一个就追加进池子**，
    所以池子越用越准）。
-2. 对每个地址**真的开一条 WebSocket 隧道**——用节点自己的 SNI 连到这个边缘 IP，
+2. 对每个地址发起一次 WebSocket 升级——用节点自己的 SNI 连到这个边缘 IP，
    然后发一个真实的 `Upgrade: websocket` 请求。
    **只有返回 HTTP `101` 才算数。** 实测中反复出现这种情况：边缘完成了 TLS 握手，
-   然后对升级请求返回 `400 Bad Request`。按"连通性"排序的话，这种死边缘会被排到最前面。
+   然后对升级请求返回 `400 Bad Request`。只看连通性的话，这种死边缘会被排到最前面。
 3. 每个地址测多轮取中位数，任何一轮失败的都会被加罚分。
-4. 用赢家重写节点列表，然后让内核原地热重载——不重启，不断连接。
-5. 之后一直让你待在最快的已验证节点上，排序依据是**实测的握手时间**，不是 ping。
+4. 用赢家重写节点列表，然后让内核原地热重载——不重启内核，已建立的连接也不会被断开。
+5. 之后一直让你待在最快的已验证节点上，排序依据是**实测的升级耗时**，不是 ping。
+
+**这一步验证的是什么，不是什么。** 它是对**边缘**的筛选，不是对整条链路的证明：
+升级握手只说明这个边缘愿意接受这条隧道，**它没有完成代理协议自身的鉴权**，
+所以它无法告诉你远端是否健康。通过筛选的边缘算作"好的候选"，
+最终确认靠的是真实连接本身。
+
+### 节点失效时会发生什么
+
+单个 Cloudflare 边缘 IP 可能被封锁，而服务本身是好的。以前这意味着客户端会一直
+待在一个死节点上直到下次扫描，所以现在：
+
+- 每次扫描额外产出一个**域名节点**。它不绑定任何地址，由 Cloudflare anycast 为
+  每条连接挑一个可用边缘。**它不是免疫 DNS 或 anycast 故障，也不更快**——
+  它存在的意义是让单个 IP 被封锁不至于把连接带下水。
+- 健康检查连续三次失败就换走；钉死的地址都失效后优先切到域名节点。
+- 候选连续两次失败就**板凳 30 分钟**，扫描不再反复证明被封的地址仍然被封。
+- 实测往返**连续两次超过 1200ms** 就放弃它，哪怕它仍是"矮子里的高个"。
 
 ### 为什么 ping 不够用（这是实测的，不是推断）
 
@@ -293,20 +410,39 @@ Linux、没有 TUN 模式、没有插件生态、没有测试。
 
 | | |
 |---|---|
-| **真实 WebSocket 验证** | 只有完成升级握手的边缘才会被使用 |
-| **自动优选** | 扫描候选池，按中位握手时间排序，重写节点列表，原地热重载 |
-| **自动用最快的** | 按**实测握手时间**排序，不是 ping。差距明显时立刻切换，差距小时会先确认，所以你不会被噪声在几个差不多的节点之间来回甩 |
+| **WebSocket 升级验证** | 只有回应 `101` 的边缘才会被保留。它筛选的是**边缘**，不是整条链路 |
+| **自动优选** | 扫描候选池，按中位升级耗时排序，重写节点列表，原地热重载内核 |
+| **域名节点兜底** | 有一个节点永不绑定地址，由 Cloudflare 每条连接挑可用边缘，单个 IP 被封带不倒它 |
+| **自动用最快的** | 按**实测升级耗时**排序，不是 ping。差距明显时立刻切换，差距小时会先确认，所以你不会被噪声在几个差不多的节点之间来回甩 |
+| **节点变差就放弃** | 连续三次检查失败，或往返**连续两次超过 1200ms**，就把流量移走——哪怕它仍是那批里最快的 |
 | **尊重你的手动选择** | 点选的节点会保持一段时间。自动挑只在已验证的边缘之间做选择，不会否决你 |
 | **支持混合订阅** | 每个 WebSocket 中转各优选一批；直连节点（trojan / ss / hysteria2）原样保留 |
 | **零安装** | 一个可执行文件加内核，无运行时、无依赖 |
 | **常驻系统托盘** | 关掉窗口程序不退出。右键托盘图标：打开窗口、切换模式、开关系统代理、立即优选、退出 |
 | **不会多弹命令行** | 编译为 GUI 子系统程序，双击只出界面 |
-| **不惊扰** | 切节点走内核 API，窗口不会闪 |
+| **切节点不重启内核** | 走内核 API，窗口不会闪，已建立的连接不会被断 |
 | **多订阅** | 界面上添加、切换、刷新、删除任意多个订阅 |
 | **三种模式** | 规则分流、全局代理、直连 |
 | **自定义规则** | 给高级用户准备的规则编辑器，附带常用模板一键插入 |
+| **游戏平台分流** | 14 个 GeoSite 分类的商店与登录页走代理；下载 CDN 保持直连，那样快得多 |
 | **系统代理安全** | 检测到别的代理客户端在运行就不抢；退出时归还原主，原主已退出则关闭代理 |
+| **默认严格 TLS** | 订阅与探针都验证证书；拒绝明文 http 和跨域重定向。自签订阅需要显式开启例外 |
+| **真的只在本地** | 每个 API 路由都要求当次启动生成的令牌，Host 必须是回环地址，跨源请求被拒，写操作必须是 JSON |
 | **内置日志** | 应用日志和内核日志都能在界面里看 |
+
+### 这个软件做不到什么
+
+写在这里，是因为一个夸大口径的代理客户端比一个功能少的更糟：
+
+- **它是系统代理客户端，不是整机隧道。** 不读系统代理的程序——大多数游戏、
+  任何走原始 UDP 的东西、任何自带网络栈的软件——都会直连。目前还没有 TUN 模式，
+  所以这里没有任何东西是"整机保证"。
+- **嗅探不是拦截。** 流量嗅探能从**已经进入内核**的连接里还原出域名，好让规则匹配它。
+  它管不了根本没进内核的流量。
+- **一次出口检测成功不代表 DNS 干净。** 出口 IP 和 DNS 是某一时刻的抽样，
+  不覆盖系统 DNS、IPv6，也不覆盖第二块网卡。
+- **站点返回 403 或 401 不算失败。** 那说明连接通了、对端回应了。
+  只有传输层错误才算在节点头上。
 
 ### 快速开始
 
@@ -324,7 +460,7 @@ cd Zenith
 .\Zenith.exe
 ```
 
-需要 Go 1.21 或更新版本。内核和地理数据随仓库提供，所以首次启动约两秒就绪，
+需要 Go 1.24 或更新版本（即 go.mod 里记录的版本）。内核和地理数据随仓库提供，所以首次启动约两秒就绪，
 不需要下载任何东西。
 
 然后两种方式都一样：
@@ -367,7 +503,7 @@ Go 程序掌管一切：生成 `data/config.yaml`、启动内核、在 `127.0.0.
 
 ### 从源码构建
 
-需要 Go 1.21 或更新版本。
+需要 Go 1.24 或更新版本。
 
 ```powershell
 .\build.ps1

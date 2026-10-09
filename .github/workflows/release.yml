@@ -37,6 +37,21 @@ jobs:
             & $rsrc -ico data/zenith.ico -o src/icon.syso -arch amd64
           }
 
+      - name: Regression tests
+        working-directory: src
+        shell: pwsh
+        run: |
+          # These cover the defects a review found - the unreachable watchdog
+          # entry, the health-map race, the slow-node counter that never counted,
+          # the TUN component check, loopback and token enforcement, and the
+          # refusal to download a subscription over plain http. A release must not
+          # be produced from a tree where any of them fails.
+          $env:CGO_ENABLED = '0'
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+
       - name: Build
         working-directory: src
         shell: pwsh
@@ -45,12 +60,35 @@ jobs:
           go build -trimpath -ldflags '-s -w -H=windowsgui' -o ../Zenith.exe .
           if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
+      - name: Verify the TUN component is the verified one
+        shell: pwsh
+        run: |
+          # The component manifest records the digest the build was tested against.
+          # Checking it here means a release cannot ship a substituted or corrupted
+          # driver, and the check is by content rather than by file name.
+          $m = Get-Content 'core/wintun/manifest.json' -Raw | ConvertFrom-Json
+          $c = $m.components[0]
+          if (-not (Test-Path $c.file)) { throw "component missing: $($c.file)" }
+          $actual = (Get-FileHash $c.file -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $c.sha256.ToLower()) {
+            throw "component digest mismatch: manifest $($c.sha256), actual $actual"
+          }
+          $sig = Get-AuthenticodeSignature $c.file
+          if ($sig.Status -ne 'Valid') { throw "component signature is not valid: $($sig.Status)" }
+          Write-Host "component $($c.name) $($c.version) verified, signed by $($sig.SignerCertificate.Subject)"
+
       - name: Smoke test
         shell: pwsh
         run: |
           $v = & .\Zenith.exe -version
           Write-Host $v
           if ($v -notmatch 'Zenith') { throw "the binary does not run" }
+          # The watchdog entry must be reachable. It used to sit after flag.Parse,
+          # which exits on an unknown flag, so the helper died on its own argument
+          # and the crash protection silently did not exist.
+          & .\Zenith.exe -watchdog "$env:TEMP\zenith-smoke" 7999
+          if ($LASTEXITCODE -ne 0) { throw "the watchdog entry point is not reachable" }
+          Write-Host "watchdog entry point is reachable"
 
       - name: Package
         shell: pwsh

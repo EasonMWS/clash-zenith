@@ -86,6 +86,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/logs", s.wrap(s.handleLogs))
 	s.mux.HandleFunc("/api/core/restart", s.wrap(s.handleCoreRestart))
 	s.mux.HandleFunc("/api/about", s.wrap(s.handleAbout))
+	// TUN lifecycle. One route for the product action, plus the read-only checks
+	// the interface needs to explain itself.
+	s.mux.HandleFunc("/api/tun/check", s.wrap(s.handleTunCheck))
+	s.mux.HandleFunc("/api/tun/enable", s.wrap(s.handleTunEnable))
+	s.mux.HandleFunc("/api/tun/disable", s.wrap(s.handleTunDisable))
+	s.mux.HandleFunc("/api/tun/repair", s.wrap(s.handleTunRepair))
+	s.mux.HandleFunc("/api/tun/uninstall", s.wrap(s.handleTunUninstall))
 	s.mux.HandleFunc("/api/quit", s.wrap(s.handleQuit))
 	s.mux.HandleFunc("/", s.handleStatic)
 }
@@ -185,6 +192,81 @@ func isLoopbackHost(host string) bool {
 	}
 	return false
 }
+
+// ---- TUN ------------------------------------------------------------------
+
+// handleTunCheck reports what the machine looks like without changing anything, so
+// the interface can explain a refusal before the user is asked for a password.
+func (s *Server) handleTunCheck(w http.ResponseWriter, r *http.Request) {
+	env := s.app.checkTunEnvironment()
+	writeJSON(w, 200, map[string]interface{}{
+		"ok":     true,
+		"env":    env,
+		"run":    s.app.TunRunState(),
+		"mode":   s.app.store.Settings().TunMode,
+		"labels": tunModeLabels(),
+	})
+}
+
+func tunModeLabels() map[string]string {
+	return map[string]string{
+		string(TunCompat):  TunCompat.Label(),
+		string(TunPrivacy): TunPrivacy.Label(),
+	}
+}
+
+// handleTunEnable is the single product action. Everything behind it - checking,
+// authorisation, component placement, adapter, routes, verification - runs from
+// this one call.
+func (s *Server) handleTunEnable(w http.ResponseWriter, r *http.Request) {
+	body := readBody(r)
+	mode := TunMode(asString(body["mode"]))
+	if mode == "" {
+		mode = TunCompat
+	}
+	if !mode.Valid() || mode == TunOff {
+		writeJSON(w, 400, map[string]interface{}{"ok": false, "error": "未知的 TUN 模式"})
+		return
+	}
+	if err := s.app.EnableTun(mode); err != nil {
+		writeJSON(w, 409, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true, "started": true, "run": s.app.TunRunState(),
+	})
+}
+
+func (s *Server) handleTunDisable(w http.ResponseWriter, r *http.Request) {
+	body := readBody(r)
+	// Releasing privacy protection is a decision, so it has to be stated.
+	release := body["releasePrivacy"] == true
+	if err := s.app.DisableTun(release); err != nil {
+		writeJSON(w, 409, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+func (s *Server) handleTunRepair(w http.ResponseWriter, r *http.Request) {
+	body := readBody(r)
+	env, err := s.app.RepairTun(body["release"] == true)
+	if err != nil {
+		writeJSON(w, 409, map[string]interface{}{"ok": false, "error": err.Error(), "env": env})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "env": env})
+}
+
+func (s *Server) handleTunUninstall(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.UninstallTun(); err != nil {
+		writeJSON(w, 409, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// ---- end TUN --------------------------------------------------------------
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
