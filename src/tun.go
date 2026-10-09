@@ -27,8 +27,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -443,25 +443,43 @@ func windowsVersion() string {
 // The request is explicit and one-shot: if the user declines, Zenith says so and
 // stays where it is. It never re-prompts in a loop, because a repeatedly
 // re-appearing UAC dialog trains people to click yes.
-func elevateRequest(args []string) error {
+func elevateRequest(args []string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	verb := "runas"
 	cwd, _ := os.Getwd()
-	cmd := exec.Command(exe, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{}
-	cmd.Dir = cwd
 	if err := shellExecuteRunas(exe, args, cwd); err != nil {
 		if isUserCancel(err) {
-			return fmt.Errorf("没有获得管理员授权，TUN 未启用。系统设置没有被修改")
+			return 0, fmt.Errorf("没有获得管理员授权，TUN 未启用。系统设置没有被修改")
 		}
-		return fmt.Errorf("请求管理员授权失败：%v", err)
+		return 0, fmt.Errorf("请求管理员授权失败：%v", err)
 	}
-	_ = verb
-	_ = cmd
-	return nil
+	return helperPIDForRequester(), nil
+}
+
+// helperPIDForRequester finds the elevated helper this process just started.
+//
+// The helper is a child of this process, runs the same executable, and carries
+// -tun-elevated. Matching on all three avoids picking up an unrelated Zenith
+// window. Returning zero is acceptable: the wait then falls back to its deadline
+// rather than to a process check, which is the behaviour before this existed.
+func helperPIDForRequester() int {
+	script := fmt.Sprintf(
+		`Get-CimInstance Win32_Process -Filter "Name='%s'" | `+
+			`Where-Object { $_.ParentProcessId -eq %d -and $_.CommandLine -like '*-tun-elevated*' } | `+
+			`Select-Object -First 1 -ExpandProperty ProcessId`,
+		filepath.Base(os.Args[0]), os.Getpid())
+	out, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	if err != nil {
+		return 0
+	}
+	for _, f := range strings.Fields(out) {
+		if n, convErr := strconv.Atoi(f); convErr == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // ---- transactions ---------------------------------------------------------
@@ -665,17 +683,25 @@ func (a *App) runEnableTun(mode TunMode) {
 		a.setTunStage("等待系统授权")
 		txA.step("请求授权", "pending", "等待用户在 UAC 对话框中确认")
 		a.saveTunTxn(txA)
+
+		// A fresh id per attempt. The helper writes its result under this id, and a
+		// record carrying any other id belongs to a different attempt and is
+		// ignored - so a stale file cannot be read as this run's verdict.
+		id := newHandoverID()
+		a.clearHandover()
 		// The root directory is passed explicitly rather than left to be
 		// rediscovered. resolveRoot infers it by looking for web/index.html near
 		// the executable, and an elevated process can be started with a different
 		// working directory - which made it read a different configuration than
 		// the instance that asked for the elevation, and act on ports and nodes
 		// that were not the ones in use.
-		err := elevateRequest([]string{
+		helperPID, err := elevateRequest([]string{
 			"-tun-elevated",
 			"-root", a.rootDir,
 			"-datadir", a.dataDir,
 			"-tun-mode", string(mode),
+			"-handover-id", id,
+			"-requester-pid", strconv.Itoa(os.Getpid()),
 		})
 		if err != nil {
 			txA.step("请求授权", "failed", err.Error())
@@ -689,11 +715,34 @@ func (a *App) runEnableTun(mode TunMode) {
 		txA.step("请求授权", "done", "已启动提权实例，由它继续完成")
 		txA.State = "done"
 		a.saveTunTxn(txA)
-		a.mu.Lock()
-		if a.tunRun != nil {
-			a.tunRun.Stage = "已授权，等待提权实例接管"
+
+		// Wait for the helper's verdict.
+		//
+		// This used to be a bare return: the state was set to "authorised, waiting
+		// for the elevated instance" and the function ended, leaving the interface
+		// waiting for something that could never arrive. The helper reported
+		// through a progress object it never initialised, so its failures were
+		// recorded nowhere and it read that empty object to decide the outcome -
+		// which meant a failed activation could report success. Nothing below reads
+		// this process's own memory to decide what the helper achieved.
+		a.setTunStage("已授权，等待提权实例接管")
+		result := a.awaitHandover(id, helperPID, handoverTimeout)
+		if result.OK {
+			txA.step("提权实例完成", "done", "由提权实例报告成功")
+			a.saveTunTxn(txA)
+			a.mu.Lock()
+			if a.tunRun != nil {
+				a.tunRun.Active = false
+				a.tunRun.Stage = "已启用"
+			}
+			a.mu.Unlock()
+			return
 		}
-		a.mu.Unlock()
+		txA.step("提权实例失败", "failed", result.Failure)
+		txA.State = "failed"
+		txA.Failure = result.Failure
+		a.saveTunTxn(txA)
+		a.failTun(fmt.Errorf("%s", result.Failure))
 		return
 	}
 
@@ -701,26 +750,40 @@ func (a *App) runEnableTun(mode TunMode) {
 	txA.State = "done"
 	a.saveTunTxn(txA)
 
-	a.runActivateTun(mode, env)
+	if err := a.runActivateTun(mode, env); err != nil {
+		txA.step("启用 TUN", "failed", err.Error())
+		txA.State = "failed"
+		txA.Failure = err.Error()
+		a.saveTunTxn(txA)
+	}
 }
+
+// handoverTimeout bounds the wait for the helper.
+//
+// It is generous because the steps it covers are slow: a core restart, driver
+// binding and a real request through the tunnel. It is not the primary way the
+// wait ends - a helper that exits is noticed as soon as it does - so this only
+// catches a helper that is still alive and stuck.
+const handoverTimeout = 4 * time.Minute
 
 // runActivateTun is transaction B. It records what it changed before changing it,
 // so a failure can put back exactly those things and nothing else.
-func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
+func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 	txB := newTunTxn(txnActivate)
 	st := a.store.Settings()
 	proxyState := NewSystemProxy(a.dataDir).Status()
 	txB.Owned.SysProxyWasOn = proxyState.Enabled
 	txB.Owned.SysProxyServer = proxyState.Server
-	txB.Owned.AdapterName = st.TunDevice
+	txB.Owned.AdapterName = st.NormalizedTunDevice()
 	a.saveTunTxn(txB)
 
-	rollback := func(reason error) {
+	rollback := func(reason error) error {
 		txB.State = "failed"
 		txB.Failure = reason.Error()
 		a.saveTunTxn(txB)
 		a.rollbackActivate(txB)
 		a.failTun(reason)
+		return reason
 	}
 
 	a.setTunStage("准备组件")
@@ -729,8 +792,7 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
 		"tunDevice": st.TunDevice,
 		"tunStack":  st.TunStack,
 	}); err != nil {
-		rollback(fmt.Errorf("无法保存 TUN 设置：%v", err))
-		return
+		return rollback(fmt.Errorf("无法保存 TUN 设置：%v", err))
 	}
 	txB.step("保存设置", "done", string(mode))
 
@@ -748,19 +810,16 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
 	cfg := BuildConfig(cfgNodes, a.optimizedNames(), cfgSettings,
 		a.secret, a.store.Snapshot().Current, a.dnsPort)
 	if err := validateCandidateConfig(cfg); err != nil {
-		rollback(fmt.Errorf("生成的 TUN 配置没有通过校验：%v", err))
-		return
+		return rollback(fmt.Errorf("生成的 TUN 配置没有通过校验：%v", err))
 	}
 	if !strings.Contains(cfg, "\ntun:\n") {
 		// The one condition this whole path exists for. Checking it here rather
 		// than trusting the generator means a future change cannot silently bring
 		// TUN back to "the adapter never appears".
-		rollback(fmt.Errorf("内部错误：设置已保存为 %s，但生成的配置里没有 tun 段", mode))
-		return
+		return rollback(fmt.Errorf("内部错误：设置已保存为 %s，但生成的配置里没有 tun 段", mode))
 	}
 	if err := os.WriteFile(a.configPath, []byte(cfg), 0o644); err != nil {
-		rollback(fmt.Errorf("无法写入 TUN 配置：%v", err))
-		return
+		return rollback(fmt.Errorf("无法写入 TUN 配置：%v", err))
 	}
 	// Keep the known-good copy in step, so a later rollback restores something
 	// real rather than the pre-TUN file.
@@ -775,8 +834,7 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
 	a.core.Stop()
 	time.Sleep(1500 * time.Millisecond)
 	if err := a.core.Start(); err != nil {
-		rollback(fmt.Errorf("内核未能带 TUN 配置启动：%v", err))
-		return
+		return rollback(fmt.Errorf("内核未能带 TUN 配置启动：%v", err))
 	}
 	txB.Owned.CoreStarted = true
 	a.saveTunTxn(txB)
@@ -798,9 +856,8 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
 		if coreErr == "" {
 			coreErr = "内核没有报告原因"
 		}
-		rollback(fmt.Errorf("虚拟网卡 %q 没有出现。内核的说法：%s。"+
+		return rollback(fmt.Errorf("虚拟网卡 %q 没有出现。内核的说法：%s。"+
 			"常见原因是组件未被正确加载，或系统策略阻止了驱动安装", st.TunDevice, coreErr))
-		return
 	}
 	txB.Owned.AdapterCreated = true
 	a.saveTunTxn(txB)
@@ -810,9 +867,8 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
 	// is not the claim being made.
 	a.setTunStage("验证真实代理请求")
 	if err := a.verifyProxyCarries(); err != nil {
-		rollback(fmt.Errorf("网卡已建立，但真实请求没有通过隧道：%v。"+
+		return rollback(fmt.Errorf("网卡已建立，但真实请求没有通过隧道：%v。"+
 			"已回滚这次激活，没有把它当作成功", err))
-		return
 	}
 	txB.step("验证连接", "done", "真实请求已通过隧道")
 
@@ -824,7 +880,8 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
 		a.tunRun.Stage = "已启用"
 	}
 	a.mu.Unlock()
-	Log("TUN enabled in %s mode; adapter %q verified carrying traffic", mode, st.TunDevice)
+	Log("TUN enabled in %s mode; adapter %q verified carrying traffic", mode, st.NormalizedTunDevice())
+	return nil
 }
 
 // rollbackActivate restores exactly what this activation changed.
@@ -992,14 +1049,25 @@ func (a *App) UninstallTun() error {
 // only for the activation, performs it, reports the outcome through the
 // transaction record, and exits. No elevated process is left behind, and the UI
 // never holds administrator rights it does not need.
-func (a *App) RunElevatedActivation(mode TunMode) error {
+func (a *App) RunElevatedActivation(mode TunMode, handoverID string, requesterPID int) error {
 	Log("elevated instance: activating TUN in %s mode", mode)
+
+	// Take ownership of the handover record first, so the waiting side sees
+	// progress from the very start rather than silence while the environment is
+	// checked. Everything below reports through it, and its terminal state is the
+	// only thing that counts as this activation's outcome.
+	rec := a.beginHandover(handoverID, requesterPID, mode)
+
 	env := a.checkTunEnvironment()
 	if len(env.Blockers) > 0 {
 		err := fmt.Errorf("%s", strings.Join(env.Blockers, "；"))
+		a.progressHandover(rec, "检查环境")
+		a.finishHandover(rec, err)
 		a.failTun(err)
 		return err
 	}
+	a.progressHandover(rec, "准备组件")
+
 	// Claim the core before stopping it. The ordinary instance restarts a core it
 	// finds down, so without the marker it would start one on top of this
 	// activation and the two would fight for the same listener.
@@ -1007,15 +1075,23 @@ func (a *App) RunElevatedActivation(mode TunMode) error {
 	defer a.releaseActivation()
 	a.core.Stop()
 	time.Sleep(1 * time.Second)
-	a.runActivateTun(mode, env)
-	if st := a.TunRunState(); st.Error != "" {
-		Log("elevated instance: activation failed: %s", st.Error, "WARN")
-		a.core.Stop()
-		return fmt.Errorf("%s", st.Error)
+
+	// The activation's own result, returned rather than inferred.
+	//
+	// This used to be read back from the progress object, which this process never
+	// initialised - so a failure was recorded nowhere, the read returned an empty
+	// value, and a failed activation was reported as success. It then stopped the
+	// core on the way out, taking down the tunnel it had just built.
+	actErr := a.runActivateTun(mode, env)
+	a.finishHandover(rec, actErr)
+	if actErr != nil {
+		// The core is left as the rollback put it. Stopping it here was the old
+		// behaviour and it was wrong: the ordinary instance takes it back on its
+		// next tick, and stopping it first tore the tunnel down between this
+		// process exiting and that tick, for no reason.
+		Log("elevated instance: activation failed: %v", actErr, "WARN")
+		return actErr
 	}
-	Log("elevated instance: activation finished")
-	// Hand the core back: the ordinary instance will start it again on its next
-	// tick, and this process leaves no privileged service running.
-	a.core.Stop()
+	Log("elevated instance: activation finished successfully")
 	return nil
 }

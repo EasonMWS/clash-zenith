@@ -66,6 +66,11 @@ func main() {
 		// reads exactly the same tree. Inferring it is not reliable: the helper can
 		// be started with a different working directory.
 		rootFlag = flag.String("root", "", "internal: the program directory to use")
+		// Passed by the instance that requested elevation. The helper writes its
+		// result under this id, and the requester ignores any record carrying a
+		// different one, so a stale file cannot be read as this attempt's verdict.
+		handoverIDFlag   = flag.String("handover-id", "", "internal: activation id for the result record")
+		requesterPIDFlag = flag.Int("requester-pid", 0, "internal: pid of the instance awaiting the result")
 		// Raised by the elevation request. The elevated instance runs the same
 		// product; it only differs in having the rights the adapter and the routes
 		// need, and it is the one that performs the activation transaction.
@@ -204,10 +209,13 @@ func main() {
 		// activation. The startup sweep would match the ordinary instance's core
 		// and kill it, which is what hung the first real attempt.
 		app.core.SetNoOrphanCleanup(true)
-		Log("elevated instance: activating TUN in %s mode", mode)
 		// No window, no tray, no second UI server: this process exists only for
 		// the activation, which needs rights the ordinary instance does not have.
-		if err := app.RunElevatedActivation(mode); err != nil {
+		//
+		// Its exit status matters, but the interface cannot read it - the helper is
+		// started through ShellExecute. The handover record is what the waiting
+		// side reads, and RunElevatedActivation writes it before returning.
+		if err := app.RunElevatedActivation(mode, *handoverIDFlag, *requesterPIDFlag); err != nil {
 			Log("elevated instance: %v", err, "ERR")
 		} else {
 			Log("elevated instance: activation finished")

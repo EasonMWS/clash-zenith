@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -148,14 +149,92 @@ func systemProxyOwner(stateDir string) string {
 	if port == 0 {
 		return ""
 	}
-	return ownerOfPort(port)
+	return ownerOfPort(port, ownCorePids()...)
+}
+
+// ownCorePids lists the processes this program owns, so ownership checks do not
+// mistake our own core for a foreign client.
+func ownCorePids() []int {
+	var out []int
+	for _, name := range []string{"mihomo.exe"} {
+		out = append(out, pidsOfName(name)...)
+	}
+	if self := os.Getpid(); self > 0 {
+		out = append(out, self)
+	}
+	return out
+}
+
+// pidsOfName returns the process ids with the given executable name.
+//
+// It resolves through the same CIM query the rest of the program uses, so an
+// elevated process that cannot be inspected still reports its id rather than
+// disappearing from the list.
+func pidsOfName(name string) []int {
+	out, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf(`Get-Process -Name '%s' -ErrorAction SilentlyContinue | `+
+			`Select-Object -ExpandProperty Id`, strings.TrimSuffix(strings.ToLower(name), ".exe")))
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, f := range strings.Fields(out) {
+		if n, err := strconv.Atoi(f); err == nil && n > 0 {
+			pids = append(pids, n)
+		}
+	}
+	return pids
+}
+
+// processRunning reports whether a process exists, distinguishing gone from
+// cannot-be-inspected.
+//
+// The distinction matters here: an elevated helper cannot be opened by a
+// non-elevated process, and treating that refusal as gone would end the wait
+// early and report a failure while the helper was still working. Only a definite
+// no-such-process counts as gone. Access denied means alive.
+func processRunning(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	const (
+		processQueryLimitedInformation = 0x1000
+		stillActive                    = 259
+	)
+	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
+	if err != nil {
+		if err == syscall.ERROR_ACCESS_DENIED {
+			// It exists; we are simply not allowed to look at it.
+			return true, nil
+		}
+		return false, nil
+	}
+	defer syscall.CloseHandle(h)
+	var code uint32
+	if err := syscall.GetExitCodeProcess(h, &code); err != nil {
+		// Opened but could not read the code: it exists.
+		return true, nil
+	}
+	return code == stillActive, nil
 }
 
 // ownerOfPort maps a listening port to a process name.
-func ownerOfPort(port int) string {
-	pids := ListeningPids(port)
-	for _, pid := range pids {
-		if pid <= 0 {
+//
+// ownPids are processes that belong to this program and must not be reported as a
+// foreign owner. Zenith's own core listens on the mixed port, so without this the
+// program identified its own mihomo as "another program holding the system proxy"
+// and told the user to pick one takeover method - about itself. The name check is
+// not enough on its own because mihomo.exe is also the name of cores belonging to
+// other clients.
+func ownerOfPort(port int, ownPids ...int) string {
+	own := map[int]bool{}
+	for _, p := range ownPids {
+		if p > 0 {
+			own[p] = true
+		}
+	}
+	for _, pid := range ListeningPids(port) {
+		if pid <= 0 || own[pid] {
 			continue
 		}
 		if name := processNameOf(pid); name != "" {

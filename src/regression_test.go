@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1134,15 +1135,24 @@ func TestElevatedDispatchComesBeforeTheSingleInstanceCheck(t *testing.T) {
 }
 
 func TestElevatedRunReturnsAnErrorRatherThanReportingThroughState(t *testing.T) {
-	// The elevated process has no window and no UI, so its only way to report is
-	// its exit status and the log. A signature that returns nothing would leave
-	// the caller unable to say whether the activation worked.
+	// The elevated process has no window and no UI, and it is started through
+	// ShellExecute so its exit status cannot be read either. Its verdict reaches
+	// the interface through the handover record, and a signature that returned
+	// nothing would leave the caller unable to say whether the activation worked -
+	// which is exactly the defect: the outcome used to be read back from a progress
+	// object this process never initialised, so a failure was reported as success.
 	src, err := os.ReadFile("tun.go")
 	if err != nil {
 		t.Skipf("tun.go is not readable: %v", err)
 	}
-	if !strings.Contains(string(src), "func (a *App) RunElevatedActivation(mode TunMode) error {") {
-		t.Error("RunElevatedActivation should return an error so its caller can report the outcome")
+	text := string(src)
+	if !strings.Contains(text, "func (a *App) RunElevatedActivation(mode TunMode, handoverID string, requesterPID int) error {") {
+		t.Error("RunElevatedActivation should take the handover id and return an error, so its " +
+			"outcome can be reported rather than inferred")
+	}
+	// And it must report through the channel, not through local state.
+	if !strings.Contains(text, "a.finishHandover(rec,") {
+		t.Error("the elevated activation does not write its verdict to the handover record")
 	}
 }
 
@@ -1558,5 +1568,154 @@ func TestGeneratedConfigUsesTheNormalizedValues(t *testing.T) {
 	// than assuming a bare scalar.
 	if !strings.Contains(cfg, `stack: "`+tunDefaultStack+`"`) {
 		t.Errorf("the generated configuration does not use stack %q:\n%s", tunDefaultStack, cfg)
+	}
+}
+
+// ---- P0-1: the handover must have a result channel --------------------------
+
+func TestHandoverRecordRoundTrips(t *testing.T) {
+	// The waiting side used to be told "authorised, waiting for the elevated
+	// instance" and then have nothing that could ever end that wait: the helper
+	// reported through a progress object it never initialised, so its verdict went
+	// nowhere. This record is the channel that replaced it.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+
+	if rec := a.readHandover(); rec != nil {
+		t.Fatal("a fresh data directory should have no handover record")
+	}
+	id := newHandoverID()
+	rec := a.beginHandover(id, 4242, TunPrivacy)
+	if rec.ID != id || rec.RequesterPID != 4242 || rec.State != handoverRunning {
+		t.Fatalf("the record was not started correctly: %+v", rec)
+	}
+	back := a.readHandover()
+	if back == nil || back.ID != id {
+		t.Fatal("the record could not be read back")
+	}
+	if back.HelperPID != os.Getpid() {
+		t.Errorf("helper pid = %d, want %d", back.HelperPID, os.Getpid())
+	}
+	if back.Adapter != tunDefaultDevice {
+		t.Errorf("adapter = %q, want the normalized default %q", back.Adapter, tunDefaultDevice)
+	}
+
+	a.progressHandover(back, "建立虚拟网卡")
+	if got := a.readHandover(); got == nil || got.Stage != "建立虚拟网卡" {
+		t.Error("progress was not recorded, so the interface would show a static waiting message")
+	}
+
+	a.finishHandover(back, nil)
+	done := a.readHandover()
+	if done == nil || done.State != handoverSucceeded {
+		t.Fatalf("success was not recorded: %+v", done)
+	}
+	a.clearHandover()
+	if a.readHandover() != nil {
+		t.Error("clearing did not remove the record, so the next activation could read this one's verdict")
+	}
+}
+
+func TestHandoverFailureCarriesItsReason(t *testing.T) {
+	// The failure this whole file exists for: a failed activation must arrive with
+	// a reason attached, not as silence and not as success.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	rec := a.beginHandover(newHandoverID(), 1, TunCompat)
+	want := "虚拟网卡没有出现：内核说 Access is denied"
+	a.finishHandover(rec, fmt.Errorf("%s", want))
+
+	back := a.readHandover()
+	if back == nil {
+		t.Fatal("no record")
+	}
+	if back.State != handoverFailed {
+		t.Errorf("state = %q, want %q", back.State, handoverFailed)
+	}
+	if back.Failure != want {
+		t.Errorf("failure = %q, want %q", back.Failure, want)
+	}
+	if back.ExitedAt == "" {
+		t.Error("a terminal record should record when the helper left")
+	}
+}
+
+func TestAwaitHandoverAlwaysEnds(t *testing.T) {
+	// The interface must never wait forever. Three things end it, and each is
+	// exercised here: the helper reports, the helper exits, and the deadline
+	// passes.
+	dir := t.TempDir()
+
+	// 1. The helper reports success.
+	a := &App{dataDir: dir}
+	id := newHandoverID()
+	rec := a.beginHandover(id, os.Getpid(), TunCompat)
+	a.finishHandover(rec, nil)
+	res := a.awaitHandover(id, os.Getpid(), 2*time.Second)
+	if !res.Done || !res.OK {
+		t.Errorf("a reported success should end the wait as success: %+v", res)
+	}
+
+	// 2. The helper reports failure, and the reason survives.
+	a2 := &App{dataDir: t.TempDir()}
+	id2 := newHandoverID()
+	rec2 := a2.beginHandover(id2, os.Getpid(), TunCompat)
+	a2.finishHandover(rec2, fmt.Errorf("网卡创建失败"))
+	res2 := a2.awaitHandover(id2, os.Getpid(), 2*time.Second)
+	if !res2.Done || res2.OK {
+		t.Errorf("a reported failure should end the wait as failure: %+v", res2)
+	}
+	if res2.Failure != "网卡创建失败" {
+		t.Errorf("the reason was lost: %q", res2.Failure)
+	}
+
+	// 3. No record at all and a process that does not exist: the wait ends as a
+	//    failure that names the case, rather than running to the deadline.
+	a3 := &App{dataDir: t.TempDir()}
+	res3 := a3.awaitHandover("id-that-never-reports", 0, 1500*time.Millisecond)
+	if !res3.Done || res3.OK {
+		t.Errorf("a deadline that passes must end the wait as failure: %+v", res3)
+	}
+	if res3.Failure == "" {
+		t.Error("a failure must carry an explanation")
+	}
+}
+
+func TestStaleHandoverRecordIsNotThisAttemptsVerdict(t *testing.T) {
+	// A record from an earlier attempt carries a different id. Reading it as this
+	// attempt's result would report the previous activation's outcome, which is how
+	// a failure gets shown as a success.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	stale := a.beginHandover("act-old", os.Getpid(), TunCompat)
+	a.finishHandover(stale, nil) // the previous attempt succeeded
+
+	res := a.awaitHandover("act-new", 0, 1200*time.Millisecond)
+	if res.OK {
+		t.Fatal("a record from a different attempt was accepted as this attempt's success")
+	}
+	if !res.Done {
+		t.Fatal("the wait did not end")
+	}
+}
+
+func TestProcessRunningDistinguishesGoneFromUninspectable(t *testing.T) {
+	// An elevated helper cannot be opened by a non-elevated process. Treating that
+	// refusal as "gone" would end the wait early and report a failure while the
+	// helper was still working.
+	alive, _ := processRunning(os.Getpid())
+	if !alive {
+		t.Error("this process should be reported as running")
+	}
+	// A pid that cannot exist.
+	gone, _ := processRunning(0x7FFFFFF0)
+	if gone {
+		t.Error("a pid that cannot exist should be reported as gone")
+	}
+	if helperStillRunning(0) {
+		t.Error("pid 0 must never be reported as a running helper")
+	}
+	if !helperStillRunning(os.Getpid()) {
+		t.Error("this process should be reported as running")
 	}
 }
