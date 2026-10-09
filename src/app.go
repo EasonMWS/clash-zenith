@@ -455,7 +455,7 @@ func (a *App) background() {
 			due := lastSub.Add(time.Duration(st.SubscriptionIntervalHours) * time.Hour)
 			if time.Now().After(due) {
 				lastSub = time.Now()
-				if id := a.store.Snapshot().SelectedSub; id != "" {
+				if id := a.store.ActiveSubscription(); id != "" {
 					if _, err := a.UpdateSubscription(id); err != nil {
 						Log("scheduled subscription refresh failed: %v", err, "WARN")
 					}
@@ -1436,6 +1436,11 @@ func (a *App) AddSubscription(rawURL, name string) (*Subscription, error) {
 	if err := a.store.SetSubscriptions(subs); err != nil {
 		return nil, err
 	}
+	// A first subscription becomes the active one, otherwise the scheduled
+	// refresh has nothing to refresh until the user clicks it.
+	if len(snap.Subscriptions) == 0 {
+		_ = a.store.SetActiveSubscription(sub.ID)
+	}
 	if err := a.store.SetNodes(nodes, nil); err != nil {
 		return nil, err
 	}
@@ -1520,12 +1525,9 @@ func (a *App) SelectSubscription(id string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	snap := a.store.Snapshot()
-	subs := snap.Subscriptions
-	for i := range subs {
-		subs[i].Enabled = subs[i].ID == id
-	}
-	_ = a.store.SetSubscriptions(subs)
+	// One call sets both the Enabled flag and SelectedSub, so the scheduled
+	// refresh has a target instead of an empty string.
+	_ = a.store.SetActiveSubscription(id)
 	_ = a.store.SetCurrent("")
 	Log("subscription selected: %s", id)
 	return n, nil

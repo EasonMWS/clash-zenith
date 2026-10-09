@@ -367,6 +367,45 @@ func (s *Store) UpdateSettings(patch map[string]interface{}) (Settings, error) {
 	return s.state.Settings, s.saveLocked()
 }
 
+// SetActiveSubscription records which subscription is in use.
+//
+// Two fields describe this: Enabled marks the one subscription the user is on,
+// and SelectedSub names it. They existed independently and only one of them was
+// ever written, so every reader of the other saw nothing - which is how the
+// scheduled refresh ended up with no target and silently did nothing.
+//
+// This sets both together. They are kept as separate fields because the file
+// format predates this fix and older builds read Enabled.
+func (s *Store) SetActiveSubscription(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Subscriptions {
+		s.state.Subscriptions[i].Enabled = s.state.Subscriptions[i].ID == id
+	}
+	s.state.SelectedSub = id
+	// saveLocked, not Save: the mutex is already held, and Save would take it a
+	// second time. A recursive lock here deadlocks rather than failing loudly,
+	// which is how it was found - the test suite simply stopped mid-run.
+	return s.saveLocked()
+}
+
+// ActiveSubscription returns the id of the subscription in use, falling back to
+// whichever one is enabled. The fallback matters for a file written before the
+// two fields were kept in step: those have Enabled set and SelectedSub empty, and
+// reporting "no subscription" for them would disable the refresh again.
+func (s *Store) ActiveSubscription() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.SelectedSub != "" {
+		return s.state.SelectedSub
+	}
+	for i := range s.state.Subscriptions {
+		if s.state.Subscriptions[i].Enabled {
+			return s.state.Subscriptions[i].ID
+		}
+	}
+	return ""
+}
 func (s *Store) SetSubscriptions(subs []Subscription) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

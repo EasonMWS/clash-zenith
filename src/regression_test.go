@@ -748,3 +748,84 @@ func TestToIntAcceptsTheShapesJSONProduces(t *testing.T) {
 		}
 	}
 }
+
+// ---- R08: the active subscription must be recorded where readers look -------
+
+func TestActiveSubscriptionFallsBackToTheEnabledFlag(t *testing.T) {
+	// Two fields describe which subscription is in use, and only one of them used
+	// to be written. Every reader of the other saw nothing, which is how the
+	// scheduled refresh ended up with no target and silently did nothing.
+	//
+	// A file written before the fix has Enabled set and SelectedSub empty. It must
+	// still report the subscription in use, or the refresh stays broken for
+	// existing users.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := []Subscription{
+		{ID: "a", Name: "one", URL: "https://a.example/x", Enabled: false},
+		{ID: "b", Name: "two", URL: "https://b.example/y", Enabled: true},
+	}
+	if err := st.SetSubscriptions(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.ActiveSubscription(); got != "b" {
+		t.Errorf("legacy file: ActiveSubscription = %q, want %q (the enabled one)", got, "b")
+	}
+
+	// Setting it explicitly must move both fields together.
+	if err := st.SetActiveSubscription("a"); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.ActiveSubscription(); got != "a" {
+		t.Errorf("after selecting a: ActiveSubscription = %q, want a", got)
+	}
+	snap := st.Snapshot()
+	for _, sub := range snap.Subscriptions {
+		want := sub.ID == "a"
+		if sub.Enabled != want {
+			t.Errorf("subscription %q has Enabled=%v, want %v", sub.ID, sub.Enabled, want)
+		}
+	}
+	if snap.SelectedSub != "a" {
+		t.Errorf("SelectedSub = %q, want a; the two fields must not drift apart", snap.SelectedSub)
+	}
+
+	// Exactly one subscription may be active at a time.
+	n := 0
+	for _, sub := range snap.Subscriptions {
+		if sub.Enabled {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d subscriptions are enabled, want exactly 1", n)
+	}
+}
+
+func TestActiveSubscriptionSurvivesAReload(t *testing.T) {
+	// The value is what the scheduled refresh uses, so it has to be durable.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSubscriptions([]Subscription{
+		{ID: "x", Name: "x", URL: "https://x.example/1"},
+		{ID: "y", Name: "y", URL: "https://y.example/2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetActiveSubscription("y"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := again.ActiveSubscription(); got != "y" {
+		t.Errorf("after a reload ActiveSubscription = %q, want y", got)
+	}
+}

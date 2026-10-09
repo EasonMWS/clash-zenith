@@ -102,7 +102,10 @@ Write-Step '运行回归测试…'
 Push-Location $SrcDir
 try {
     $env:CGO_ENABLED = '0'
-    $testArgs = @('test', './...')
+    # A timeout so a deadlock fails the build instead of hanging it. A recursive
+    # mutex is exactly the kind of defect this suite is meant to catch, and one
+    # was caught this way.
+    $testArgs = @('test', '-timeout', '90s', './...')
     if ($Race) { $testArgs += '-race' }
     & $go @testArgs
     if ($LASTEXITCODE -ne 0) { throw "测试未通过 (exit $LASTEXITCODE)" }

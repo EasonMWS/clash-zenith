@@ -426,8 +426,13 @@ func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{
 		"ok":            true,
 		"subscriptions": st.Subscriptions,
-		"selected":      st.SelectedSub,
-		"lastFetch":     st.Settings.LastProfile,
+		// Derived rather than read raw from the snapshot. The stored field and the
+		// per-subscription Enabled flag can disagree in a file written before they
+		// were kept in step, and reporting "none selected" for those would disable
+		// the scheduled refresh for exactly the users who already have a
+		// subscription configured.
+		"selected":  s.app.store.ActiveSubscription(),
+		"lastFetch": st.Settings.LastProfile,
 	})
 }
 
