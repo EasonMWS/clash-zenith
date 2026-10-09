@@ -3243,7 +3243,7 @@ proxies:
   - name: "node"
     type: vmess
     server: example.com
-    uuid: 187d8fa9-569b-49e4-bd00-bbb318a4f295
+    uuid: 00000000-1111-2222-3333-444444444444
     ws-opts:
       path: "/a-private-path"
       headers:
@@ -3254,7 +3254,7 @@ rules:
 	out := RedactConfigForDisplay(cfg)
 	for _, leak := range []string{
 		"the-core-control-secret",
-		"187d8fa9-569b-49e4-bd00-bbb318a4f295",
+		"00000000-1111-2222-3333-444444444444",
 		"/a-private-path",
 	} {
 		if strings.Contains(out, leak) {
@@ -3303,8 +3303,8 @@ func TestConfigRedactionLeavesCommentsAndBlanksAlone(t *testing.T) {
 
 func TestUUIDLikeRecognisesOnlyUUIDs(t *testing.T) {
 	yes := []string{
-		"187d8fa9-569b-49e4-bd00-bbb318a4f295",
-		`"187d8fa9-569b-49e4-bd00-bbb318a4f295"`,
+		"00000000-1111-2222-3333-444444444444",
+		`"00000000-1111-2222-3333-444444444444"`,
 	}
 	for _, v := range yes {
 		if !uuidLike(v) {
@@ -3313,7 +3313,7 @@ func TestUUIDLikeRecognisesOnlyUUIDs(t *testing.T) {
 	}
 	no := []string{"", "short", "187d8fa9-569b-49e4-bd00-bbb318a4f29",
 		"187d8fa9x569b-49e4-bd00-bbb318a4f295", "example.com",
-		"187d8fa9-569b-49e4-bd00-bbb318a4f2955"}
+		"00000000-1111-2222-3333-4444444444445"}
 	for _, v := range no {
 		if uuidLike(v) {
 			t.Errorf("uuidLike(%q) = true, want false", v)
