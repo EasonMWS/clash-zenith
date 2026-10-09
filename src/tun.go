@@ -706,19 +706,14 @@ func (a *App) runEnableTun(mode TunMode) {
 	// ownership decision, so this is not a shortcut around the checks; it is the
 	// path that does not need a prompt.
 	if serviceReachable() {
-		a.setTunStage("交由 Zenith 服务启用")
-		cfgNodes := a.mergedNodes()
-		cfgSettings := a.store.Settings()
-		cfg := BuildConfig(cfgNodes, a.optimizedNames(), cfgSettings,
-			a.secret, a.store.Snapshot().Current, a.dnsPort)
-		if err := validateCandidateConfig(cfg); err != nil {
-			txA.step("生成配置", "failed", err.Error())
-			txA.State = "failed"
-			txA.Failure = "生成的配置没有通过校验：" + err.Error()
-			a.saveTunTxn(txA)
-			a.failTun(fmt.Errorf("%s", txA.Failure))
-			return
-		}
+		// The mode is saved BEFORE the configuration is generated, not after.
+		//
+		// The order was the other way round, and the consequence is exact: enabling
+		// from off produced a configuration built from settings that still said off,
+		// so it had no tun block, and switching compat to privacy produced one that
+		// still carried the old strict-route. The service then started a core against
+		// a configuration that did not describe what was asked for.
+		a.setTunStage("保存目标设置")
 		if _, err := a.store.UpdateSettings(map[string]interface{}{
 			"tunMode":   string(mode),
 			"tunDevice": env.Adapter,
@@ -731,6 +726,43 @@ func (a *App) runEnableTun(mode TunMode) {
 			a.failTun(err)
 			return
 		}
+		saved := a.store.Settings()
+		txA.step("保存设置", "done", string(mode))
+		a.saveTunTxn(txA)
+
+		a.setTunStage("生成配置")
+		cfg := BuildConfig(a.mergedNodes(), a.optimizedNames(), saved,
+			a.secret, a.store.Snapshot().Current, a.dnsPort)
+		if err := validateCandidateConfig(cfg); err != nil {
+			txA.step("生成配置", "failed", err.Error())
+			txA.State = "failed"
+			txA.Failure = "生成的配置没有通过校验：" + err.Error()
+			a.saveTunTxn(txA)
+			a.failTun(fmt.Errorf("%s", txA.Failure))
+			return
+		}
+		// The same check the local path makes, for the same reason: a configuration
+		// that does not carry the mode that was asked for would start a core that
+		// cannot deliver it, and the failure would surface as "the adapter never
+		// appears" rather than as this sentence.
+		if mode != TunOff && !strings.Contains(cfg, "\ntun:\n") {
+			txA.step("生成配置", "failed", "配置里没有 tun 段")
+			txA.State = "failed"
+			txA.Failure = fmt.Sprintf("内部错误：模式已保存为 %s，但生成的配置里没有 tun 段", mode)
+			a.saveTunTxn(txA)
+			a.failTun(fmt.Errorf("%s", txA.Failure))
+			return
+		}
+		if err := a.applyCandidateConfig(cfg); err != nil {
+			txA.step("写入候选配置", "failed", err.Error())
+			txA.State = "failed"
+			txA.Failure = err.Error()
+			a.saveTunTxn(txA)
+			a.failTun(err)
+			return
+		}
+		txA.step("生成配置", "done", fmt.Sprintf("%d 字节，含 tun 段", len(cfg)))
+
 		txA.step("请求服务", "pending", "由常驻服务接管，无需再次授权")
 		a.saveTunTxn(txA)
 		if err := a.serviceStartRequest([]byte(cfg), mode); err != nil {
@@ -742,10 +774,45 @@ func (a *App) runEnableTun(mode TunMode) {
 			return
 		}
 		txA.step("请求服务", "done", "服务已带 TUN 配置启动内核")
+		a.saveTunTxn(txA)
+
+		// The service owns the core, but this process is the one that can see this
+		// machine's interfaces and routes - so the verification happens here, over the
+		// same evidence chain as the local path. Returning straight after the request
+		// meant the interface said "enabled" on the strength of a request that was
+		// accepted, which is the claim this program is not allowed to make.
+		a.setTunStage("验证流量是否经过隧道")
+		after := a.store.Settings()
+		venv := a.checkTunEnvironment()
+		venv.Adapter = after.NormalizedTunDevice()
+		venv.Stack = after.NormalizedTunStack()
+		venv.MixedPort = after.MixedPort
+		venv.DNSPort = a.dnsPort
+		traffic := a.VerifyTunTraffic(mode, venv)
+		if !traffic.OK {
+			txA.step("验证流量", "failed", traffic.Stage+": "+traffic.Detail)
+			txA.State = "failed"
+			txA.Failure = fmt.Sprintf("服务已启动内核，但流量没有经过隧道（%s）：%s",
+				traffic.Stage, traffic.Detail)
+			a.saveTunTxn(txA)
+			a.failTun(fmt.Errorf("%s", txA.Failure))
+			return
+		}
+		txA.step("验证流量", "done", traffic.DirectDetail+"；"+traffic.CoreDetail)
+
+		// Verified, so this is now the configuration worth going back to.
+		a.commitConfig(cfg)
 		txA.State = "done"
 		a.saveTunTxn(txA)
-		// The service owns the core; verifying the tunnel is the caller's job, since
-		// the evidence is gathered from this machine's interfaces and routes.
+		a.mu.Lock()
+		if a.tunRun != nil {
+			a.tunRun.Active = false
+			a.tunRun.Stage = "已启用"
+			a.tunRun.Error = ""
+		}
+		a.mu.Unlock()
+		Log("TUN enabled through the service in %s mode; adapter %q verified carrying traffic",
+			mode, after.NormalizedTunDevice())
 		return
 	}
 
@@ -756,8 +823,13 @@ func (a *App) runEnableTun(mode TunMode) {
 		if err := a.ensureService(); err == nil {
 			txA.step("安装服务", "done", "已安装并启动常驻服务，之后启用不再需要授权")
 			a.saveTunTxn(txA)
-			// Re-enter through the service path now that it exists.
-			go a.EnableTun(mode)
+			// Continue into the service path rather than calling EnableTun again.
+			//
+			// The re-entry hit the guard at the top of EnableTun - the outer call had
+			// already set Active - so the activation stopped with "already enabling,
+			// please wait" while nothing was running. The guard is right; calling
+			// through it was not.
+			go a.runEnableTun(mode)
 			return
 		} else {
 			txA.step("安装服务", "skipped", err.Error()+"；改用每次授权的方式")

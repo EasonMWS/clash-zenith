@@ -3399,3 +3399,90 @@ func TestAdapterLookupRefusesAnUnusableNameRatherThanPassingItOn(t *testing.T) {
 		t.Error("adapter removal accepted a name it should refuse")
 	}
 }
+
+// ---- the service path must run the same state machine ----------------------
+
+func TestServicePathSavesTheModeBeforeGeneratingTheConfig(t *testing.T) {
+	// The order was the other way round, and the consequence was exact: enabling from
+	// off produced a configuration built from settings that still said off, so it had
+	// no tun block; switching compat to privacy produced one that still carried the
+	// old strict-route. The service then started a core against a configuration that
+	// did not describe what was asked for.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	start := strings.Index(text, "if serviceReachable() {")
+	if start < 0 {
+		t.Fatal("the service path is missing")
+	}
+	end := strings.Index(text[start:], "txA.step(\"请求服务\", \"pending\"")
+	if end < 0 {
+		t.Fatal("could not find the end of the service path's preparation")
+	}
+	block := text[start : start+end]
+
+	save := strings.Index(block, "UpdateSettings")
+	build := strings.Index(block, "BuildConfig")
+	if save < 0 || build < 0 {
+		t.Fatal("the block does not both save and build")
+	}
+	if save > build {
+		t.Error("the configuration is generated before the mode is saved, so it " +
+			"describes the previous mode rather than the requested one")
+	}
+}
+
+func TestServicePathVerifiesBeforeClaimingSuccess(t *testing.T) {
+	// Returning straight after the request meant the interface said "enabled" on the
+	// strength of a request that was accepted. That is the claim this program is not
+	// allowed to make.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	start := strings.Index(text, "if serviceReachable() {")
+	end := strings.Index(text[start:], "\n\t// No service yet.")
+	if end < 0 {
+		t.Fatal("could not find the end of the service path")
+	}
+	block := text[start : start+end]
+
+	if !strings.Contains(block, "VerifyTunTraffic(") {
+		t.Error("the service path does not verify the traffic before reporting success")
+	}
+	if !strings.Contains(block, "commitConfig(") {
+		t.Error("the service path does not commit the verified configuration")
+	}
+	if !strings.Contains(block, "a.tunRun.Active = false") {
+		t.Error("the service path does not clear the running flag, so the interface " +
+			"would stay in the running state after success")
+	}
+	// And the guard that the mode actually reached the configuration.
+	if !strings.Contains(block, "tun:") {
+		t.Error("the service path does not check that the generated configuration " +
+			"carries the mode it was asked for")
+	}
+}
+
+func TestNothingReEntersEnableTun(t *testing.T) {
+	// The re-entry hit the guard at the top of EnableTun - the outer call had already
+	// set Active - so the activation stopped with "already enabling, please wait"
+	// while nothing was running. The guard is right; calling through it was not.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	// The only call to EnableTun should be from the HTTP handler, which is where a
+	// user action arrives. A call from inside the activation is the defect.
+	if strings.Contains(text, "go a.EnableTun(") {
+		t.Error("the activation re-enters EnableTun, which its own guard refuses")
+	}
+	// The route out of the install branch is the internal function instead.
+	if !strings.Contains(text, "go a.runEnableTun(mode)") {
+		t.Error("the install branch should continue into the same state machine")
+	}
+}
