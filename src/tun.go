@@ -609,6 +609,41 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) {
 	}
 	txB.step("保存设置", "done", string(mode))
 
+	// Write the configuration here, explicitly.
+	//
+	// This used to be left to ApplySettings, which rewrites the configuration when
+	// one of a list of keys changes. That list did not include the TUN settings, so
+	// enabling TUN stored the mode and then restarted the core against a file with
+	// no tun block in it - twice, and the second time even after the list was
+	// fixed. Making the activation depend on a side effect of a settings function
+	// was the actual mistake: an activation that must produce a specific file
+	// should say so, and should fail loudly if it cannot.
+	cfgNodes := a.mergedNodes()
+	cfgSettings := a.store.Settings()
+	cfg := BuildConfig(cfgNodes, a.optimizedNames(), cfgSettings,
+		a.secret, a.store.Snapshot().Current, a.dnsPort)
+	if err := validateCandidateConfig(cfg); err != nil {
+		rollback(fmt.Errorf("生成的 TUN 配置没有通过校验：%v", err))
+		return
+	}
+	if !strings.Contains(cfg, "\ntun:\n") {
+		// The one condition this whole path exists for. Checking it here rather
+		// than trusting the generator means a future change cannot silently bring
+		// TUN back to "the adapter never appears".
+		rollback(fmt.Errorf("内部错误：设置已保存为 %s，但生成的配置里没有 tun 段", mode))
+		return
+	}
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o644); err != nil {
+		rollback(fmt.Errorf("无法写入 TUN 配置：%v", err))
+		return
+	}
+	// Keep the known-good copy in step, so a later rollback restores something
+	// real rather than the pre-TUN file.
+	if err := os.WriteFile(a.goodConfigPath(), []byte(cfg), 0o644); err != nil {
+		Log("could not update the known-good copy after writing the TUN config: %v", err, "WARN")
+	}
+	txB.step("写入 TUN 配置", "done", fmt.Sprintf("%d 字节，含 tun 段", len(cfg)))
+
 	// The core is restarted rather than reloaded: the TUN inbound is created at
 	// startup, and a hot reload will not bring an adapter up.
 	a.setTunStage("重建内核以启用 TUN")

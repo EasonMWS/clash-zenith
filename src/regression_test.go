@@ -1391,3 +1391,41 @@ func TestTunModeProducesATunBlockInTheGeneratedConfig(t *testing.T) {
 		t.Errorf("the generated TUN configuration is not valid: %v", err)
 	}
 }
+
+func TestApplySettingsRewritesConfigForTunMode(t *testing.T) {
+	// End to end through the real store: change the TUN mode the way the
+	// activation does, and confirm the generated configuration gains a tun block.
+	// The earlier tests asserted the trigger list and the generator separately;
+	// this asserts the join, which is where the failure actually was.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateSettings(map[string]interface{}{
+		"tunMode": "compat", "tunDevice": "Zenith", "tunStack": "gvisor",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := st.Settings()
+	if got.TunMode != TunCompat {
+		t.Fatalf("tunMode = %q, want compat", got.TunMode)
+	}
+	if got.TunDevice != "Zenith" {
+		t.Errorf("tunDevice = %q, want Zenith", got.TunDevice)
+	}
+	if got.TunStack != "gvisor" {
+		t.Errorf("tunStack = %q, want gvisor", got.TunStack)
+	}
+
+	a := &App{dataDir: dir, store: st}
+	cfg := BuildConfig([]Proxy{{Name: "n", Type: "socks5", Server: "1.2.3.4", Port: 1080}},
+		[]string{"n"}, got, "s", "n", 8199)
+	if !strings.Contains(cfg, "\ntun:\n") {
+		t.Error("the stored settings did not produce a tun block")
+	}
+	if !strings.Contains(cfg, "device: \"Zenith\"") {
+		t.Error("the tun block does not name the adapter the activation waited for")
+	}
+	_ = a
+}
