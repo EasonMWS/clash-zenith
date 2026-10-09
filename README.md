@@ -159,23 +159,50 @@ The system proxy only reaches applications that read it — not games, not raw U
 not anything with its own network stack. TUN closes that gap by putting a virtual
 adapter in front of the traffic.
 
-**One click, and the rest is automatic.** On a machine that has never had a VPN
-client, pressing enable does all of this without any manual step:
+**Authorise once, and after that it is a switch.** The first time you enable TUN,
+Zenith asks for one elevation prompt and uses it to install a small resident
+service. That service holds the core from then on. Every later enable is an
+authenticated request to a running service, not another prompt.
+
+The service exists because of a real failure. The core used to belong to whichever
+process was running, which stopped being one answer the moment elevation was
+involved: the ordinary instance started a core, the elevated helper stopped it to
+take the ports, started its own, then stopped that one on the way out and expected
+the first instance to notice and start another. Two processes, two control secrets,
+one configuration file. The results were a tunnel torn down by the helper leaving,
+an instance with no rights to take over what had been built, and — because the
+secrets differed — a core that was plainly running reported as unavailable.
+
+**The whole flow, in order:**
 
 1. Checks the architecture, the OS, your node set, and any other tunnel already
    present — before asking for a password, so a machine that cannot support TUN is
    told that first.
-2. Verifies the Wintun driver **by SHA-256 and Authenticode signature**, not by
-   file name. A substituted file, or one borrowed from another VPN's directory, is
-   refused.
-3. Raises one elevation prompt. Only that one; declining it stops the process and
-   nothing is retried.
-4. Starts the core with TUN, waits for the adapter **by name from the OS**, and
-   then makes a real HTTP request through the tunnel.
+2. Checks that the core can actually create an adapter: the binary is present, is
+   this architecture, and is the version the rest of the program was written
+   against. It reads the version out of the file without running it.
+3. Raises one elevation prompt, and uses it to install the resident service. Only
+   that one; declining it stops the process and nothing is retried. If the service
+   cannot be installed, the activation falls back to a per-activation prompt, so a
+   machine without the service still works.
+4. Writes a candidate configuration, starts the core against it, and waits for the
+   adapter **by name from the OS** rather than assuming a sleep was long enough.
+5. Proves the traffic goes through the tunnel, in the order the packets travel: the
+   adapter is up, the default route points into it, a request leaves this process
+   with **no proxy configured anywhere**, and the core's own connection table shows
+   it carried that request. DNS, IPv6 and UDP are checked against what the mode
+   promises.
 
-If any step fails it rolls back exactly what it changed and says why. The adapter
-is removed, the mode returns to off, and nothing is reported as working when it is
-not.
+If any step fails it says which one and why. The adapter is removed, the previous
+configuration is restored and read back to confirm it matches, and the mode returns
+to off. Nothing is reported as working when it is not.
+
+**On the driver.** Zenith does not require you to place a `wintun.dll` anywhere.
+mihomo carries its own — measured: with no `wintun.dll` beside it, and again with a
+four-kilobyte junk file of that name in its place, it produced identical output and
+still reached `configure tun interface: Access is denied`. It never opens that file.
+Earlier versions checked for it and told you your build was incomplete, which was
+wrong.
 
 **Three states, described honestly:**
 
@@ -183,15 +210,27 @@ not.
 |---|---|
 | System proxy | Only applications that honour the system proxy are routed. Games and UDP go direct |
 | TUN takeover (compat) | Supported traffic is taken over and your rules still apply. **Direct is still allowed** — this is not "everything is proxied" and there is no kill switch |
-| Privacy | Protected traffic may only leave through an approved route, and a dropped connection keeps refusing rather than falling back to direct. Leaving this state is a decision you make explicitly |
+| Privacy | Protected traffic may only leave through an approved route, and a dropped connection keeps refusing rather than falling back to direct. Leaving this state is a decision you make explicitly, and **a failed activation never lifts the block for you** |
 
 **Uninstall removes only Zenith's own adapter.** The driver file is deliberately
 left in place, because another application may be using the same one.
 
-**What is not verified.** The one-click flow requires an interactive UAC approval,
-so the elevated path has been verified by construction and by unit tests, not by a
-person clicking through it on a clean machine. That end-to-end acceptance run is
-still outstanding, and is listed as such in the CHANGELOG.
+**What is not verified, stated plainly.**
+
+- **The service registration and the one-authorisation install have not been run
+  end to end.** They need an interactive UAC approval this environment cannot
+  answer — `sc create` returns `Access is denied` without it. The registration code
+  is written and reviewed; the channel itself is verified (`/alive` answers without
+  a credential, everything that acts returns 401 without one and 200 with it), and
+  the fallback path is verified, since that is what runs on a machine with no
+  service.
+- **A TUN activation has never completed successfully.** Each attempt stopped at a
+  specific, explainable cause, and each cause was found and fixed — the dispatch
+  order, the wrong root directory, two processes fighting for the core, a settings
+  key missing from the reload list, a known-good configuration overwritten before
+  it was proven. But the success state itself has not been observed.
+- **Privacy mode has not been tested against a determined bypass**, and neither have
+  sleep/wake, multiple network adapters, or coexistence with another VPN.
 
 ### What this does not do
 
@@ -401,7 +440,7 @@ Cloudflare 是 Anycast。同一个边缘 IP 在不同时段可能被调度到不
 客户端。如果按通用客户端来评判，它是一个人对着
 [clash-verge-rev](https://github.com/clash-verge-rev/clash-verge-rev)（14.9 万星）和
 [FlClash](https://github.com/chen08209/FlClash)（5.4 万星）写的项目：没有 macOS 和
-Linux、没有 TUN 模式、没有插件生态、没有测试。
+Linux、没有插件生态、没有界面主题、没有多语言，**TUN 接管有实现但从未成功跑通过一次**。
 
 但如果按"让我的 Cloudflare 中转真的快起来"来评判，它做到了主流客户端交给外部脚本
 去做的那件事。
@@ -418,6 +457,7 @@ Linux、没有 TUN 模式、没有插件生态、没有测试。
 | **尊重你的手动选择** | 点选的节点会保持一段时间。自动挑只在已验证的边缘之间做选择，不会否决你 |
 | **支持混合订阅** | 每个 WebSocket 中转各优选一批；直连节点（trojan / ss / hysteria2）原样保留 |
 | **零安装** | 一个可执行文件加内核，无运行时、无依赖 |
+| **TUN 接管** | 覆盖不读系统代理的流量（游戏、原始 UDP）。**授权一次之后就是一个开关**，见下节 |
 | **常驻系统托盘** | 关掉窗口程序不退出。右键托盘图标：打开窗口、切换模式、开关系统代理、立即优选、退出 |
 | **不会多弹命令行** | 编译为 GUI 子系统程序，双击只出界面 |
 | **切节点不重启内核** | 走内核 API，窗口不会闪，已建立的连接不会被断 |
@@ -430,13 +470,73 @@ Linux、没有 TUN 模式、没有插件生态、没有测试。
 | **真的只在本地** | 每个 API 路由都要求当次启动生成的令牌，Host 必须是回环地址，跨源请求被拒，写操作必须是 JSON |
 | **内置日志** | 应用日志和内核日志都能在界面里看 |
 
+### TUN 接管
+
+系统代理只能覆盖读它的程序——游戏不行，原始 UDP 不行，自带网络栈的都不行。
+TUN 在流量前面放一块虚拟网卡来补上这个缺口。
+
+**授权一次，之后它就是一个开关。** 第一次启用会要一次管理员授权，用这次授权安装一个
+小的常驻服务，由它持有内核。之后每次启用都是**向已在运行的服务发一个经认证的请求**，
+不再弹授权框。
+
+为什么要这个服务：内核原来属于"当时在跑的那个进程"。一旦涉及提权，这句话就有了两个答案——
+普通实例起了一个内核，提权助手为了拿端口把它停掉、起自己的，退出前又停掉自己的，
+然后指望第一个实例"下一 tick 注意到"再起一个。两个进程、两个控制密码、一个配置文件。
+后果是：**刚建好的隧道被助手退出时停掉**、**普通实例没权限接管助手建好的东西**、
+以及**因为密码不一致，内核明明在跑却被报告成不可用**。
+
+**完整流程，按顺序：**
+
+1. 先查架构、系统、节点集、已有的其他隧道——**在要密码之前**，所以不支持 TUN 的机器
+   在这一步就被明确告知。
+2. 查内核**能不能真的创建网卡**：文件在不在、是不是这个架构、是不是程序对应的版本。
+   版本是从文件里读出来的，不运行它。
+3. 弹**一次**授权，用它安装常驻服务。只有这一次；拒绝就停下，没有任何重试。
+   如果服务装不上，激活会回退到"每次授权"的老方式——**没装服务的机器仍然能用**。
+4. 写一份**候选配置**，用它启动内核，然后**按名字向系统查询网卡**是否出现，
+   而不是猜一个睡眠时间够不够。
+5. **按包经过的顺序证明流量真的进了隧道**：网卡已启用 → 默认路由指向它 →
+   本进程在**没有任何代理设置**的情况下发出请求 → 内核自己的连接表里有这次请求。
+   DNS、IPv6、UDP 按所选模式的要求分别检查。
+
+任何一步失败都会**说清是哪一步、为什么**。删掉本次创建的网卡，**恢复之前的配置并读回比对确认**，
+模式回到关闭。**没做到的事绝不会被报成成功。**
+
+**关于驱动**：Zenith 不需要你手动放 `wintun.dll`。mihomo 自带——这是实测的：
+内核旁边完全没有 `wintun.dll`，和放一个 4KB 的垃圾文件冒充它，**输出完全一样**，
+都到达 `configure tun interface: Access is denied`。它根本不读那个文件。
+早先的版本会检查它，然后告诉你"这个构建不完整"——那是错的。
+
+**三种状态，分别描述：**
+
+| 状态 | 含义 |
+|---|---|
+| 系统代理 | 只有遵循系统代理的应用被路由，游戏和 UDP 直连 |
+| TUN 接管（兼容） | 接管支持范围内的流量并仍按规则分流，**仍允许直连**——不等于"全部流量经代理"，也没有 Kill Switch |
+| 隐私保护 | 受保护流量只走批准线路，断线保持阻断而不是回退直连。退出保护必须你主动确认，**失败的激活永远不会替你解除阻断** |
+
+**卸载只删除 Zenith 自己的网卡。** 驱动文件**故意不删**，因为别的软件可能正在用同一个。
+
+**哪些没有验证，如实写在这里：**
+
+- **服务向 Windows 服务管理器的注册、以及"一次授权完成安装"的端到端流程没有实测。**
+  它们需要交互式 UAC 确认，当前环境答不了——没有它 `sc create` 返回 `Access is denied`。
+  注册代码写完并审过；**通道本身验证过了**（`/alive` 无凭据返回 200，
+  所有会改变状态的端点无凭据返回 401、正确凭据返回 200），**回退路径也验证过了**，
+  因为没装服务的机器跑的就是它。
+- **TUN 激活从未成功完成过一次。** 每次尝试都停在一个具体、可解释的原因上，
+  每个原因都定位并修复了——分派顺序、根目录错误、两个进程抢内核、设置项漏在重载列表外、
+  回滚用的配置在验证前就被覆盖。**但"成功"这个状态本身没有被观测到。**
+- **隐私模式没有做过对抗性旁路测试**，睡眠唤醒、多网卡、与其他 VPN 共存也都没有实测。
+
 ### 这个软件做不到什么
 
 写在这里，是因为一个夸大口径的代理客户端比一个功能少的更糟：
 
-- **它是系统代理客户端，不是整机隧道。** 不读系统代理的程序——大多数游戏、
-  任何走原始 UDP 的东西、任何自带网络栈的软件——都会直连。目前还没有 TUN 模式，
-  所以这里没有任何东西是"整机保证"。
+- **默认是系统代理客户端，不是整机隧道。** 不读系统代理的程序——大多数游戏、
+  任何走原始 UDP 的东西、任何自带网络栈的软件——都会直连。**TUN 接管能覆盖这部分**，
+  但它需要一次管理员授权来安装常驻服务，而且**它从未被成功跑通过一次**（见上）。
+  除此之外，这里没有任何东西是"整机保证"。
 - **嗅探不是拦截。** 流量嗅探能从**已经进入内核**的连接里还原出域名，好让规则匹配它。
   它管不了根本没进内核的流量。
 - **一次出口检测成功不代表 DNS 干净。** 出口 IP 和 DNS 是某一时刻的抽样，
