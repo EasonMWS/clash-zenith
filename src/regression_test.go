@@ -2903,3 +2903,104 @@ func TestNoRuntimeFileIsTrackedByGit(t *testing.T) {
 			"reached a public repository. Add it to .gitignore.", strings.TrimPrefix(f, "data/"))
 	}
 }
+
+// ---- the privacy block must be a system policy, not a declaration ----------
+
+func TestPrivacyBlockHasNoExecutionPathByAccident(t *testing.T) {
+	// The setting existed and nothing read it. That is the defect this file fixes,
+	// and it is worth a test that fails if the block is ever disconnected from the
+	// paths that establish it - a security control that is only declared is worse
+	// than one that is absent, because the interface reports it as on.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "ApplyPrivacyBlock(") {
+		t.Error("the privacy activation does not establish the block")
+	}
+	if !strings.Contains(text, "ReleasePrivacyBlock(") {
+		t.Error("nothing releases the block, so it could never be turned off")
+	}
+	// And the rollback must check whether it is still enforced rather than assert
+	// that it is.
+	if !strings.Contains(text, "PrivacyBlockEnforced()") {
+		t.Error("the rollback does not verify the block survived a failed activation")
+	}
+}
+
+func TestPrivacyBlockRuleNamesAreScopedToThisProgram(t *testing.T) {
+	// The rules are found by exact name. A prefix match would risk deleting a rule
+	// belonging to something else, the same way an adapter is matched by name.
+	names := blockRuleNames()
+	if len(names) != 2 {
+		t.Fatalf("expected two rules (one per direction), got %d", len(names))
+	}
+	for _, n := range names {
+		if !strings.HasPrefix(n, blockRulePrefix) {
+			t.Errorf("rule %q does not carry the prefix %q", n, blockRulePrefix)
+		}
+		if !strings.Contains(n, "Zenith") {
+			t.Errorf("rule %q does not name this program", n)
+		}
+	}
+	// Both directions, because an outbound block alone leaves an established
+	// inbound connection carrying replies.
+	joined := strings.Join(names, " ")
+	if !strings.Contains(joined, "(in)") || !strings.Contains(joined, "(out)") {
+		t.Errorf("the block must cover both directions, got %v", names)
+	}
+}
+
+func TestPrivacyBlockStatusReportsEnforcedNotRequested(t *testing.T) {
+	// The interface decides whether to say "protected" from this. Reporting the
+	// setting instead of the system would reproduce the original defect in a new
+	// place: a claim of protection backed by nothing.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateSettings(map[string]interface{}{"tunMode": string(TunPrivacy)}); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st}
+
+	got := a.PrivacyBlockStatus()
+	if !got.Requested {
+		t.Fatal("privacy mode with block-on-failure should be reported as requested")
+	}
+	if got.CheckedAt == "" {
+		t.Error("the status should record when it was read")
+	}
+	// This test runs without elevation, so the rules cannot be installed. The point
+	// is which field carries the answer: Enforced must reflect the system, and the
+	// detail must say plainly that the two disagree.
+	if got.Enforced {
+		t.Skip("firewall rules are present on this machine; the disagreement case cannot be exercised")
+	}
+	if got.Detail == "" {
+		t.Error("a disagreement between the setting and the system must be explained")
+	}
+	if !strings.Contains(got.Detail, "不受阻断保护") && !strings.Contains(got.Detail, "防火墙规则") {
+		t.Errorf("the detail should name the condition, got %q", got.Detail)
+	}
+}
+
+func TestPrivacyBlockStatusQuietWhenNothingIsAsked(t *testing.T) {
+	// With TUN off there is nothing to protect, and the status should not read as a
+	// warning.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st}
+	got := a.PrivacyBlockStatus()
+	if got.Requested {
+		t.Error("nothing was asked for")
+	}
+	if got.Enforced {
+		t.Error("no rules should be present in a fresh data directory")
+	}
+}

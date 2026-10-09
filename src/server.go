@@ -210,11 +210,15 @@ func isLoopbackHost(host string) bool {
 func (s *Server) handleTunCheck(w http.ResponseWriter, r *http.Request) {
 	env := s.app.checkTunEnvironment()
 	writeJSON(w, 200, map[string]interface{}{
-		"ok":     true,
-		"env":    env,
-		"run":    s.app.TunRunState(),
-		"mode":   s.app.store.Settings().TunMode,
-		"labels": tunModeLabels(),
+		"ok":  true,
+		"env": env,
+		"run": s.app.TunRunState(),
+		// What is enforced, not what was requested. The interface says "protected"
+		// from this field, so it has to come from the system rather than from the
+		// setting that asked for it.
+		"privacyBlock": s.app.PrivacyBlockStatus(),
+		"mode":         s.app.store.Settings().TunMode,
+		"labels":       tunModeLabels(),
 	})
 }
 

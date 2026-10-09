@@ -973,6 +973,18 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 		Log("TUN 提示：%s", traffic.IPv6)
 	}
 
+	// Privacy mode's block goes in before the configuration is committed, because
+	// it is part of what "protected" means and a commit that skipped it would
+	// record a success the machine does not back up.
+	if mode == TunPrivacy {
+		a.setTunStage("建立独立于内核的阻断")
+		if err := ApplyPrivacyBlock("privacy mode activation"); err != nil {
+			return rollback(fmt.Errorf("隐私模式需要建立阻断，但防火墙规则没有建立成功：%v。"+
+				"没有阻断的隐私模式只是普通 TUN，所以这次激活按失败处理", err))
+		}
+		txB.step("建立阻断", "done", "防火墙规则已建立并读回确认；它不依赖内核存活")
+	}
+
 	// Only now, with the adapter carrying traffic, is this configuration the one
 	// worth going back to. A failure after this point would otherwise roll back to
 	// the file that was just overwritten.
@@ -1054,6 +1066,13 @@ func (a *App) releasePrivacyBlock(reason string) error {
 	if st.TunMode != TunPrivacy {
 		return nil
 	}
+	// Release the system policy first, then the setting. In that order, because the
+	// setting is what the interface reads to decide whether to say "protected": a
+	// failure between the two leaves a setting that asks for a block with no block
+	// behind it, which the status reports as a disagreement rather than as safety.
+	if err := ReleasePrivacyBlock(reason); err != nil {
+		return err
+	}
 	Log("privacy block released explicitly: %s", reason, "WARN")
 	_, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)})
 	return err
@@ -1106,11 +1125,33 @@ func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 
 	// 2. Mode off, unless this is privacy mode and the block must stand.
 	if privacy {
-		txB.Steps = append(txB.Steps, tunStep{
-			Name: "隐私阻断", State: "done",
-			Detail: "隐私模式的阻断保持不变；解除保护需要你明确确认，" +
-				"不会因为一次失败的激活而自动放开", At: time.Now(),
-		})
+		// The block is deliberately left standing, and now that it is a real
+		// firewall policy this sentence describes something rather than asserting
+		// it. Restoring connectivity is not an improvement when it restores it
+		// unprotected, and a failed enable must not be the event that quietly
+		// removes the protection the user asked for.
+		enforced, _, err := PrivacyBlockEnforced()
+		switch {
+		case err != nil:
+			txB.Steps = append(txB.Steps, tunStep{
+				Name: "隐私阻断", State: "failed",
+				Detail: "无法确认阻断是否仍在生效：" + err.Error(), At: time.Now(),
+			})
+		case enforced:
+			txB.Steps = append(txB.Steps, tunStep{
+				Name: "隐私阻断", State: "done",
+				Detail: "阻断仍然生效（防火墙规则在读回时存在）。这次激活失败了，" +
+					"但保护没有被解除——解除必须是你的明确操作", At: time.Now(),
+			})
+		default:
+			// The one case that must never be reported as fine.
+			txB.Steps = append(txB.Steps, tunStep{
+				Name: "隐私阻断", State: "failed",
+				Detail: "隐私模式要求阻断，但防火墙规则不在。当前流量不受阻断保护。" +
+					"重新启用一次隐私模式会重新建立它", At: time.Now(),
+			})
+			txB.RestoreFailure = "隐私阻断未生效"
+		}
 		// The candidate configuration is gone, so the core must be started from the
 		// restored one. The mode stays privacy, so the block is re-armed by the
 		// configuration the user already had.
@@ -1181,6 +1222,11 @@ func (a *App) DisableTun(releasePrivacy bool) error {
 	}
 	if st.TunMode == TunPrivacy && !releasePrivacy {
 		return fmt.Errorf("当前是隐私保护模式：请先确认要退出保护并恢复常规联网")
+	}
+	if st.TunMode == TunPrivacy {
+		if err := ReleasePrivacyBlock("TUN disable"); err != nil {
+			return err
+		}
 	}
 	if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
 		return err
