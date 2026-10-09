@@ -16,7 +16,7 @@ import (
 
 const (
 	AppName    = "Zenith"
-	AppVersion = "1.2.0"
+	AppVersion = "1.2.1"
 
 	// coreStartGrace is how long the watchdog waits before it decides the core
 	// is broken. A first run against an empty data directory downloads the rule

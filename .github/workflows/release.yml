@@ -83,22 +83,44 @@ jobs:
           $v = & .\Zenith.exe -version
           Write-Host $v
           if ($v -notmatch 'Zenith') { throw "the binary does not run" }
+
           # The pre-parse dispatch must be reachable. It used to sit after
           # flag.Parse, which exits with status 2 on an unknown flag, so the
           # watchdog helper died on its own argument and the crash protection
           # silently did not exist.
           #
-          # The check uses the inert entry point rather than the watchdog itself:
-          # running the real watchdog would clear a system proxy that points at a
-          # dead port, and a build check must not be able to change the machine it
-          # runs on.
-          $s = & .\Zenith.exe -self-test
-          Write-Host $s
-          if ($LASTEXITCODE -ne 0) { throw "the pre-parse dispatch is not reachable" }
+          # This is checked on a console build of the same source. The shipped
+          # binary is GUI-subsystem, and a GUI process started from a console does
+          # not attach to it: its output cannot be captured and its exit status
+          # does not come back reliably. Behaviour is therefore verified on a build
+          # where a console exists, and the artefact itself is checked separately
+          # by looking for the marker in the binary.
+          #
+          # The inert entry point is used rather than the real watchdog: running
+          # that would clear a system proxy pointing at a dead port, and a build
+          # check must not be able to change the machine it runs on.
+          Push-Location src
+          try {
+            $env:CGO_ENABLED = '0'
+            go build -o ../Zenith-console.exe .
+            if ($LASTEXITCODE -ne 0) { throw "console build failed" }
+          } finally { Pop-Location }
+
+          $s = & .\Zenith-console.exe -self-test 2>&1 | Out-String
+          Write-Host "self-test output: $s"
+          if ($LASTEXITCODE -ne 0) { throw "the pre-parse dispatch is not reachable (exit $LASTEXITCODE)" }
           if ($s -notmatch 'selftest ok') { throw "unexpected self-test output: $s" }
-          # And the watchdog argument itself must be recognised as such.
-          $w = & .\Zenith.exe -self-test -watchdog "$env:TEMP\zenith-smoke" 7999
+
+          $w = & .\Zenith-console.exe -self-test -watchdog "$env:TEMP\zenith-smoke" 7999 2>&1 | Out-String
+          Write-Host "watchdog-shape output: $w"
           if ($w -notmatch 'watchdog=true') { throw "the watchdog invocation is not recognised: $w" }
+
+          # And the shipped GUI binary must carry the same dispatch.
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path .\Zenith.exe))
+          if ([System.Text.Encoding]::ASCII.GetString($bytes) -notmatch 'selftest ok') {
+            throw "the shipped binary does not contain the pre-parse dispatch"
+          }
+          Remove-Item .\Zenith-console.exe -Force -ErrorAction SilentlyContinue
           Write-Host "pre-parse dispatch is reachable and the watchdog is recognised"
 
       - name: Package
