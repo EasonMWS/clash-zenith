@@ -21,6 +21,7 @@ package main
 // ---------------------------------------------------------------------------
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -34,7 +35,10 @@ import (
 	"unsafe"
 )
 
-const defaultTunDevice = "Zenith"
+// defaultTunDevice is the name this program creates and owns. It aliases the
+// store constant so the settings migration, the environment check and the adapter
+// lookup cannot drift apart.
+const defaultTunDevice = tunDefaultDevice
 
 // ---- component manifest ---------------------------------------------------
 
@@ -153,13 +157,17 @@ func short(s string) string {
 // each carries a reason rather than a bare false, because "TUN failed" with no
 // explanation is the thing this is meant to avoid.
 type tunEnvironment struct {
-	OK        bool              `json:"ok"`
-	Blockers  []string          `json:"blockers"`
-	Warnings  []string          `json:"warnings"`
-	Admin     bool              `json:"admin"`
-	Arch      string            `json:"arch"`
-	OS        string            `json:"os"`
-	Adapter   string            `json:"adapter,omitempty"`
+	OK       bool     `json:"ok"`
+	Blockers []string `json:"blockers"`
+	Warnings []string `json:"warnings"`
+	Admin    bool     `json:"admin"`
+	Arch     string   `json:"arch"`
+	OS       string   `json:"os"`
+	Adapter  string   `json:"adapter,omitempty"`
+	// Stack is the normalized protocol stack, taken from the same source as
+	// Adapter, so the environment check, the generated configuration and the
+	// adapter lookup cannot disagree about what was decided.
+	Stack     string            `json:"stack,omitempty"`
 	Component tunComponentState `json:"component"`
 	Others    []string          `json:"otherVpns,omitempty"`
 	Nodes     int               `json:"availableNodes"`
@@ -210,31 +218,72 @@ func (a *App) checkTunEnvironment() tunEnvironment {
 	env.Checks["架构"] = env.Arch
 
 	// Component integrity, by content.
+	//
+	// What is checked here is the external wintun copy that ships beside the core.
+	// It is worth checking - a program should not load a DLL it cannot account for
+	// - but it is NOT what makes TUN work, and it must never be allowed to block on
+	// its absence. Measured behaviour: with no wintun.dll next to mihomo.exe at
+	// all, and again with a junk file of that name in its place, the core produced
+	// byte-identical output and still reached "configure tun interface: Access is
+	// denied". It never touches the file; the wintun driver it uses is embedded in
+	// the binary and loaded from memory.
+	//
+	// This matters because the check used to block on that file. A user whose core
+	// was perfectly capable was told the build was incomplete and to download it
+	// again, which is the failure the review called out: it verified a file rather
+	// than the capability.
 	m, err := loadManifest(a.rootDir)
 	if err != nil {
-		env.Blockers = append(env.Blockers, err.Error())
-	} else {
+		// A missing manifest is a packaging defect worth stating, but it says
+		// nothing about whether this core can create an adapter, so it does not
+		// block. It is reported as a warning and the run continues.
+		if manifestBlocksTun(err) {
+			env.Blockers = append(env.Blockers, err.Error())
+		} else {
+			env.Warnings = append(env.Warnings,
+				"外置 TUN 组件清单缺失（"+err.Error()+"）。这不影响内核启用 TUN —— "+
+					"内核使用内嵌的 wintun 驱动，外置文件只是随包附带的副本。")
+		}
+	} else if len(m.Components) > 0 {
 		env.Component = verifyTunComponent(a.rootDir, m.Components[0])
-		if !env.Component.Verified {
+		env.Checks["组件"] = fmt.Sprintf("%s %s", env.Component.Name, env.Component.Version)
+		if componentBlocksTun(env.Component) {
 			env.Blockers = append(env.Blockers,
 				"TUN 组件未通过校验："+env.Component.Detail)
-		}
-		env.Checks["组件"] = fmt.Sprintf("%s %s", env.Component.Name, env.Component.Version)
-		if env.Component.Signed {
-			env.Checks["组件签名"] = env.Component.Signer
+		} else if env.Component.Verified {
+			if env.Component.Signed {
+				env.Checks["组件签名"] = env.Component.Signer
+			} else {
+				env.Warnings = append(env.Warnings, "组件摘要正确，但未能确认数字签名")
+			}
 		} else {
-			env.Warnings = append(env.Warnings, "组件摘要正确，但未能确认数字签名")
+			// Present but not matching. This is still not a blocker for TUN, but it
+			// is worth saying loudly: something put a file of that name where the
+			// core's directory is, and it is not the one this build shipped.
+			env.Warnings = append(env.Warnings,
+				"外置 TUN 组件与清单不一致："+env.Component.Detail+
+					"。这不影响内核启用 TUN（内核用内嵌驱动），但如果这不是你有意替换的，建议重新下载发布包。")
 		}
 	}
 
-	// The core must actually be able to load it. Presence on disk is not proof:
-	// the file has to be next to the core binary, because the loader searches the
-	// executable's own directory first.
-	coreDir := filepath.Join(a.rootDir, "core")
-	if _, err := os.Stat(filepath.Join(coreDir, "mihomo.exe")); err != nil {
+	// What actually decides whether TUN can work on this machine: a core binary
+	// that exists, matches this architecture, and is the version the rest of the
+	// program was written against.
+	corePath := filepath.Join(a.rootDir, "core", "mihomo.exe")
+	if _, err := os.Stat(corePath); err != nil {
 		env.Blockers = append(env.Blockers, "找不到 core/mihomo.exe")
 	} else {
-		env.Checks["内核"] = "已找到 core/mihomo.exe"
+		arch, ver := coreBuildInfo(corePath)
+		if arch != "" {
+			if arch != "amd64" {
+				env.Blockers = append(env.Blockers,
+					fmt.Sprintf("内核是 %s 架构，无法在这台 %s 机器上创建网卡", arch, env.Arch))
+			} else {
+				env.Checks["内核"] = "mihomo " + ver + " (" + arch + ")"
+			}
+		} else {
+			env.Checks["内核"] = "已找到 core/mihomo.exe"
+		}
 	}
 
 	// Routing needs at least one usable node; starting a tunnel that cannot carry
@@ -265,14 +314,90 @@ func (a *App) checkTunEnvironment() tunEnvironment {
 	if !env.Admin {
 		env.Actions = append(env.Actions, "需要管理员授权以创建虚拟网卡并配置路由")
 	}
-	if st.TunDevice == "" {
-		st.TunDevice = defaultTunDevice
-	}
-	env.Adapter = st.TunDevice
-	env.Checks["网卡名"] = st.TunDevice
+	// The normalized values, not the raw settings. The check, the generated
+	// configuration, the adapter creation and the adapter lookup all read these,
+	// so a settings file with an empty device name is repaired once and every
+	// stage agrees on the result.
+	env.Adapter = st.NormalizedTunDevice()
+	env.Stack = st.NormalizedTunStack()
+	env.Checks["网卡名"] = env.Adapter
+	env.Checks["协议栈"] = env.Stack
 
 	env.OK = len(env.Blockers) == 0
 	return env
+}
+
+// componentBlocksTun reports whether a component state must stop the activation.
+//
+// It is deliberately always false today, and it is a named function rather than an
+// inlined condition so the rule is visible and testable. The external wintun copy
+// is not consulted by the core at all - measured: with no such file, and again
+// with a junk file of that name, the core produced byte-identical output and still
+// reached "configure tun interface: Access is denied". Blocking on it told users
+// with a perfectly capable core that their build was incomplete.
+//
+// The parameter is kept because a genuinely blocking condition would belong here,
+// and because it makes the decision explicit at the call site.
+func componentBlocksTun(c tunComponentState) bool {
+	return false
+}
+
+// manifestBlocksTun reports whether a missing manifest must stop the activation.
+//
+// Also always false today, for the same reason: a manifest describes the external
+// copy, and the external copy is not what creates the adapter.
+func manifestBlocksTun(err error) bool {
+	return false
+}
+
+// coreBuildInfo reads the architecture and version out of a mihomo binary,
+// without running it.
+//
+// The architecture matters: an arm64 core on an amd64 machine cannot create an
+// adapter, and saying so from the file is more useful than failing later with a
+// driver error. An empty return means the file could not be read as a PE image,
+// which is reported as "found but unrecognised" rather than as a failure - the
+// capability is what matters, not the parse.
+func coreBuildInfo(path string) (arch, version string) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) < 0x40 {
+		return "", ""
+	}
+	if data[0] != 'M' || data[1] != 'Z' {
+		return "", ""
+	}
+	le := func(off int) uint32 {
+		return uint32(data[off]) | uint32(data[off+1])<<8 |
+			uint32(data[off+2])<<16 | uint32(data[off+3])<<24
+	}
+	pe := int(le(0x3C))
+	if pe <= 0 || pe+6 > len(data) || data[pe] != 'P' || data[pe+1] != 'E' {
+		return "", ""
+	}
+	machine := uint16(data[pe+4]) | uint16(data[pe+5])<<8
+	switch machine {
+	case 0x8664:
+		arch = "amd64"
+	case 0x14c:
+		arch = "386"
+	case 0xaa64:
+		arch = "arm64"
+	default:
+		arch = fmt.Sprintf("unknown(0x%x)", machine)
+	}
+	// mihomo embeds its version as a plain string near the build information.
+	if i := bytes.Index(data, []byte("v1.19")); i > 0 && i+8 < len(data) {
+		end := i
+		for end < len(data) && end-i < 12 &&
+			((data[end] >= '0' && data[end] <= '9') || data[end] == '.' || data[end] == 'v') {
+			end++
+		}
+		version = string(data[i:end])
+	}
+	if version == "" {
+		version = "未知版本"
+	}
+	return arch, version
 }
 
 // ---- elevation ------------------------------------------------------------

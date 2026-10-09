@@ -266,12 +266,51 @@ func (s *Store) load() error {
 	return nil
 }
 
+// TUN defaults, named once so the migration, the environment check, the
+// generated configuration and the adapter lookup cannot disagree.
+const (
+	tunDefaultDevice = "Zenith"
+	tunDefaultStack  = "gvisor"
+)
+
+// NormalizedTunDevice returns the adapter name to use, filling in the default.
+//
+// A settings file written before these fields existed has them empty, and the
+// environment check used to substitute the default locally without telling anyone
+// - so the check reported one name, the generated configuration carried another,
+// and the adapter lookup searched for a third. Every path goes through here now.
+func (s Settings) NormalizedTunDevice() string {
+	if strings.TrimSpace(s.TunDevice) == "" {
+		return tunDefaultDevice
+	}
+	return strings.TrimSpace(s.TunDevice)
+}
+
+// NormalizedTunStack returns the stack to use, filling in the default.
+//
+// Only stacks the core accepts are returned. An unrecognised value would make the
+// core refuse the whole configuration, which is worse than choosing the documented
+// default and saying so.
+func (s Settings) NormalizedTunStack() string {
+	switch strings.TrimSpace(s.TunStack) {
+	case "gvisor", "system", "mixed":
+		return strings.TrimSpace(s.TunStack)
+	default:
+		return tunDefaultStack
+	}
+}
+
 // mergeDefaults copies zero values from def so a settings file written by an
 // older version still yields a complete configuration.
 func mergeDefaults(s *Settings, def Settings) {
 	if s.Mode == "" {
 		s.Mode = def.Mode
 	}
+	// The TUN fields are normalized rather than merely defaulted, so a file with
+	// an empty or unusable value is repaired on load instead of asking the user to
+	// edit JSON before the feature can work for the first time.
+	s.TunDevice = s.NormalizedTunDevice()
+	s.TunStack = s.NormalizedTunStack()
 	if s.MixedPort == 0 {
 		s.MixedPort = def.MixedPort
 	}

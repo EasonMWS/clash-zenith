@@ -15,6 +15,7 @@ package main
 // ---------------------------------------------------------------------------
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1428,4 +1429,134 @@ func TestApplySettingsRewritesConfigForTunMode(t *testing.T) {
 		t.Error("the tun block does not name the adapter the activation waited for")
 	}
 	_ = a
+}
+
+// ---- the TUN component check must test capability, not a file --------------
+
+func TestCoreDoesNotNeedAnExternalWintunDll(t *testing.T) {
+	// Measured behaviour, which this test records rather than re-runs: with no
+	// wintun.dll beside mihomo.exe, and again with a four-kilobyte junk file of
+	// that name in its place, the core produced byte-identical output and still
+	// reached "configure tun interface: Access is denied". It never opens the
+	// file - the driver it uses is embedded in the binary and loaded from memory.
+	//
+	// The check used to block on that file, so a user whose core was perfectly
+	// capable was told the build was incomplete and to download it again. This
+	// asserts the decision rule that replaced it.
+	env := tunEnvironment{Checks: map[string]string{}, Warnings: []string{}}
+
+	// Absence of the external copy must not block.
+	missing := tunComponentState{Name: "wintun", Version: "0.14.1", Verified: false,
+		Detail: "文件不存在"}
+	if componentBlocksTun(missing) {
+		t.Error("a missing external wintun copy must not block TUN: the core does not use it")
+	}
+	// Absence of the manifest must not block either.
+	if manifestBlocksTun(nil) {
+		t.Error("a missing component manifest must not block TUN")
+	}
+	// A mismatched external copy is worth a warning, not a refusal.
+	mismatch := tunComponentState{Name: "wintun", Version: "0.14.1", Verified: false,
+		Detail: "摘要不符"}
+	if componentBlocksTun(mismatch) {
+		t.Error("a mismatched external copy must warn rather than block")
+	}
+	// A verified one is simply fine.
+	ok := tunComponentState{Name: "wintun", Version: "0.14.1", Verified: true, Signed: true,
+		Signer: "CN=WireGuard LLC"}
+	if componentBlocksTun(ok) {
+		t.Error("a verified component must not block")
+	}
+	_ = env
+}
+
+func TestCoreBuildInfoReadsArchitecture(t *testing.T) {
+	// The architecture matters: an arm64 core on an amd64 machine cannot create an
+	// adapter, and reading that from the file is more useful than a driver error
+	// later. This runs against the core that ships with the program.
+	arch, ver := coreBuildInfo(filepath.Join("..", "core", "mihomo.exe"))
+	if arch == "" {
+		t.Skip("core/mihomo.exe is not readable from the test directory")
+	}
+	if arch != "amd64" {
+		t.Errorf("core architecture = %q, want amd64 on this build", arch)
+	}
+	if ver == "" || ver == "未知版本" {
+		t.Errorf("core version was not read: %q", ver)
+	}
+	// A file that is not a PE image must return empty rather than guessing.
+	dir := t.TempDir()
+	junk := filepath.Join(dir, "notape.exe")
+	if err := os.WriteFile(junk, bytes.Repeat([]byte("A"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if a, v := coreBuildInfo(junk); a != "" || v != "" {
+		t.Errorf("a non-PE file produced (%q, %q), want empty", a, v)
+	}
+}
+
+func TestTunDefaultsAreNormalizedOnLoad(t *testing.T) {
+	// A settings file written before these fields existed has them empty. The
+	// environment check used to substitute the default locally without telling
+	// anyone, so the check reported one name, the generated configuration carried
+	// another, and the adapter lookup searched for a third. The migration now
+	// normalizes once and every stage reads the same value.
+	dir := t.TempDir()
+	legacy := `{"settings":{"mixedPort":7890,"controlPort":7797,"mode":"rule",` +
+		`"tunDevice":"","tunStack":""}}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := st.Settings()
+	if got.TunDevice != tunDefaultDevice {
+		t.Errorf("tunDevice = %q, want %q after migration", got.TunDevice, tunDefaultDevice)
+	}
+	if got.TunStack != tunDefaultStack {
+		t.Errorf("tunStack = %q, want %q after migration", got.TunStack, tunDefaultStack)
+	}
+	if got.NormalizedTunDevice() != got.TunDevice {
+		t.Error("the migration and the accessor disagree about the device name")
+	}
+
+	// An unusable stack must be repaired rather than passed to the core, which
+	// would refuse the whole configuration.
+	bad := Settings{TunDevice: "  ", TunStack: "not-a-stack"}
+	if bad.NormalizedTunDevice() != tunDefaultDevice {
+		t.Error("a blank device name must normalize to the default")
+	}
+	if bad.NormalizedTunStack() != tunDefaultStack {
+		t.Error("an unrecognised stack must normalize to a value the core accepts")
+	}
+	// A valid explicit choice must survive.
+	keep := Settings{TunDevice: "MyTun", TunStack: "system"}
+	if keep.NormalizedTunDevice() != "MyTun" {
+		t.Error("an explicit device name must be kept")
+	}
+	if keep.NormalizedTunStack() != "system" {
+		t.Error("an explicit valid stack must be kept")
+	}
+}
+
+func TestGeneratedConfigUsesTheNormalizedValues(t *testing.T) {
+	// The generator and the environment check must agree, or the adapter that gets
+	// created is not the one being looked for.
+	st := Settings{MixedPort: 7890, ControlPort: 7797, Mode: "rule",
+		TunMode: TunCompat, TunDevice: "", TunStack: ""}
+	// Normalize the way the migration would.
+	st.TunDevice = st.NormalizedTunDevice()
+	st.TunStack = st.NormalizedTunStack()
+	cfg := BuildConfig([]Proxy{{Name: "n", Type: "socks5", Server: "1.2.3.4", Port: 1}},
+		[]string{"n"}, st, "s", "n", 8199)
+	if !strings.Contains(cfg, `device: "`+tunDefaultDevice+`"`) {
+		t.Errorf("the generated configuration does not name %q:\n%s", tunDefaultDevice, cfg)
+	}
+	// The stack is emitted quoted, so the assertion matches the quoted form rather
+	// than assuming a bare scalar.
+	if !strings.Contains(cfg, `stack: "`+tunDefaultStack+`"`) {
+		t.Errorf("the generated configuration does not use stack %q:\n%s", tunDefaultStack, cfg)
+	}
 }
