@@ -497,6 +497,17 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		}
 		Info(AppName, "已开始优选边缘节点。\n过程中可以正常上网，完成后会自动切换。")
 	})
+	// Windows is ending the session - a shutdown, a restart, a sign-out. There is no
+	// one to confirm anything, and no time to wait, so the cleanup runs alongside the
+	// shutdown rather than holding it up.
+	//
+	// Without this the default answer to "may I end the session" is yes, the process
+	// is terminated, and the system proxy is left pointing at a port that just died -
+	// which is a machine with no internet until the next start notices and clears it.
+	tray.OnShutdown(func() {
+		Log("session ending: restoring the system proxy and stopping the core")
+		app.Shutdown()
+	})
 	tray.On(idQuit, func() {
 		if !Confirm(AppName, "退出 Zenith？\n\n会同时停止代理并还原系统代理设置。") {
 			return

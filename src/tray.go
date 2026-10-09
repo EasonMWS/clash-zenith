@@ -58,6 +58,18 @@ const (
 	wmLButtonUp   = 0x0202
 	wmTrayMessage = 0x0400 + 1 // WM_APP + 1
 
+	// Windows asks every window whether it is ready to end the session, and later
+	// tells them that it is ending. Not handling the first one was leaving this
+	// program's shutdown path unrun: the default answer is "yes, go ahead", so
+	// Windows terminated the process without restoring the system proxy - and a
+	// proxy pointing at a port that has just died is a machine with no internet.
+	//
+	// The next start clears it (see claimProxyForStartup), so this is not the only
+	// line of defence. It is the difference between the machine being tidy on the way
+	// out and being tidied on the way in.
+	wmQueryEndSession = 0x0011
+	wmEndSession      = 0x0016
+
 	nimAdd    = 0x00000000
 	nimModify = 0x00000001
 	nimDelete = 0x00000002
@@ -211,6 +223,11 @@ type Tray struct {
 
 	ready  chan struct{}
 	closed chan struct{}
+
+	// onShutdown runs when Windows is ending the session, so the program can put the
+	// machine back the way it found it. It is separate from the menu handler because
+	// nobody is there to answer a confirmation dialog during a shutdown.
+	onShutdown func()
 }
 
 func NewTray() *Tray {
@@ -292,6 +309,27 @@ func (t *Tray) Run(iconPath, tip string) error {
 	t.remove()
 	close(t.closed)
 	return nil
+}
+
+// OnShutdown registers what to run when Windows ends the session.
+//
+// No confirmation and no waiting: the session is ending regardless, and a dialog
+// raised here is a dialog nobody will answer.
+func (t *Tray) OnShutdown(fn func()) {
+	t.mu.Lock()
+	t.onShutdown = fn
+	t.mu.Unlock()
+}
+
+// close runs the shutdown hook once, off the message thread.
+func (t *Tray) close() {
+	t.mu.Lock()
+	fn := t.onShutdown
+	t.onShutdown = nil // once; an end-session follows a query-end-session
+	t.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // Ready returns a channel closed once the icon is on screen.
@@ -421,6 +459,20 @@ func (t *Tray) wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr
 			// blocking work, and stalling the pump would freeze the menu
 			go fn()
 		}
+		return 0
+	case wmQueryEndSession:
+		// Answer "yes, I am ready", then do the work on another thread.
+		//
+		// Blocking here to restore the proxy would be the wrong trade: Windows gives a
+		// window a few seconds to answer and then ends the session anyway, so a slow
+		// cleanup on this thread would either be cut off or delay the shutdown the user
+		// asked for. Answering first and cleaning up alongside means the machine is
+		// usually tidy, and never held up.
+		go t.close()
+		return 1 // TRUE: do not block the shutdown
+	case wmEndSession:
+		// The session is ending whether or not the cleanup finished.
+		go t.close()
 		return 0
 	case wmClose:
 		procDestroyWindow.Call(hwnd)

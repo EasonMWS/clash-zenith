@@ -4153,3 +4153,126 @@ func TestACoreThatDiedIsRestartedPromptly(t *testing.T) {
 			"bootCore would never shorten the window")
 	}
 }
+
+// ---- the four questions a user actually asks ------------------------------
+
+func TestForceKillingUnderTunCannotTakeTheMachineOffline(t *testing.T) {
+	// The scenario: TUN is on, the user opens Task Manager and ends the task.
+	//
+	// What a proxy client leaves behind in that case is normally a registry entry
+	// pointing at a port that has just died, which on Windows is not "bypass the
+	// proxy" but every request failing. The reason it does not happen here is an
+	// ordering property, so it is worth asserting rather than assuming: the
+	// activation switches the system proxy OFF before it builds the tunnel, so at the
+	// moment the process can be killed there is no such entry to leave behind.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "关闭系统代理（与 TUN 互斥）") {
+		t.Fatal("the activation does not switch the system proxy off, so a force kill " +
+			"under TUN leaves a registry entry pointing at a dead port")
+	}
+	// The switch must happen before the tunnel is built, not after. Ordering is the
+	// whole property, so compare the two positions rather than just their presence.
+	proxyOff := strings.Index(text, "关闭系统代理（与 TUN 互斥）")
+	tunnelUp := strings.Index(text, "TUN enabled in compat mode")
+	if proxyOff < 0 || tunnelUp < 0 {
+		t.Skip("could not locate both steps in the same function")
+	}
+	if proxyOff > tunnelUp {
+		t.Error("the system proxy is switched off after the tunnel is built, so there is " +
+			"a window in which a kill leaves the machine offline")
+	}
+	// And a leftover adapter is reconciled at the next start rather than believed.
+	rec, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(rec), "func (a *App) RecoverTun()") {
+		t.Error("nothing reconciles a leftover adapter at startup")
+	}
+}
+
+func TestClosingTheLidDoesNotHangTheShutdown(t *testing.T) {
+	// Windows asks every window whether it is ready to end the session, and terminates
+	// the process a few seconds later whatever the answer. Not handling the question
+	// left the default answer - "yes, go ahead" - so the shutdown path never ran and
+	// the system proxy was left pointing at a dead port.
+	//
+	// The answer must be immediate. Blocking on this thread to restore the proxy would
+	// either be cut off or delay a shutdown the user asked for, and delaying a shutdown
+	// is the behaviour the question was really about.
+	src, err := os.ReadFile("tray.go")
+	if err != nil {
+		t.Skipf("tray.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "wmQueryEndSession") {
+		t.Fatal("the tray window does not handle the end-session question, so the " +
+			"shutdown path never runs")
+	}
+	if !strings.Contains(text, "wmEndSession") {
+		t.Error("the tray window is not told when the session is actually ending")
+	}
+	// The hook is registered and separate from the menu's quit, because nobody is
+	// there to answer a confirmation dialog during a shutdown.
+	if !strings.Contains(text, "func (t *Tray) OnShutdown(") {
+		t.Error("there is no shutdown hook to run the cleanup")
+	}
+	if !strings.Contains(text, "t.onShutdown = nil") {
+		t.Error("the shutdown hook is not cleared, so a query followed by an end would " +
+			"run the cleanup twice")
+	}
+	// The handler must return TRUE and do the work off the message thread.
+	i := strings.Index(text, "case wmQueryEndSession:")
+	if i < 0 {
+		t.Fatal("the case is missing")
+	}
+	body := text[i : i+700]
+	if !strings.Contains(body, "return 1") {
+		t.Error("the end-session question is not answered with TRUE, so Windows may " +
+			"decide this program is refusing to close")
+	}
+	if !strings.Contains(body, "go t.close()") {
+		t.Error("the cleanup runs on the message thread, which delays the shutdown")
+	}
+
+	// And main must wire it up, or the hook is a comment.
+	m, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Skipf("main.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(m), "tray.OnShutdown(") {
+		t.Error("main never registers a shutdown handler")
+	}
+}
+
+func TestOpeningTheShortcutManyTimesStartsOneInstance(t *testing.T) {
+	// Double-clicking the desktop shortcut five times must not produce five cores.
+	// Two processes with one data directory is the state this program spent a long
+	// time removing: they disagree about which port the proxy should point at, and the
+	// user sees an interface reporting a dead core while the machine is online.
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Skipf("main.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "IsPortListening(uiPort)") {
+		t.Error("startup does not check whether another instance already owns the UI " +
+			"port, so every double-click could start another copy")
+	}
+	// The check must come before the port is bound, or it is a race with itself.
+	bind := strings.Index(text, "srv.Listen()")
+	check := strings.Index(text, "IsPortListening(uiPort)")
+	if bind < 0 || check < 0 {
+		t.Skip("could not locate both")
+	}
+	if check > bind {
+		t.Error("the single-instance check runs after binding, so two copies started at " +
+			"the same moment could both proceed")
+	}
+}

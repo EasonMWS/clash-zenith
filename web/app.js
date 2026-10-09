@@ -1091,9 +1091,10 @@ function bindTun() {
   $('#btn-tun-repair').addEventListener('click', function () {
     const el = this;
     guard(el, async () => {
-      // 离线修复不需要网络，也能在界面或服务损坏时把机器恢复回来。
+      // 不依赖网络的检查：确认组件、清掉残留的网卡和路由。
+      // 它曾经还负责"解除隐私保护"，那个模式已经删除。
       const r = await api('/api/tun/repair', { release: true });
-      if (r.ok) { toast('已解除保护并检查组件', 'ok'); await loadTun(); }
+      if (r.ok) { toast('已检查组件并清理残留', 'ok'); await loadTun(); }
       else { toast(r.error || '修复失败', 'err'); }
     });
   });
