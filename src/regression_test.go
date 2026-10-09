@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2847,5 +2848,58 @@ func TestAdoptedCoreIsRecorded(t *testing.T) {
 	a.mu.Unlock()
 	if got != 4242 {
 		t.Errorf("adoptedCorePID = %d after adopting, want 4242", got)
+	}
+}
+
+// ---- no runtime file may be tracked, ever -----------------------------------
+
+func TestNoRuntimeFileIsTrackedByGit(t *testing.T) {
+	// This is a guard against a mistake made three times, not a test of behaviour.
+	//
+	//   - config.last-good.yaml, a whole configuration including node credentials;
+	//   - data/control.secret, the key to the core's control API, which sat in a
+	//     public repository for seven commits;
+	//   - data/service-state.json and data/activation-handover.json, runtime records.
+	//
+	// Each time the file was added by code and forgotten by the ignore list, and each
+	// time the omission was found by hand rather than by the build. The ignore rules
+	// are now written by kind, and this asserts the property those rules exist for.
+	//
+	// It shells out to git, so it is skipped where git or the repository is absent -
+	// a machine building from an unpacked release has neither and must still be able
+	// to run the suite.
+	root := ".."
+	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		t.Skip("not a git checkout")
+	}
+	git := func(args ...string) (string, error) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		out, err := cmd.Output()
+		return string(out), err
+	}
+	out, err := git("ls-files", "data/")
+	if err != nil {
+		t.Skipf("git is unavailable or this is not a checkout: %v", err)
+	}
+
+	// What ships is only what a fresh clone needs to start: the rule databases, the
+	// icon, the first-run marker, and the candidate pool the optimiser seeds from.
+	allowed := map[string]bool{
+		"data/GeoSite.dat":    true,
+		"data/geoip.metadb":   true,
+		"data/zenith.ico":     true,
+		"data/free.flag":      true,
+		"data/candidates.txt": true,
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.TrimSpace(filepath.ToSlash(line))
+		if f == "" || allowed[f] {
+			continue
+		}
+		t.Errorf("data/%s is tracked by git. Anything under data/ other than the "+
+			"shipped files is generated at runtime and must not be committed - "+
+			"three leaks came from exactly this, one of them a control secret that "+
+			"reached a public repository. Add it to .gitignore.", strings.TrimPrefix(f, "data/"))
 	}
 }
