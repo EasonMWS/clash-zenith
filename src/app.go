@@ -1628,8 +1628,17 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 	// anything that changes the generated config needs a rewrite + reload.
 	// keepNodes is deliberately NOT in this list: it only caps how many
 	// optimised nodes are shown, so changing it must not rewrite the config.
+	//
+	// The three TUN settings belong here. They were missing, and the consequence
+	// was exact: enabling TUN stored the mode, restarted the core, and never wrote
+	// a config containing a tun block - so the core started without TUN, no
+	// adapter appeared, and the activation waited out its timeout and rolled back.
+	// The core's own log had no TUN lines at all, which is what gave it away.
 	needReload := false
-	for _, k := range []string{"mixedPort", "apiPort", "directCNDomains", "blockAds", "customRules"} {
+	for _, k := range []string{
+		"mixedPort", "apiPort", "directCNDomains", "blockAds", "customRules",
+		"tunMode", "tunDevice", "tunStack",
+	} {
 		if _, ok := patch[k]; ok {
 			needReload = true
 			break

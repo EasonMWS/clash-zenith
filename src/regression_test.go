@@ -1321,3 +1321,73 @@ func TestPortRotationMustRepointAnOwnedProxy(t *testing.T) {
 		}
 	}
 }
+
+// ---- enabling TUN must actually reach the configuration --------------------
+
+func TestTunSettingsTriggerAConfigRewrite(t *testing.T) {
+	// The three TUN settings were missing from the reload trigger list, and the
+	// consequence was exact: enabling TUN stored the mode, restarted the core, and
+	// never wrote a config containing a tun block. The core therefore started
+	// without TUN, no adapter appeared, and the activation waited out its timeout
+	// and rolled back. The core's own log had no TUN lines at all.
+	//
+	// This is a property of a list in ApplySettings, so it is checked against the
+	// source: a missing entry is a silent failure with no return value to assert on.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable from the test directory: %v", err)
+	}
+	text := string(src)
+	start := strings.Index(text, "needReload := false")
+	if start < 0 {
+		t.Fatal("the reload trigger list is missing from ApplySettings")
+	}
+	end := strings.Index(text[start:], "if needReload {")
+	if end < 0 {
+		t.Fatal("could not find the end of the reload trigger list")
+	}
+	block := text[start : start+end]
+	for _, key := range []string{"tunMode", "tunDevice", "tunStack"} {
+		if !strings.Contains(block, `"`+key+`"`) {
+			t.Errorf("%q is not in the reload trigger list, so changing it would not "+
+				"rewrite the configuration and TUN would never be enabled", key)
+		}
+	}
+	// And the settings that were already there must stay, or this fix would have
+	// traded one silent failure for another.
+	for _, key := range []string{"mixedPort", "blockAds", "customRules"} {
+		if !strings.Contains(block, `"`+key+`"`) {
+			t.Errorf("%q was dropped from the reload trigger list", key)
+		}
+	}
+}
+
+func TestTunModeProducesATunBlockInTheGeneratedConfig(t *testing.T) {
+	// The other half of the same property: once the rewrite is triggered, the
+	// generated configuration must actually contain the block the core needs.
+	base := Settings{MixedPort: 7899, ControlPort: 7797, Mode: "rule",
+		TunDevice: defaultTunDevice, TunStack: "gvisor"}
+	off := BuildConfig([]Proxy{{Name: "n", Type: "socks5", Server: "1.2.3.4", Port: 1080}},
+		[]string{"n"}, base, "s", "n", 8199)
+	if strings.Contains(off, "\ntun:\n") {
+		t.Error("a tun block was emitted while TUN was off")
+	}
+
+	on := base
+	on.TunMode = TunPrivacy
+	withTun := BuildConfig([]Proxy{{Name: "n", Type: "socks5", Server: "1.2.3.4", Port: 1080}},
+		[]string{"n"}, on, "s", "n", 8199)
+	if !strings.Contains(withTun, "\ntun:\n") {
+		t.Fatal("enabling TUN produced no tun block, so the core would start without it")
+	}
+	if !strings.Contains(withTun, "enable: true") {
+		t.Error("the tun block is present but not enabled")
+	}
+	// The mode has to reach the block, or the three policies would be one policy.
+	if !strings.Contains(withTun, "strict-route: true") {
+		t.Error("privacy mode should ask for a strict route")
+	}
+	if err := validateCandidateConfig(withTun); err != nil {
+		t.Errorf("the generated TUN configuration is not valid: %v", err)
+	}
+}
