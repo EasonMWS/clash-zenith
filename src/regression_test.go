@@ -4404,3 +4404,116 @@ func TestSelectingAGroupStillNamesTheNodeInUse(t *testing.T) {
 			"in use, so the interface cannot say \"AUTO, currently X\"")
 	}
 }
+
+// ---- the two switches read as one choice, and an install can repair ---------
+
+func TestTheServiceInstallReplacesABrokenRegistration(t *testing.T) {
+	// Measured, and it cost the user two permission prompts every single time. An
+	// earlier build had registered the service with a binary that did not speak the
+	// Service Control Manager protocol, so Windows had it stuck in START_PENDING and it
+	// never answered on its port. Every later attempt then went: create fails because
+	// the name exists, start reports success because Windows still thinks the old
+	// process is starting, the endpoint never answers, the install is reported as
+	// failed, and the activation falls back to a per-activation prompt.
+	//
+	// Two UAC dialogs per attempt, forever, with the reason buried in a log.
+	src, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Skipf("service.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "func (a *App) installService() error") {
+		t.Fatal("installService is missing")
+	}
+	i := strings.Index(text, "func (a *App) installService() error")
+	j := strings.Index(text[i:], "\nfunc ")
+	body := text[i : i+j]
+
+	if !strings.Contains(body, "serviceInstalled()") {
+		t.Error("the install does not check whether a registration already exists, so a " +
+			"broken one can block every future install")
+	}
+	if !strings.Contains(body, `serviceControl("delete", serviceName)`) {
+		t.Error("the install does not remove an existing registration, so it cannot " +
+			"repair one")
+	}
+	// The delete must happen before the create, or it is pointless.
+	del := strings.Index(body, `serviceControl("delete", serviceName)`)
+	cre := strings.Index(body, `serviceControl("create", serviceName`)
+	if del < 0 || cre < 0 {
+		t.Fatal("could not locate both calls")
+	}
+	if del > cre {
+		t.Error("the existing registration is removed after the create, which cannot work")
+	}
+}
+
+func TestBothElevationPromptsShowTheWaitingPanel(t *testing.T) {
+	// There are two permission prompts on a machine with no service: one to install the
+	// resident service, and - if that fails - one for the activation itself. The
+	// approval panel, with the countdown and the hint about where the dialog might be
+	// hiding, was only raised for the second. So the first prompt, which is usually the
+	// one the user actually sees, was shown while the interface said nothing more
+	// helpful than "等待系统授权". Reported by the user as the panel appearing only at
+	// the second prompt, which is exactly what it was doing.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	// Both elevation sites must raise the wait.
+	if strings.Count(text, "a.setApprovalWait(true)") < 2 {
+		t.Errorf("only %d elevation site(s) raise the approval panel, want 2 - the "+
+			"service install prompts too",
+			strings.Count(text, "a.setApprovalWait(true)"))
+	}
+	// And each must clear it, or a stale timer keeps counting after the dialog is gone.
+	if strings.Count(text, "a.setApprovalWait(false)") < 2 {
+		t.Errorf("only %d site(s) clear the approval panel, want 2",
+			strings.Count(text, "a.setApprovalWait(false)"))
+	}
+	// The service-install prompt should say what it is for, so a user seeing two dialogs
+	// in a row knows the second is a different request.
+	if !strings.Contains(text, "安装常驻服务") {
+		t.Error("the first prompt does not say what it is asking for")
+	}
+}
+
+func TestTheTraySaysWhyASwitchIsOff(t *testing.T) {
+	// The two ways of taking traffic are mutually exclusive, so "系统代理" with no check
+	// mark is ambiguous: the user turned it off, or enabling TUN turned it off for
+	// them. A menu that shows the same thing in both cases leaves the user with a
+	// switch that appears not to respond to anything - which is how the missing sync
+	// was reported.
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Skipf("main.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "func sysProxyLabel(on, tunOn bool) string") {
+		t.Fatal("the system proxy item has one label for every state")
+	}
+	for _, need := range []string{
+		"已启用，点击关闭",
+		"TUN 接管中，已自动关闭",
+		"已关闭，点击启用",
+	} {
+		if !strings.Contains(text, need) {
+			t.Errorf("the proxy label does not cover %q", need)
+		}
+	}
+	// And the TUN item says the same thing from the other side.
+	if !strings.Contains(text, "系统代理使用中，点击改用 TUN") {
+		t.Error("the TUN item does not say when the system proxy is the one in use")
+	}
+	// The state must be read live on each open, not captured when the menu was built.
+	// That mechanism lives in tray.go, which is where the popup is assembled.
+	tray, err := os.ReadFile("tray.go")
+	if err != nil {
+		t.Skipf("tray.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(tray), "items := build()") {
+		t.Error("the menu is not rebuilt when it is opened, so it can go stale")
+	}
+}

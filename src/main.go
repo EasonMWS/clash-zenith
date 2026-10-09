@@ -535,6 +535,10 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		if ps, ok := st["systemProxy"].(ProxyState); ok {
 			proxyOn = ps.Enabled && ps.Owner == "zenith"
 		}
+		tunOn := false
+		if tm, ok := st["tunMode"].(string); ok && tm != "" && tm != string(TunOff) {
+			tunOn = true
+		}
 
 		items := []menuItem{
 			{id: idShowWindow, label: "打开 Zenith 窗口"},
@@ -544,7 +548,7 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 			{id: idModeGlobal, label: "全局模式", checked: mode == "global"},
 			{id: idModeDirect, label: "直连模式", checked: mode == "direct"},
 			{separate: true},
-			{id: idSysProxy, label: "系统代理", checked: proxyOn},
+			{id: idSysProxy, label: sysProxyLabel(proxyOn, tunOn), checked: proxyOn},
 		}
 		// TUN belongs here for the same reason the proxy switch does: it is the other
 		// way of taking traffic, and a user who has closed the window should not have to
@@ -595,6 +599,11 @@ func tunMenuItem(app *App) menuItem {
 	if mode != "" && mode != string(TunOff) {
 		return menuItem{id: idTun, label: "TUN 接管（已启用，点击关闭）", checked: true}
 	}
+	// Say when the proxy is the one holding the traffic, so the pair reads as one
+	// choice rather than two switches that appear unrelated.
+	if ps, ok := st["systemProxy"].(ProxyState); ok && ps.Enabled && ps.Owner == "zenith" {
+		return menuItem{id: idTun, label: "TUN 接管（系统代理使用中，点击改用 TUN）"}
+	}
 	return menuItem{id: idTun, label: "TUN 接管（需要一次系统授权）"}
 }
 
@@ -639,6 +648,23 @@ func trayToggleTun(app *App, bringUp func()) {
 		"窗口里会显示进度和倒计时，随时可以取消。")
 	if err := app.EnableTun(TunCompat); err != nil {
 		Info(AppName, fmt.Sprintf("启用 TUN 失败：%v", err))
+	}
+}
+
+// sysProxyLabel says what the system proxy switch is, including why it is off.
+//
+// The two ways of taking traffic are mutually exclusive, so "系统代理" with no check
+// mark is ambiguous: it can mean the user turned it off, or that enabling TUN turned it
+// off for them. A menu that shows the same thing in both cases leaves the user with a
+// switch that appears not to respond to anything.
+func sysProxyLabel(on, tunOn bool) string {
+	switch {
+	case on:
+		return "系统代理（已启用，点击关闭）"
+	case tunOn:
+		return "系统代理（TUN 接管中，已自动关闭）"
+	default:
+		return "系统代理（已关闭，点击启用）"
 	}
 }
 

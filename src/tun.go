@@ -844,7 +844,17 @@ func (a *App) runEnableTun(mode TunMode) {
 	// through to the per-activation elevation that worked before - a machine without
 	// the service must still be able to use the feature.
 	if !isElevated() {
-		if err := a.ensureService(); err == nil {
+		// This is an elevation prompt too, and it is usually the FIRST one the user
+		// sees. The approval panel - the countdown, the hint about where the dialog
+		// might be hiding - was only raised for the second elevation, so the first
+		// prompt was shown while the interface said nothing more helpful than
+		// "等待系统授权". Reported by the user as the panel appearing only at the second
+		// prompt, which is exactly what it was doing.
+		a.setTunStage("等待系统授权，请在弹窗里点「是」（安装常驻服务）")
+		a.setApprovalWait(true)
+		err := a.ensureService()
+		a.setApprovalWait(false)
+		if err == nil {
 			txA.step("安装服务", "done", "已安装并启动常驻服务，之后启用不再需要授权")
 			a.saveTunTxn(txA)
 			// Continue into the service path rather than calling EnableTun again.

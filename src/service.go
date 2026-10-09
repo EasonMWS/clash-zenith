@@ -154,6 +154,20 @@ func serviceInstalled() bool {
 	return strings.Contains(out, "SERVICE_NAME") || strings.Contains(out, "STATE")
 }
 
+// serviceRunning reports whether the SCM currently believes our service is running or
+// starting.
+//
+// "Not stopped" rather than "running": a service stuck in START_PENDING is the case
+// that has to be waited out before a delete will succeed, and asking only about
+// RUNNING would sleep the full loop every time.
+func serviceRunning() bool {
+	out, err := HiddenCommand("sc", "query", serviceName)
+	if err != nil && out == "" {
+		return false
+	}
+	return strings.Contains(out, "RUNNING") || strings.Contains(out, "START_PENDING")
+}
+
 // serviceStart requests the service to start the core with a configuration.
 //
 // The request carries the control secret. That is the authenticated local channel
@@ -529,6 +543,52 @@ func (a *App) installService() error {
 	}
 	binPath := fmt.Sprintf(`"%s" -service -root "%s" -datadir "%s"`,
 		exe, a.rootDir, a.dataDir)
+
+	// Replace a registration that is already there, rather than trying to create over
+	// it. This is what makes the install able to REPAIR, and without it a broken
+	// registration was permanent.
+	//
+	// Measured, and it cost the user two permission prompts every single time. An
+	// earlier build had registered the service with a binary that did not speak the
+	// Service Control Manager protocol, so Windows had it stuck in START_PENDING and
+	// it never answered on its port. Every later attempt then went: create fails
+	// because the name exists, start reports success because Windows still thinks the
+	// old process is starting, the endpoint never answers, the install is reported as
+	// failed, and the activation falls back to a per-activation prompt. Two UAC dialogs
+	// per attempt, forever, with the reason buried in a log.
+	//
+	// Deleting first is deliberate and is what a reinstall means. It is scoped to this
+	// program's own service name, so nothing else is touched.
+	if serviceInstalled() {
+		Log("service: a registration already exists; replacing it so a broken one " +
+			"cannot block the install")
+		// Best effort at a clean stop. A service stuck in START_PENDING refuses, which
+		// is exactly the case being repaired - so a failure here is expected and the
+		// delete below is what actually matters.
+		if out, err := serviceControl("stop", serviceName); err != nil {
+			Log("service: stop before replace reported: %v (%s)",
+				err, strings.TrimSpace(out), "WARN")
+		}
+		// `sc stop` returns before the service has stopped. Waiting briefly avoids
+		// racing the delete against a stop that is still in progress.
+		for i := 0; i < 20; i++ {
+			if !serviceRunning() {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if out, err := serviceControl("delete", serviceName); err != nil {
+			// A delete can fail while a stop is still settling. One retry, then report:
+			// continuing to `create` against a name that still exists produces the
+			// confusing two-prompt behaviour this is here to remove.
+			time.Sleep(1500 * time.Millisecond)
+			if out2, err2 := serviceControl("delete", serviceName); err2 != nil {
+				return fmt.Errorf("无法替换已有的服务注册：%v（%s / %s）。"+
+					"请以管理员身份运行 sc delete %s 后重试",
+					err2, strings.TrimSpace(out), strings.TrimSpace(out2), serviceName)
+			}
+		}
+	}
 
 	// auto start means the tunnel survives a reboot without the user having to
 	// remember anything, which is the point of a resident service.
