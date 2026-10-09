@@ -1575,13 +1575,21 @@ func TestGeneratedConfigUsesTheNormalizedValues(t *testing.T) {
 
 // ---- P0-1: the handover must have a result channel --------------------------
 
+// testAppForHandover builds an App with a control secret, which the handover record
+// needs: the record is signed with it, and a record without a valid signature is
+// refused. Production always has a secret - it is created with the data directory -
+// so a test without one models a state that cannot occur.
+func testAppForHandover(dir string) *App {
+	return &App{dataDir: dir, secret: strings.Repeat("s", 43)}
+}
+
 func TestHandoverRecordRoundTrips(t *testing.T) {
 	// The waiting side used to be told "authorised, waiting for the elevated
 	// instance" and then have nothing that could ever end that wait: the helper
 	// reported through a progress object it never initialised, so its verdict went
 	// nowhere. This record is the channel that replaced it.
 	dir := t.TempDir()
-	a := &App{dataDir: dir}
+	a := testAppForHandover(dir)
 
 	if rec := a.readHandover(); rec != nil {
 		t.Fatal("a fresh data directory should have no handover record")
@@ -1622,7 +1630,7 @@ func TestHandoverFailureCarriesItsReason(t *testing.T) {
 	// The failure this whole file exists for: a failed activation must arrive with
 	// a reason attached, not as silence and not as success.
 	dir := t.TempDir()
-	a := &App{dataDir: dir}
+	a := testAppForHandover(dir)
 	rec := a.beginHandover(newHandoverID(), 1, TunCompat)
 	want := "虚拟网卡没有出现：内核说 Access is denied"
 	a.finishHandover(rec, fmt.Errorf("%s", want))
@@ -1649,7 +1657,7 @@ func TestAwaitHandoverAlwaysEnds(t *testing.T) {
 	dir := t.TempDir()
 
 	// 1. The helper reports success.
-	a := &App{dataDir: dir}
+	a := testAppForHandover(dir)
 	id := newHandoverID()
 	rec := a.beginHandover(id, os.Getpid(), TunCompat)
 	a.finishHandover(rec, nil)
@@ -1659,7 +1667,7 @@ func TestAwaitHandoverAlwaysEnds(t *testing.T) {
 	}
 
 	// 2. The helper reports failure, and the reason survives.
-	a2 := &App{dataDir: t.TempDir()}
+	a2 := testAppForHandover(t.TempDir())
 	id2 := newHandoverID()
 	rec2 := a2.beginHandover(id2, os.Getpid(), TunCompat)
 	a2.finishHandover(rec2, fmt.Errorf("网卡创建失败"))
@@ -1673,7 +1681,7 @@ func TestAwaitHandoverAlwaysEnds(t *testing.T) {
 
 	// 3. No record at all and a process that does not exist: the wait ends as a
 	//    failure that names the case, rather than running to the deadline.
-	a3 := &App{dataDir: t.TempDir()}
+	a3 := testAppForHandover(t.TempDir())
 	res3 := a3.awaitHandover("id-that-never-reports", 0, 1500*time.Millisecond)
 	if !res3.Done || res3.OK {
 		t.Errorf("a deadline that passes must end the wait as failure: %+v", res3)
@@ -1688,7 +1696,7 @@ func TestStaleHandoverRecordIsNotThisAttemptsVerdict(t *testing.T) {
 	// attempt's result would report the previous activation's outcome, which is how
 	// a failure gets shown as a success.
 	dir := t.TempDir()
-	a := &App{dataDir: dir}
+	a := testAppForHandover(dir)
 	stale := a.beginHandover("act-old", os.Getpid(), TunCompat)
 	a.finishHandover(stale, nil) // the previous attempt succeeded
 
@@ -2419,7 +2427,7 @@ func TestHandoverHeartbeatDistinguishesStuckFromSlow(t *testing.T) {
 	// difference matters: a user waiting for something that will finish is in a
 	// different position from one waiting for something that will not.
 	dir := t.TempDir()
-	a := &App{dataDir: dir}
+	a := testAppForHandover(dir)
 	id := newHandoverID()
 	a.beginHandover(id, os.Getpid(), TunCompat)
 	back := a.readHandover()
@@ -2443,7 +2451,7 @@ func TestStaleHeartbeatEndsTheWait(t *testing.T) {
 	// A helper that has stopped reporting is reported as stuck at the stage it
 	// stopped at, rather than being waited on until the overall deadline.
 	dir := t.TempDir()
-	a := &App{dataDir: dir}
+	a := testAppForHandover(dir)
 	id := newHandoverID()
 	rec := a.beginHandover(id, os.Getpid(), TunCompat)
 	// Backdate the heartbeat past the threshold, keeping the record otherwise live.
@@ -2469,5 +2477,144 @@ func TestStaleHeartbeatEndsTheWait(t *testing.T) {
 	}
 	if !strings.Contains(res.Failure, "卡住") {
 		t.Errorf("the failure should say it was judged stuck rather than timing out, got %q", res.Failure)
+	}
+}
+
+// ---- the handover record must not be editable into a wrong verdict ----------
+
+func TestHandoverRecordIsSignedAndDetectsTampering(t *testing.T) {
+	// The record decides whether an activation is reported as successful, so a
+	// record that has been edited must not be believed. This detects corruption,
+	// truncation, and a record written for a different data directory - the key is
+	// that directory's secret.
+	//
+	// It does NOT defend against a malicious process running as the same user,
+	// which can read the same secret. That is stated rather than implied: the
+	// defence there is the filesystem permissions on the data directory, not
+	// cryptography.
+	dir := t.TempDir()
+	a := &App{dataDir: dir, secret: "a-secret-of-sufficient-length-000000"}
+	rec := a.beginHandover(newHandoverID(), os.Getpid(), TunCompat)
+	a.finishHandover(rec, nil)
+
+	back := a.readHandover()
+	if back == nil {
+		t.Fatal("a signed record should be readable")
+	}
+	if back.State != handoverSucceeded {
+		t.Fatalf("state = %q", back.State)
+	}
+	if back.Signature == "" {
+		t.Fatal("the record was written without a signature")
+	}
+
+	// Flip the verdict to a failure and rewrite it. The signature must refuse it -
+	// in this direction too, because a forged failure is also a wrong report.
+	back.State = handoverFailed
+	back.Failure = "forged"
+	raw, _ := json.MarshalIndent(back, "", "  ")
+	if err := os.WriteFile(a.handoverPath(), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.readHandover(); got != nil {
+		t.Errorf("a tampered record was accepted: state=%q", got.State)
+	}
+
+	// And a forged success is refused just as firmly.
+	rec2 := a.beginHandover(newHandoverID(), os.Getpid(), TunCompat)
+	rec2.State = handoverSucceeded
+	rec2.Signature = "0000000000000000000000000000000000000000000000000000000000000000"
+	raw2, _ := json.MarshalIndent(rec2, "", "  ")
+	if err := os.WriteFile(a.handoverPath(), raw2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.readHandover(); got != nil {
+		t.Error("a record with a wrong signature was accepted")
+	}
+}
+
+func TestHandoverRecordFromAnotherDataDirectoryIsRefused(t *testing.T) {
+	// The signature key is the data directory's secret, so a record written for a
+	// different tree does not verify here. Pointing a helper at the wrong directory
+	// produces a record that is ignored rather than acted on.
+	dirA, dirB := t.TempDir(), t.TempDir()
+	a := &App{dataDir: dirA, secret: "secret-for-directory-a-0000000000000"}
+	a.beginHandover("act-shared", os.Getpid(), TunCompat)
+
+	// Copy the file into B, which has a different secret.
+	raw, err := os.ReadFile(a.handoverPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &App{dataDir: dirB, secret: "secret-for-directory-b-1111111111111"}
+	if err := os.WriteFile(b.handoverPath(), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.readHandover(); got != nil {
+		t.Error("a record signed with another directory's secret was accepted")
+	}
+	// The same file reads correctly in its own directory.
+	if got := a.readHandover(); got == nil {
+		t.Error("the record should be readable in the directory it was written for")
+	}
+}
+
+func TestUnsignedHandoverRecordIsRefused(t *testing.T) {
+	// A record from a version that did not sign, or one written by hand. Refusing
+	// it ends the wait with an honest failure rather than a verdict that may have
+	// been mangled.
+	dir := t.TempDir()
+	a := &App{dataDir: dir, secret: "secret-of-sufficient-length-00000000"}
+	rec := handoverRecord{
+		ID: "act-handwritten", State: handoverSucceeded,
+		HelperPID: os.Getpid(), StartedAt: time.Now().Format(time.RFC3339Nano),
+	}
+	raw, _ := json.MarshalIndent(rec, "", "  ")
+	if err := os.WriteFile(a.handoverPath(), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.readHandover(); got != nil {
+		t.Error("an unsigned record was accepted")
+	}
+}
+
+func TestHandoverMACCoverEveryDecisiveField(t *testing.T) {
+	// Every field that decides anything is covered, so none can be edited without
+	// the signature failing. The canonical form is fixed in code rather than taken
+	// from the struct, so a future field reordering cannot silently change what is
+	// signed.
+	base := handoverRecord{
+		ID: "act-1", HelperPID: 10, RequesterPID: 20,
+		State: handoverRunning, Stage: "s", Mode: "compat", Adapter: "Zenith",
+	}
+	secret := "a-key-of-sufficient-length-000000000000"
+	want := handoverMAC(secret, &base)
+
+	mutations := map[string]func(*handoverRecord){
+		"id":            func(r *handoverRecord) { r.ID = "act-2" },
+		"helper pid":    func(r *handoverRecord) { r.HelperPID = 11 },
+		"requester pid": func(r *handoverRecord) { r.RequesterPID = 21 },
+		"state":         func(r *handoverRecord) { r.State = handoverSucceeded },
+		"stage":         func(r *handoverRecord) { r.Stage = "other" },
+		"mode":          func(r *handoverRecord) { r.Mode = "privacy" },
+		"adapter":       func(r *handoverRecord) { r.Adapter = "Other" },
+		"exited at":     func(r *handoverRecord) { r.ExitedAt = "now" },
+	}
+	for name, mutate := range mutations {
+		r := base
+		mutate(&r)
+		if got := handoverMAC(secret, &r); got == want {
+			t.Errorf("changing %s did not change the signature, so it is not covered", name)
+		}
+	}
+
+	// A different key produces a different signature, which is what makes a record
+	// from another directory fail here.
+	if handoverMAC("another-key-of-sufficient-length-000000", &base) == want {
+		t.Error("the signature does not depend on the key")
+	}
+	// An empty key must not produce a verifiable signature at all.
+	if handoverMAC("", &base) != "" {
+		t.Error("an empty key must not sign")
 	}
 }

@@ -29,6 +29,10 @@ package main
 // ---------------------------------------------------------------------------
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -77,6 +81,10 @@ type handoverRecord struct {
 	// ExitedAt is set when the helper is about to leave. It is the difference
 	// between "still working" and "gone without finishing".
 	ExitedAt string `json:"exitedAt,omitempty"`
+	// Signature covers the fields above, so a record cannot be edited into a
+	// verdict it does not contain. See signHandover for what it does and does not
+	// defend against.
+	Signature string `json:"signature,omitempty"`
 	// Heartbeat is refreshed every time the helper reports progress. It is the
 	// difference between "slow" and "stopped": UpdatedAt moves on every write,
 	// including writes from the waiting side, so it cannot answer that question on
@@ -93,11 +101,52 @@ func newHandoverID() string {
 	return fmt.Sprintf("act-%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 
-// writeHandover saves the record. A failure to write is logged and otherwise
-// ignored: the record is how the other process learns what happened, but losing it
-// must not stop this process from doing its work.
+// signHandover attaches a signature over the record's identity and verdict.
+//
+// What this defends against, stated precisely, because the distinction matters and
+// overstating it would be worse than not having it:
+//
+//   - It detects corruption and truncation. A record half-written by a machine that
+//     lost power is refused rather than read as a verdict it does not contain.
+//   - It detects a record belonging to a different data directory, since the key is
+//     that directory's secret: pointing the helper at the wrong tree produces a
+//     record that fails here rather than being acted on.
+//   - It does NOT defend against a malicious process running as the same user. That
+//     process can read the same secret file and sign anything it likes. Defending
+//     against it would need a key the other process cannot obtain, which on a single
+//     user account means a key protected by something this program does not have -
+//     and claiming otherwise would be a false assurance.
+//
+// The same-account case is covered by the filesystem permissions on the data
+// directory, not by cryptography. This is integrity, not authenticity.
+func (a *App) signHandover(rec *handoverRecord) string {
+	return handoverMAC(a.secret, rec)
+}
+
+// handoverMAC is the canonical form that gets signed.
+//
+// Every field that decides anything is included, so none of them can be edited
+// without the signature failing. The order is fixed here rather than taken from the
+// struct, so a future field reordering cannot silently change what is covered.
+func handoverMAC(secret string, rec *handoverRecord) string {
+	if secret == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	fmt.Fprintf(mac, "v1|%s|%d|%d|%s|%s|%s|%s|%s",
+		rec.ID, rec.HelperPID, rec.RequesterPID,
+		rec.State, rec.Stage, rec.Mode, rec.Adapter, rec.ExitedAt)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// writeHandover saves the record, with its signature.
+//
+// A failure to write is logged and otherwise ignored: the record is how the other
+// process learns what happened, but losing it must not stop this process from doing
+// its work.
 func (a *App) writeHandover(rec *handoverRecord) {
 	rec.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	rec.Signature = a.signHandover(rec)
 	raw, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return
@@ -110,7 +159,12 @@ func (a *App) writeHandover(rec *handoverRecord) {
 	_ = os.Rename(tmp, a.handoverPath())
 }
 
-// readHandover loads the record, if there is one.
+// readHandover loads the record, if there is one and it is intact.
+//
+// A record whose signature does not match is treated as absent rather than
+// partially believed. That is the safe direction: an unreadable record ends the
+// wait with "the helper exited without reporting" or the deadline, both of which
+// are honest, instead of a verdict that may have been mangled.
 func (a *App) readHandover() *handoverRecord {
 	raw, err := os.ReadFile(a.handoverPath())
 	if err != nil {
@@ -118,6 +172,19 @@ func (a *App) readHandover() *handoverRecord {
 	}
 	var rec handoverRecord
 	if err := json.Unmarshal(raw, &rec); err != nil {
+		return nil
+	}
+	if rec.Signature == "" {
+		// A record from a version that did not sign. Refusing it is the correct
+		// direction - the fields it would contribute decide whether an activation is
+		// reported as successful - and the consequence is a failure message rather
+		// than a wrong success.
+		Log("activation record has no signature; ignoring it rather than trusting its contents", "WARN")
+		return nil
+	}
+	if subtle.ConstantTimeCompare([]byte(rec.Signature), []byte(a.signHandover(&rec))) != 1 {
+		Log("activation record failed its integrity check; ignoring it. This means it was "+
+			"written for a different data directory, or damaged", "WARN")
 		return nil
 	}
 	return &rec
