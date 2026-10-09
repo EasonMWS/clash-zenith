@@ -417,6 +417,7 @@ const (
 	idModeGlobal
 	idModeDirect
 	idSysProxy
+	idTun
 	idOptimize
 	idQuit
 )
@@ -508,6 +509,9 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		Log("session ending: restoring the system proxy and stopping the core")
 		app.Shutdown()
 	})
+	// The tray knows the system proxy and the modes; TUN is the third switch a user
+	// reaches for without opening the window.
+	tray.On(idTun, func() { trayToggleTun(app, bringUp) })
 	tray.On(idQuit, func() {
 		if !Confirm(AppName, "退出 Zenith？\n\n会同时停止代理并还原系统代理设置。") {
 			return
@@ -542,6 +546,13 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 			{separate: true},
 			{id: idSysProxy, label: "系统代理", checked: proxyOn},
 		}
+		// TUN belongs here for the same reason the proxy switch does: it is the other
+		// way of taking traffic, and a user who has closed the window should not have to
+		// reopen it to change which one is on.
+		//
+		// The label carries the state, because the two are mutually exclusive and a
+		// bare check mark would not say which one currently holds the traffic.
+		items = append(items, tunMenuItem(app))
 		if optimizing {
 			items = append(items, menuItem{id: idOptimize, label: "正在优选…", disabled: true})
 		} else {
@@ -556,6 +567,79 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		)
 		return items
 	})
+}
+
+// tunMenuItem describes the TUN switch for the tray.
+//
+// It reports what is actually true rather than what was last clicked: enabling TUN
+// runs a check, asks for elevation and then proves the traffic goes through the
+// tunnel, so there are three honest states - off, working, and working-on-it - and the
+// item says which.
+//
+// While an activation is running the item is disabled rather than hidden. A menu that
+// loses an entry mid-click is worse than one that shows why the entry cannot be used.
+func tunMenuItem(app *App) menuItem {
+	st := app.Status()
+	run, _ := st["tunRun"].(*tunRun)
+	mode, _ := st["tunMode"].(string)
+
+	if run != nil && run.Active {
+		label := "TUN 接管：正在启用…"
+		if run.WaitingForApproval {
+			label = fmt.Sprintf("TUN 接管：等待你点「是」（%ds）", run.WaitedSeconds)
+		} else if run.Stage != "" {
+			label = "TUN 接管：" + run.Stage
+		}
+		return menuItem{id: idTun, label: label, disabled: true}
+	}
+	if mode != "" && mode != string(TunOff) {
+		return menuItem{id: idTun, label: "TUN 接管（已启用，点击关闭）", checked: true}
+	}
+	return menuItem{id: idTun, label: "TUN 接管（需要一次系统授权）"}
+}
+
+// trayToggleTun turns TUN on or off from the tray.
+//
+// Two things it deliberately does not do.
+//
+// It does not offer to switch the system proxy off first. That would be a dialog to
+// answer, and the activation already does it - the two are mutually exclusive and the
+// activation is the thing that knows the order.
+//
+// And it does not pretend the operation is immediate. Enabling TUN asks for elevation
+// and then proves the traffic goes through the tunnel, which takes seconds to minutes
+// depending on how quickly the permission prompt is answered. The menu item shows that
+// state and is disabled while it runs, and the window stays the place where the step
+// list and the cancel button live - the tray says what is happening and does not
+// pretend to be the whole interface.
+func trayToggleTun(app *App, bringUp func()) {
+	st := app.Status()
+	run, _ := st["tunRun"].(*tunRun)
+	if run != nil && run.Active {
+		Info(AppName, "TUN 正在启用中。\n\n进度和取消按钮在窗口里——托盘只显示状态，不重复整个界面。")
+		bringUp()
+		return
+	}
+	mode, _ := st["tunMode"].(string)
+	if mode != "" && mode != string(TunOff) {
+		// Turning it off is the one direction that needs no elevation and no proof.
+		if err := app.DisableTun(); err != nil {
+			Info(AppName, fmt.Sprintf("关闭 TUN 失败：%v", err))
+			return
+		}
+		Info(AppName, "TUN 接管已关闭。\n\n不遵循系统代理的程序现在会直连；"+
+			"想恢复整机接管，右键托盘图标再点一次。")
+		return
+	}
+	// Enabling needs the window, because it needs the permission prompt explained and
+	// the progress shown - and because the cancel button has to be reachable the moment
+	// the user wants it.
+	bringUp()
+	Info(AppName, "即将启用 TUN 接管。\n\n会弹出一次系统授权窗口，请点「是」。\n"+
+		"窗口里会显示进度和倒计时，随时可以取消。")
+	if err := app.EnableTun(TunCompat); err != nil {
+		Info(AppName, fmt.Sprintf("启用 TUN 失败：%v", err))
+	}
 }
 
 func trayMode(app *App, mode string) {

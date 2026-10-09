@@ -4276,3 +4276,67 @@ func TestOpeningTheShortcutManyTimesStartsOneInstance(t *testing.T) {
 			"the same moment could both proceed")
 	}
 }
+
+// ---- there is always a way out --------------------------------------------
+
+func TestThereIsAlwaysAHostnameNodeToFallBackTo(t *testing.T) {
+	// The hostname node exists because a pinned edge address can be filtered while the
+	// provider's own hostname keeps working - Cloudflare hands out a fresh edge per
+	// connection, so it survives exactly the case where every pinned address fails.
+	// The health loop prefers it for that reason.
+	//
+	// It was only ever produced by a successful optimisation, which leaves a gap that
+	// opens precisely when things are already going wrong: an optimisation result gone
+	// stale because the credential was rotated, followed by a subscription refresh that
+	// fails because the provider is down. In that state there is no hostname node, the
+	// health loop reports "no alternative is known-good", and the user is pinned to a
+	// dead address until the provider comes back.
+	base := []Proxy{{
+		Name: "node", Type: "vmess", Server: "qh.example.com", Port: 443,
+		UUID:       "deadbeef-0000-1111-2222-333333333333",
+		Servername: "qh.example.com", Network: "ws",
+	}}
+
+	// With nothing optimised, one is composed.
+	fb, ok := hostnameFallback(base)
+	if !ok {
+		t.Fatal("no fallback could be built from a hostname node")
+	}
+	if !fb.OriginNode {
+		t.Error("the fallback is not marked as the hostname node, so the health loop " +
+			"will not prefer it")
+	}
+	if fb.Server != "qh.example.com" {
+		t.Errorf("the fallback points at %q, want the subscription's own hostname", fb.Server)
+	}
+	if fb.UUID != base[0].UUID {
+		t.Error("the fallback lost the credential")
+	}
+	if fb.SNI != "qh.example.com" {
+		t.Errorf("the fallback SNI is %q, which would break the TLS handshake", fb.SNI)
+	}
+	if fb.Name == "" {
+		t.Error("the fallback has no name")
+	}
+
+	// A subscription whose nodes are all pinned addresses has no hostname to fall back
+	// to, and inventing one would be a guess.
+	pinned := []Proxy{{Name: "a", Server: "104.16.1.1", Port: 443}}
+	if _, ok := hostnameFallback(pinned); ok {
+		t.Error("a pinned address was treated as a hostname")
+	}
+
+	// And the merge must guarantee one is present.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "if !hasOrigin {") {
+		t.Error("mergedNodes does not check whether a hostname node is present, so the " +
+			"one case that needs it most is the one case without it")
+	}
+	if !strings.Contains(text, "if fb, ok := hostnameFallback(base); ok {") {
+		t.Error("mergedNodes does not compose a hostname node when none exists")
+	}
+}

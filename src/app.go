@@ -1391,7 +1391,11 @@ func (a *App) mergedNodes() []Proxy {
 	optimized, base := a.nodeSet()
 	out := make([]Proxy, 0, len(optimized)+len(base))
 	seen := make(map[string]bool, len(optimized)+len(base))
+	hasOrigin := false
 	for _, p := range optimized {
+		if p.OriginNode {
+			hasOrigin = true
+		}
 		if !seen[p.Name] {
 			seen[p.Name] = true
 			out = append(out, p)
@@ -1403,7 +1407,56 @@ func (a *App) mergedNodes() []Proxy {
 			out = append(out, p)
 		}
 	}
+	// Guarantee a way out, always.
+	//
+	// The hostname node exists because a pinned edge address can be filtered while
+	// the provider's own hostname keeps working - Cloudflare hands out a fresh edge per
+	// connection, so it survives exactly the case where every pinned address fails.
+	// The health loop prefers it for that reason.
+	//
+	// It was only ever produced by a successful optimisation, which leaves a gap that
+	// only opens when things are already going wrong: an optimisation result that has
+	// gone stale (the credential was rotated), followed by a subscription refresh that
+	// fails (the provider is down). In that state there is no hostname node, the
+	// previous one is gone with the stale list, the health loop reports "no alternative
+	// is known-good", and the user is pinned to a dead address until the provider comes
+	// back.
+	//
+	// Composing one from the current base node closes it: nothing to download, nothing
+	// to measure, and it survives both of those failures because it depends on neither.
+	if !hasOrigin {
+		if fb, ok := hostnameFallback(base); ok {
+			if !seen[fb.Name] {
+				out = append(out, fb)
+			}
+		}
+	}
 	return out
+}
+
+// hostnameFallback builds a node that connects to the provider's own hostname rather
+// than to a pinned edge address.
+//
+// It reports ok=false when there is nothing to build from, which is the honest answer
+// for a subscription whose nodes are all pinned addresses: there is no hostname to
+// fall back to, and inventing one would be a guess.
+func hostnameFallback(base []Proxy) (Proxy, bool) {
+	for _, p := range base {
+		host := p.Server
+		if host == "" || looksLikeIPv4(host) {
+			continue
+		}
+		fb := p
+		fb.OriginNode = true
+		fb.OriginHost = host
+		fb.MeasuredMS = 0
+		if p.Servername != "" {
+			fb.SNI = p.Servername
+		}
+		fb.Name = fmt.Sprintf("兜底 · %s · 域名", host)
+		return fb, true
+	}
+	return Proxy{}, false
 }
 
 // ---- config ---------------------------------------------------------------
@@ -1550,11 +1603,19 @@ func (a *App) Status() map[string]interface{} {
 		"isOptimized":      isOptimized,
 		"settings":         st,
 		"systemProxy":      a.sysproxy.Status(),
-		"optimizing":       a.opt.Running(),
-		"progress":         a.opt.Progress(),
-		"optSummary":       a.opt.LastSummary(),
-		"lastOptimize":     snap.LastOptimize,
-		"error":            a.lastErr,
+		// The TUN state, in the same shape the interface reads.
+		//
+		// Added because the tray menu needed it and could not get it: the menu asked
+		// for "tunMode" and "tunRun" and Status returned neither, so the item reported
+		// "not enabled" whether the tunnel was up or not. A menu that lies about the
+		// switch it is offering is worse than no menu item.
+		"tunMode":      st.TunMode,
+		"tunRun":       a.TunRunState(),
+		"optimizing":   a.opt.Running(),
+		"progress":     a.opt.Progress(),
+		"optSummary":   a.opt.LastSummary(),
+		"lastOptimize": snap.LastOptimize,
+		"error":        a.lastErr,
 		"ports": map[string]int{
 			"mixed": st.MixedPort, "api": st.APIPort, "ui": st.UIPort, "control": st.ControlPort,
 		},
