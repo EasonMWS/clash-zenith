@@ -406,6 +406,42 @@ func (c *Core) Connections() Connections {
 	}
 }
 
+// ConnectionHosts lists the destinations the core is currently carrying.
+//
+// The count-only view is enough for the interface, but not for proving a tunnel
+// works: "did the core carry this request" needs the destinations, and that
+// question is the difference between a request succeeding and a request
+// succeeding through the tunnel.
+func (c *Core) ConnectionHosts() []string {
+	data, err := c.api(http.MethodGet, "/connections", nil, 6*time.Second)
+	if err != nil {
+		return nil
+	}
+	raw, ok := data["connections"].([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		meta, ok := m["metadata"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		host, _ := meta["host"].(string)
+		if host == "" {
+			host, _ = meta["destinationIP"].(string)
+		}
+		if host != "" {
+			out = append(out, host)
+		}
+	}
+	return out
+}
+
 // CloseConnections drops all live connections, used after switching nodes so a
 // bad route is not kept alive by an existing socket.
 func (c *Core) CloseConnections() {

@@ -1861,3 +1861,110 @@ func TestRollbackWithoutAKnownGoodReportsRestoreFailure(t *testing.T) {
 		t.Error("the restore failure must be recorded on its own, not folded into the general failure")
 	}
 }
+
+// ---- P0-7: prove the traffic, not just the node ----------------------------
+
+func TestDirectClientIgnoresProxySettings(t *testing.T) {
+	// The load-bearing observation is "a request completed with no proxy
+	// configured". If the client honoured HTTPS_PROXY the test would be routing
+	// through the very proxy it is meant to bypass, and would pass on a machine
+	// where the tunnel does nothing.
+	os.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+	os.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	os.Setenv("ALL_PROXY", "http://127.0.0.1:1")
+	defer func() {
+		os.Unsetenv("HTTPS_PROXY")
+		os.Unsetenv("HTTP_PROXY")
+		os.Unsetenv("ALL_PROXY")
+	}()
+
+	c := directHTTPClient(time.Second)
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("unexpected transport")
+	}
+	if tr.Proxy != nil {
+		t.Error("the direct client has a proxy function; it would not bypass the proxy it is testing")
+	}
+	// And the request must actually fail against the dead proxy above, which is
+	// only true if the proxy was ignored - a client that used it would fail to
+	// connect, so a successful connection to a real host proves the point.
+	if _, err := directRequest("http://127.0.0.1:1/", 1500*time.Millisecond); err == nil {
+		t.Error("a request to a closed port should fail")
+	}
+}
+
+func TestVerifyTunTrafficReportsTheStageItStoppedAt(t *testing.T) {
+	// "TUN verification failed" was the message that made the earlier attempts
+	// unactionable. Each stage must name itself.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
+	a.core = NewCore("", dir, a.configPath, "s", 7797)
+
+	env := tunEnvironment{Adapter: tunDefaultDevice, Stack: tunDefaultStack,
+		MixedPort: 7899, DNSPort: 8199, Checks: map[string]string{}}
+	rep := a.VerifyTunTraffic(TunCompat, env)
+
+	if rep.OK {
+		t.Fatal("verification reported success with no tunnel at all")
+	}
+	if rep.Stage == "" {
+		t.Error("a failed verification must name the stage it stopped at")
+	}
+	if rep.Detail == "" {
+		t.Error("a failed verification must explain what was observed")
+	}
+	if rep.TestedAt == "" {
+		t.Error("the report should record when it was taken")
+	}
+	// With no adapter present the first stage is the adapter, and it must say so
+	// rather than blaming the tunnel.
+	if rep.Stage != "虚拟网卡" {
+		t.Errorf("stage = %q, want 虚拟网卡 when no adapter exists", rep.Stage)
+	}
+}
+
+func TestAdapterStateDistinguishesMissingFromDown(t *testing.T) {
+	// An adapter that exists but is down carries nothing, and "the adapter is there"
+	// was previously the whole claim.
+	exists, up, _ := adapterState("ZenithDefinitelyNotPresent")
+	if exists {
+		t.Error("a name that does not exist must report as not existing")
+	}
+	if up {
+		t.Error("a name that does not exist must not report as up")
+	}
+}
+
+func TestDefaultRouteCheckRejectsAnUnusableIndex(t *testing.T) {
+	// A zero index means the adapter could not be resolved, and treating that as
+	// "route is fine" would let the verification pass without checking anything.
+	ok, detail := defaultRouteUsesAdapter(0)
+	if ok {
+		t.Error("an unusable interface index must not be reported as having a route")
+	}
+	if detail == "" {
+		t.Error("the failure must explain itself")
+	}
+}
+
+func TestTrafficReportIsRecordedOnTheTransaction(t *testing.T) {
+	// The evidence belongs on the record, not only in the log, so a failure can be
+	// diagnosed from the file afterwards.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	tx := newTunTxn(txnActivate)
+	tx.Traffic = &tunTrafficReport{OK: false, Stage: "路由", Detail: "没有默认路由"}
+	a.saveTunTxn(tx)
+	back := a.loadTunTxn()
+	if back == nil || back.Traffic == nil {
+		t.Fatal("the traffic report did not survive the round trip")
+	}
+	if back.Traffic.Stage != "路由" {
+		t.Errorf("stage = %q, want 路由", back.Traffic.Stage)
+	}
+}

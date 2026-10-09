@@ -98,6 +98,11 @@ func (s *Server) routes() {
 	// optimiser runs speak to the edge; this goes through the tunnel, which is the
 	// only way to tell whether the whole path works.
 	s.mux.HandleFunc("/api/verify", s.wrap(s.handleVerify))
+	// Whether traffic is actually being carried by the tunnel, on demand. Separate
+	// from the activation because it is also the question a user asks later, when
+	// something stops working and they want to know if the tunnel is still doing
+	// anything.
+	s.mux.HandleFunc("/api/tun/traffic", s.wrap(s.handleTunTraffic))
 	s.mux.HandleFunc("/api/quit", s.wrap(s.handleQuit))
 	s.mux.HandleFunc("/", s.handleStatic)
 }
@@ -281,6 +286,26 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		code = 200
 	}
 	writeJSON(w, code, map[string]interface{}{"ok": true, "result": res})
+}
+
+// handleTunTraffic reports whether the tunnel is carrying traffic, with the
+// evidence rather than a verdict alone.
+func (s *Server) handleTunTraffic(w http.ResponseWriter, r *http.Request) {
+	st := s.app.store.Settings()
+	if st.TunMode == TunOff {
+		writeJSON(w, 200, map[string]interface{}{
+			"ok": true,
+			"report": map[string]interface{}{
+				"ok":     false,
+				"stage":  "未启用",
+				"detail": "TUN 没有启用，所以没有隧道可以验证",
+			},
+		})
+		return
+	}
+	env := s.app.checkTunEnvironment()
+	rep := s.app.VerifyTunTraffic(st.TunMode, env)
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "report": rep})
 }
 
 // ---- end TUN --------------------------------------------------------------

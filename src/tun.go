@@ -167,7 +167,12 @@ type tunEnvironment struct {
 	// Stack is the normalized protocol stack, taken from the same source as
 	// Adapter, so the environment check, the generated configuration and the
 	// adapter lookup cannot disagree about what was decided.
-	Stack     string            `json:"stack,omitempty"`
+	Stack string `json:"stack,omitempty"`
+	// MixedPort and DNSPort are recorded here so the traffic verification checks
+	// the ports this activation actually produced, rather than re-reading settings
+	// that may have moved since.
+	MixedPort int               `json:"mixedPort,omitempty"`
+	DNSPort   int               `json:"dnsPort,omitempty"`
 	Component tunComponentState `json:"component"`
 	Others    []string          `json:"otherVpns,omitempty"`
 	Nodes     int               `json:"availableNodes"`
@@ -320,6 +325,8 @@ func (a *App) checkTunEnvironment() tunEnvironment {
 	// stage agrees on the result.
 	env.Adapter = st.NormalizedTunDevice()
 	env.Stack = st.NormalizedTunStack()
+	env.MixedPort = st.MixedPort
+	env.DNSPort = a.dnsPort
 	env.Checks["网卡名"] = env.Adapter
 	env.Checks["协议栈"] = env.Stack
 
@@ -513,6 +520,11 @@ type tunTxn struct {
 	// an activation that fails and rolls back cleanly is recoverable, one that
 	// cannot restore its own previous state is not.
 	RestoreFailure string `json:"restoreFailure,omitempty"`
+	// Traffic is the evidence that the tunnel is carrying traffic, kept on the
+	// record so a failure can be diagnosed from the file rather than only from the
+	// log, and so "it is on" is backed by observations rather than by the absence of
+	// an error.
+	Traffic *tunTrafficReport `json:"traffic,omitempty"`
 	// Owned records what this attempt changed, so a rollback touches only that.
 	Owned tunOwned `json:"owned"`
 }
@@ -877,13 +889,25 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 	txB.step("建立虚拟网卡", "done", st.NormalizedTunDevice())
 
 	// Only now is it meaningful to check that traffic flows. "The adapter exists"
-	// is not the claim being made.
-	a.setTunStage("验证真实代理请求")
-	if err := a.verifyProxyCarries(); err != nil {
-		return rollback(fmt.Errorf("网卡已建立，但真实请求没有通过隧道：%v。"+
-			"已回滚这次激活，没有把它当作成功", err))
+	// is not the claim being made, and neither is "the selected node answers a
+	// speed test": neither says anything about whether anything on this machine
+	// reaches the tunnel. The verification below gathers evidence in the order the
+	// packets travel - adapter up, default route into it, a request from this
+	// process with no proxy configured anywhere, and the core's own record of
+	// carrying it.
+	a.setTunStage("验证流量是否经过隧道")
+	traffic := a.VerifyTunTraffic(mode, env)
+	txB.Traffic = &traffic
+	a.saveTunTxn(txB)
+	if !traffic.OK {
+		txB.step("验证流量", "failed", traffic.Stage+": "+traffic.Detail)
+		return rollback(fmt.Errorf("网卡已建立，但流量没有经过隧道（%s）：%s。"+
+			"已回滚这次激活，没有把它当作成功", traffic.Stage, traffic.Detail))
 	}
-	txB.step("验证连接", "done", "真实请求已通过隧道")
+	txB.step("验证流量", "done", traffic.DirectDetail+"；"+traffic.CoreDetail)
+	if traffic.IPv6 != "" {
+		Log("TUN 提示：%s", traffic.IPv6)
+	}
 
 	// Only now, with the adapter carrying traffic, is this configuration the one
 	// worth going back to. A failure after this point would otherwise roll back to
@@ -897,7 +921,8 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 		a.tunRun.Stage = "已启用"
 	}
 	a.mu.Unlock()
-	Log("TUN enabled in %s mode; adapter %q verified carrying traffic", mode, st.NormalizedTunDevice())
+	Log("TUN enabled in %s mode; adapter %q is up, the default route uses it, and a "+
+		"proxy-free request completed through it", mode, st.NormalizedTunDevice())
 	return nil
 }
 
