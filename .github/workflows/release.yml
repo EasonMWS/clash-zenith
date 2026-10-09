@@ -110,10 +110,11 @@ jobs:
           Write-Host "self-test output: $s"
           if ($LASTEXITCODE -ne 0) { throw "the pre-parse dispatch is not reachable (exit $LASTEXITCODE)" }
           if ($s -notmatch 'selftest ok') { throw "unexpected self-test output: $s" }
-
-          $w = & .\Zenith-console.exe -self-test -watchdog "$env:TEMP\zenith-smoke" 7999 2>&1 | Out-String
-          Write-Host "watchdog-shape output: $w"
-          if ($w -notmatch 'watchdog=true') { throw "the watchdog invocation is not recognised: $w" }
+          # sample=true means the watchdog argument shape is classified correctly.
+          # It is checked against a sample inside the process, not by passing
+          # -watchdog here, because isWatchdogInvocation reads os.Args[1] and
+          # -self-test is argv[1] in this invocation.
+          if ($s -notmatch 'sample=true') { throw "the watchdog shape is not classified correctly: $s" }
 
           # And the shipped GUI binary must carry the same dispatch.
           $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path .\Zenith.exe))

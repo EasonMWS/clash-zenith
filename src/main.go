@@ -33,10 +33,20 @@ func main() {
 	// and the crash protection the user was told about did not exist. The check
 	// therefore happens first and does not rely on the flag package.
 	if isSelfTestInvocation() {
-		// Reports what the pre-parse dispatch saw, and exits. It exists so a build
-		// can prove that dispatch works without running the real watchdog, which
-		// would touch the system proxy as a side effect.
-		fmt.Printf("selftest ok args=%d watchdog=%v\n", len(os.Args), isWatchdogInvocation())
+		// Reports what the pre-parse dispatch decided, and exits.
+		//
+		// It prints the decision for the argument list it was given as well as the
+		// one it is running under, so a build can prove both shapes are classified
+		// correctly without executing either of them - running the real watchdog
+		// would clear a system proxy pointing at a dead port, and a build check
+		// must not be able to change the machine it runs on.
+		// The sample is a full argument vector including the program name, which is
+		// the same shape os.Args has: watchdogShapeOf reads index 1 onward.
+		sample := []string{"zenith.exe", "-watchdog", `C:\data`, "7899"}
+		fmt.Printf("selftest ok args=%d watchdog=%v sample=%v\n",
+			len(os.Args),
+			isWatchdogInvocation(),
+			watchdogShapeOf(sample))
 		return
 	}
 	if isWatchdogInvocation() {

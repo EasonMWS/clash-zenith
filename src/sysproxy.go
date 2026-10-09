@@ -383,6 +383,22 @@ func isSelfTestInvocation() bool {
 	return len(os.Args) >= 2 && os.Args[1] == "-self-test"
 }
 
+// watchdogShapeOf reports whether a given argument list is a watchdog invocation.
+//
+// isWatchdogInvocation answers the same question about the running process. This
+// variant exists so a build can prove the classification is right for the real
+// shape without executing it, since executing it has side effects.
+func watchdogShapeOf(args []string) bool {
+	if len(args) < 4 {
+		return false
+	}
+	if args[1] != "-watchdog" {
+		return false
+	}
+	_, err := strconv.Atoi(args[3])
+	return err == nil
+}
+
 // isWatchdogInvocation reports whether this process was started as the detached
 // recovery helper.
 //
@@ -394,15 +410,7 @@ func isSelfTestInvocation() bool {
 // A watchdog also only ever has a data directory and a port, and it never has a
 // window, so the shape of the argument list is unambiguous.
 func isWatchdogInvocation() bool {
-	if len(os.Args) < 4 {
-		return false
-	}
-	if os.Args[1] != "-watchdog" {
-		return false
-	}
-	// args: exe -watchdog <dataDir> <port>
-	_, err := strconv.Atoi(os.Args[3])
-	return err == nil
+	return watchdogShapeOf(os.Args)
 }
 
 // runWatchdogFromArgs is the detached recovery path. It runs as its own process,

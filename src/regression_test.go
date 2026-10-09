@@ -507,16 +507,16 @@ func TestSelfTestInvocationIsInert(t *testing.T) {
 		t.Error("-self-test must not be mistaken for a watchdog run")
 	}
 
-	// With the watchdog arguments following, both must be readable: this is what
-	// the release smoke test asserts on.
+	// With extra arguments following, the self-test is still recognised, and the
+	// watchdog predicate is correctly false: it reads os.Args[1], which is
+	// -self-test here. The release smoke test asserts on the classification of a
+	// sample instead, which is what watchdogShapeOf is for.
 	os.Args = []string{"zenith.exe", "-self-test", "-watchdog", `C:\data`, "7999"}
 	if !isSelfTestInvocation() {
 		t.Error("-self-test should still be recognised with extra arguments")
 	}
 	if isWatchdogInvocation() {
-		// -watchdog is not the first argument here, so this is correctly false;
-		// the smoke test reads the same predicate to show the shape is understood.
-		t.Log("watchdog is correctly not the first argument in the self-test form")
+		t.Error("-watchdog in second position must not be read as the watchdog invocation")
 	}
 
 	// A watchdog invocation proper is a different shape.
@@ -526,6 +526,32 @@ func TestSelfTestInvocationIsInert(t *testing.T) {
 	}
 	if isSelfTestInvocation() {
 		t.Error("the watchdog form must not be mistaken for a self-test")
+	}
+
+	// The classification of an arbitrary vector, which is what a build can check
+	// without executing anything.
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"zenith.exe", "-watchdog", `C:\data`, "7899"}, true},
+		{[]string{"zenith.exe", "-watchdog", `C:\data`, "0"}, true},
+		{[]string{"zenith.exe", "-watchdog", `C:\data`, "abc"}, false},
+		{[]string{"zenith.exe", "-watchdog", `C:\data`}, false},
+		{[]string{"zenith.exe", "-self-test", "-watchdog", `C:\data`, "7899"}, false},
+		{[]string{"zenith.exe", "-headless"}, false},
+		{[]string{}, false},
+	}
+	for _, c := range cases {
+		if got := watchdogShapeOf(c.args); got != c.want {
+			t.Errorf("watchdogShapeOf(%v) = %v, want %v", c.args, got, c.want)
+		}
+	}
+	// The two predicates must agree on the same vector, or the running process and
+	// the build check would disagree about what a watchdog is.
+	os.Args = []string{"zenith.exe", "-watchdog", `C:\data`, "7899"}
+	if isWatchdogInvocation() != watchdogShapeOf(os.Args) {
+		t.Error("isWatchdogInvocation and watchdogShapeOf disagree on the same vector")
 	}
 }
 
