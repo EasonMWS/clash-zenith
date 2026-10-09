@@ -34,3 +34,14 @@ desktop.ini
 
 # ---- go ----
 /vendor/
+# ---- runtime state that must never be committed ----
+#
+# config.last-good.yaml is the rollback copy of the generated configuration. It
+# is a full configuration: the same node credentials the subscription carries.
+# It was committed by accident when the configuration transaction was added, and
+# a credential in a public history is a credential that has to be replaced.
+/data/config.last-good.yaml
+/data/config-transaction.json
+/data/tun-transaction.json
+/data/candidates.stat.json
+/data/activation.yield
