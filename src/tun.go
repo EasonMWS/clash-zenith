@@ -700,6 +700,70 @@ func (a *App) runEnableTun(mode TunMode) {
 		Log("TUN 提示：%s", w)
 	}
 
+	// The service owns the core on a machine where it has been installed, and an
+	// activation then needs no further authorisation - which is the whole reason it
+	// exists. The request is still authenticated and still goes through the same
+	// ownership decision, so this is not a shortcut around the checks; it is the
+	// path that does not need a prompt.
+	if serviceReachable() {
+		a.setTunStage("交由 Zenith 服务启用")
+		cfgNodes := a.mergedNodes()
+		cfgSettings := a.store.Settings()
+		cfg := BuildConfig(cfgNodes, a.optimizedNames(), cfgSettings,
+			a.secret, a.store.Snapshot().Current, a.dnsPort)
+		if err := validateCandidateConfig(cfg); err != nil {
+			txA.step("生成配置", "failed", err.Error())
+			txA.State = "failed"
+			txA.Failure = "生成的配置没有通过校验：" + err.Error()
+			a.saveTunTxn(txA)
+			a.failTun(fmt.Errorf("%s", txA.Failure))
+			return
+		}
+		if _, err := a.store.UpdateSettings(map[string]interface{}{
+			"tunMode":   string(mode),
+			"tunDevice": env.Adapter,
+			"tunStack":  env.Stack,
+		}); err != nil {
+			txA.step("保存设置", "failed", err.Error())
+			txA.State = "failed"
+			txA.Failure = err.Error()
+			a.saveTunTxn(txA)
+			a.failTun(err)
+			return
+		}
+		txA.step("请求服务", "pending", "由常驻服务接管，无需再次授权")
+		a.saveTunTxn(txA)
+		if err := a.serviceStartRequest([]byte(cfg), mode); err != nil {
+			txA.step("请求服务", "failed", err.Error())
+			txA.State = "failed"
+			txA.Failure = err.Error()
+			a.saveTunTxn(txA)
+			a.failTun(err)
+			return
+		}
+		txA.step("请求服务", "done", "服务已带 TUN 配置启动内核")
+		txA.State = "done"
+		a.saveTunTxn(txA)
+		// The service owns the core; verifying the tunnel is the caller's job, since
+		// the evidence is gathered from this machine's interfaces and routes.
+		return
+	}
+
+	// No service yet. Ask once to install it, and if that is declined or fails, fall
+	// through to the per-activation elevation that worked before - a machine without
+	// the service must still be able to use the feature.
+	if !isElevated() {
+		if err := a.ensureService(); err == nil {
+			txA.step("安装服务", "done", "已安装并启动常驻服务，之后启用不再需要授权")
+			a.saveTunTxn(txA)
+			// Re-enter through the service path now that it exists.
+			go a.EnableTun(mode)
+			return
+		} else {
+			txA.step("安装服务", "skipped", err.Error()+"；改用每次授权的方式")
+		}
+	}
+
 	// Privilege is requested after the checks that need none, so a machine that
 	// cannot support TUN is told that before it is asked for a password.
 	if !isElevated() {

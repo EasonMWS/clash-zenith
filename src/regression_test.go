@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2088,5 +2089,156 @@ func TestSecretIsUsableAsAnAPIHeader(t *testing.T) {
 	}
 	if !ensureSecretFileExists(dir) {
 		t.Error("a directory with a secret should report one")
+	}
+}
+
+// ---- P0-2/P0-5: one owner for the core, and an authenticated channel --------
+
+func TestServiceRefusesRequestsWithoutTheSecret(t *testing.T) {
+	// The channel is what lets the window ask a resident service to start and stop
+	// the core. It must authenticate, or any process on the machine could redirect
+	// every connection this computer makes.
+	h := &serviceHandler{secret: "the-real-secret", app: &App{}}
+	srv := httptest.NewServer(h.routes())
+	defer srv.Close()
+
+	// The liveness endpoint is deliberately open: it answers "is anything there",
+	// which the window needs before it can decide who owns the core, and it reveals
+	// nothing and changes nothing.
+	resp, err := http.Get(srv.URL + "/alive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/alive = %d, want 200: the window must be able to ask without a secret", resp.StatusCode)
+	}
+
+	// Everything that acts needs the secret.
+	for _, path := range []string{"/core/start", "/core/stop", "/core/state"} {
+		for _, hdr := range []string{"", "wrong", "the-real-secre", "the-real-secretx"} {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader("{}"))
+			if hdr != "" {
+				req.Header.Set("X-Zenith-Secret", hdr)
+			}
+			r2, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r2.Body.Close()
+			if r2.StatusCode != http.StatusUnauthorized {
+				t.Errorf("%s with secret %q = %d, want 401", path, hdr, r2.StatusCode)
+			}
+		}
+	}
+}
+
+func TestServiceAcceptsTheCorrectSecret(t *testing.T) {
+	// And the correct secret works, or the channel would be useless.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
+	a.core = NewCore("", dir, a.configPath, "s", 7797)
+	h := &serviceHandler{secret: "the-real-secret", app: a}
+	srv := httptest.NewServer(h.routes())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/core/state", nil)
+	req.Header.Set("X-Zenith-Secret", "the-real-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/core/state with the correct secret = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestServiceRefusesAConfigurationTheCoreWouldReject(t *testing.T) {
+	// The service validates before it acts. A window that sends a broken
+	// configuration gets it refused with a reason, rather than a core that fails to
+	// start with no explanation - which was the failure mode that made the earlier
+	// attempts unactionable.
+	dir := t.TempDir()
+	st, _ := NewStore(dir)
+	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
+	a.core = NewCore("", dir, a.configPath, "s", 7797)
+	h := &serviceHandler{secret: "s3cret-value-long-enough", app: a}
+	srv := httptest.NewServer(h.routes())
+	defer srv.Close()
+
+	body, _ := json.Marshal(map[string]string{"config": "this is not a configuration", "mode": "compat"})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/core/start", bytes.NewReader(body))
+	req.Header.Set("X-Zenith-Secret", "s3cret-value-long-enough")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("response was not JSON: %s", raw)
+	}
+	if out.OK {
+		t.Error("the service accepted a configuration the core would reject")
+	}
+	if !strings.Contains(out.Error, "校验") {
+		t.Errorf("the refusal should say it was a validation failure, got %q", out.Error)
+	}
+}
+
+func TestCoreOwnerIsDecidedByAsking(t *testing.T) {
+	// One owner, decided by asking rather than assuming. When the service is not
+	// reachable and no core is running, nobody owns it - and that is a state the
+	// caller must handle rather than a nil dereference.
+	a := &App{dataDir: t.TempDir()}
+	a.core = NewCore("", t.TempDir(), filepath.Join(t.TempDir(), "c.yaml"), "s", 7797)
+	// No service is running in the test environment.
+	if got := a.coreOwnerNow(); got != ownerNone && got != ownerSelf {
+		t.Errorf("owner = %q, want none or self when no service answers", got)
+	}
+}
+
+func TestSecretEqualIsConstantTimeAndRejectsEmpties(t *testing.T) {
+	if secretEqual("", "abc") {
+		t.Error("an empty candidate must not match")
+	}
+	if secretEqual("abc", "") {
+		t.Error("an empty expected secret must never match anything")
+	}
+	if secretEqual("abc", "abd") {
+		t.Error("different secrets must not match")
+	}
+	if !secretEqual("abc", "abc") {
+		t.Error("equal secrets must match")
+	}
+}
+
+func TestServiceStateSurvivesARestart(t *testing.T) {
+	// The record is how a window that starts later learns what the service holds,
+	// and how a diagnostic sees who owns the core without asking anyone.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	if got := a.loadServiceState(); got != nil {
+		t.Fatal("a fresh directory should have no service state")
+	}
+	a.saveServiceState(&serviceState{CorePID: 4242, Mode: "compat", ConfigDigest: "abc"})
+	back := a.loadServiceState()
+	if back == nil {
+		t.Fatal("the state could not be read back")
+	}
+	if back.CorePID != 4242 || back.Mode != "compat" || back.ConfigDigest != "abc" {
+		t.Errorf("the record lost data: %+v", back)
+	}
+	if back.UpdatedAt == "" {
+		t.Error("the record should say when it was written")
 	}
 }

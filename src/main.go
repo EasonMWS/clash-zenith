@@ -71,6 +71,10 @@ func main() {
 		// different one, so a stale file cannot be read as this attempt's verdict.
 		handoverIDFlag   = flag.String("handover-id", "", "internal: activation id for the result record")
 		requesterPIDFlag = flag.Int("requester-pid", 0, "internal: pid of the instance awaiting the result")
+		// -service runs the resident process that owns the core. -install-service is
+		// what the one authorisation runs: it registers that service with Windows.
+		serviceFlag        = flag.Bool("service", false, "internal: run as the resident core service")
+		installServiceFlag = flag.Bool("install-service", false, "internal: register the resident service")
 		// Raised by the elevation request. The elevated instance runs the same
 		// product; it only differs in having the rights the adapter and the routes
 		// need, and it is the one that performs the activation transaction.
@@ -186,6 +190,29 @@ func main() {
 	}
 
 	Log("root=%s uiPort=%d headless=%v", rootDir, uiPort, *headless)
+
+	// Registering the service is what the one authorisation does. It is dispatched
+	// before everything else because it must not open a window, must not touch the
+	// system proxy, and must exit as soon as the service is registered.
+	if *installServiceFlag {
+		app.sysproxy.SetReadOnly(true)
+		app.core.SetNoOrphanCleanup(true)
+		if err := app.installService(); err != nil {
+			Log("install service: %v", err, "ERR")
+			os.Exit(1)
+		}
+		return
+	}
+
+	// The resident service. It holds the core and answers the authenticated
+	// channel; it never opens a window or a tray icon.
+	if *serviceFlag {
+		if err := RunService(rootDir, app.dataDir, app.secret); err != nil {
+			Log("service: %v", err, "ERR")
+			os.Exit(1)
+		}
+		return
+	}
 
 	// The elevated instance is dispatched here, before the single-instance check.
 	//
