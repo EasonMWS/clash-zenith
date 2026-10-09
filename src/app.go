@@ -22,6 +22,11 @@ const (
 	// is broken. A first run against an empty data directory downloads the rule
 	// databases, which on a slow link takes a couple of minutes.
 	coreStartGrace = 4 * time.Minute
+
+	// coreRestartDelay is the much shorter window applied once a core has already
+	// answered in this run. Long enough that a deliberate restart is not fought
+	// over, short enough that a machine is not left offline for minutes.
+	coreRestartDelay = 20 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -58,6 +63,11 @@ type App struct {
 	// coreStartedAt is when this process last started a core, so a port that is
 	// not bound yet can be told apart from a port nothing will ever serve.
 	coreStartedAt time.Time
+	// coreEverCameUp records that a core has answered at least once in this run.
+	// It is what separates a first start, which needs a long grace period
+	// because a fresh data directory downloads its rule databases, from a
+	// core that died after working, which needs to be replaced promptly.
+	coreEverCameUp bool
 
 	mu         sync.Mutex
 	optimizing bool
@@ -600,6 +610,14 @@ func (a *App) bootCore() {
 	}
 }
 
+// noteCoreCameUp records that a core has answered in this run, so the long first-start
+// grace period stops applying.
+func (a *App) noteCoreCameUp() {
+	a.mu.Lock()
+	a.coreEverCameUp = true
+	a.mu.Unlock()
+}
+
 // background runs the housekeeping loop: core watchdog, dead proxy guard,
 // scheduled subscription refresh and scheduled optimisation.
 func (a *App) background() {
@@ -635,13 +653,39 @@ func (a *App) background() {
 			continue
 		}
 
+		// Track whether this core has ever answered, so the grace period can be told
+		// apart from a failure. Set here rather than only after a recovery, because
+		// the core that bootCore started also counts.
+		if a.coreEverCameUp {
+			// already known
+		} else if a.core.IsUp() {
+			a.noteCoreCameUp()
+		}
+
 		if !a.core.IsUp() {
-			// Give the core room to finish its first start. A brand new data
-			// directory has no rule databases yet, so mihomo downloads them and
-			// that takes far longer than the health check interval. Restarting
-			// it mid-download looped forever, because every restart began the
-			// same download again and the core never got to answer.
-			if time.Since(started) < coreStartGrace {
+			// Give the core room to finish its FIRST start. A brand new data
+			// directory has no rule databases yet, so mihomo downloads them and that
+			// takes far longer than the health check interval. Restarting it
+			// mid-download looped forever, because every restart began the same
+			// download again and the core never got to answer.
+			//
+			// But that reasoning only applies to a core that has never answered. Once
+			// a core has been up in this run, a core that is down is a core that died,
+			// and four minutes is not a grace period for that - it is four minutes of
+			// the machine being offline while the proxy setting points at a port with
+			// nothing behind it.
+			//
+			// Measured: the core died at 22:11:02 and the watchdog restarted it at
+			// 22:13:56, because the grace period was measured from process start rather
+			// than from the failure. Nearly three minutes, for no reason that applies
+			// to a core that had already been serving.
+			if !a.coreEverCameUp {
+				if time.Since(started) < coreStartGrace {
+					continue
+				}
+			} else if time.Since(started) < coreRestartDelay {
+				// A short delay so a core that is being deliberately restarted - by a
+				// settings change, by an activation - is not fought over.
 				continue
 			}
 			// Only this process may recover a core it started. When the service owns
@@ -671,6 +715,7 @@ func (a *App) background() {
 			// offline while a checkbox says otherwise.
 			if a.core.Ensure() {
 				a.lastErr = ""
+				a.noteCoreCameUp()
 				continue
 			}
 			a.ensureNotOfflineBecauseOfUs()

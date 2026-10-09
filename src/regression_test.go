@@ -4117,3 +4117,39 @@ func TestTheRuleIsAppliedAgainAfterTheCoreShouldHaveStarted(t *testing.T) {
 			"chance to bind")
 	}
 }
+
+func TestACoreThatDiedIsRestartedPromptly(t *testing.T) {
+	// The long grace period exists for a genuine first start: a fresh data directory
+	// has no rule databases, mihomo downloads them, and restarting it mid-download
+	// looped forever because every restart began the same download again.
+	//
+	// But that reasoning only applies to a core that has never answered. Measured, it
+	// was being applied to a core that had been serving and then died: the core went
+	// down at 22:11:02 and the watchdog restarted it at 22:13:56, nearly three minutes
+	// of the machine being offline with the proxy pointing at a port nothing was
+	// behind, for a reason that did not apply.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "coreEverCameUp") {
+		t.Fatal("nothing distinguishes a first start from a core that died after working, " +
+			"so every failure waits out the first-start grace period")
+	}
+	if !strings.Contains(text, "coreRestartDelay = 20 * time.Second") {
+		t.Error("there is no shorter window for a core that has already answered")
+	}
+	// The recovery must be the prompt one, and the grace period must be conditional.
+	if !strings.Contains(text, "if !a.coreEverCameUp {") {
+		t.Error("the first-start grace period is not conditional on the core never " +
+			"having answered")
+	}
+	// It must be recorded in both places a core can come up: the one bootCore started,
+	// and the one recovery started.
+	if strings.Count(text, "noteCoreCameUp()") < 2 {
+		t.Error("the first answer is not recorded on both paths, so a core started by " +
+			"bootCore would never shorten the window")
+	}
+}
