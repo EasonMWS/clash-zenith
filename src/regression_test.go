@@ -3160,3 +3160,163 @@ func TestSubscriptionParsingCannotProduceAnUnsafeNestedKey(t *testing.T) {
 		}
 	}
 }
+
+// ---- the interface must not hand its token to a foreign page ---------------
+
+func TestForeignPageCannotObtainTheToken(t *testing.T) {
+	// A hostile page can navigate the browser to http://127.0.0.1:<port>/. The
+	// response used to carry the API token, so that page could then read it. Fetch
+	// Metadata is set by the browser and cannot be forged by a page, which is what
+	// makes the distinction available.
+	const expect = "127.0.0.1:7799"
+
+	foreign := []struct {
+		name    string
+		fetch   string
+		origin  string
+		wantRef bool
+	}{
+		{"cross-site navigation", "cross-site", "https://evil.example", true},
+		{"same-site, another port", "same-site", "http://127.0.0.1:8080", true},
+		{"foreign origin with no metadata", "", "https://evil.example", true},
+		{"foreign origin even when metadata lies", "same-origin", "https://evil.example", true},
+		{"unrecognised metadata", "something-new", "", true},
+		// Ours, and the two shapes a legitimate load takes.
+		{"our own page", "same-origin", "http://127.0.0.1:7799", false},
+		{"a navigation the user started", "none", "", false},
+		// No metadata at all: a local script or a command-line client. It cannot be
+		// distinguished from the browser, and the honest answer is to allow it and
+		// say so in the README rather than to pretend the token authenticates users.
+		{"no metadata, no origin", "", "", false},
+	}
+	for _, c := range foreign {
+		r := httptest.NewRequest(http.MethodGet, "http://"+expect+"/", nil)
+		r.Host = expect
+		if c.fetch != "" {
+			r.Header.Set("Sec-Fetch-Site", c.fetch)
+		}
+		if c.origin != "" {
+			r.Header.Set("Origin", c.origin)
+		}
+		got := !interfaceRequestAllowed(r, expect)
+		if got != c.wantRef {
+			t.Errorf("%s: refused = %v, want %v", c.name, got, c.wantRef)
+		}
+	}
+}
+
+func TestOriginComparisonIsExactOnPort(t *testing.T) {
+	// The previous check accepted any loopback origin, so another application on
+	// this machine was treated as ours.
+	const expect = "127.0.0.1:7799"
+	ours := []string{"http://127.0.0.1:7799", "http://localhost:7799"}
+	for _, o := range ours {
+		if !originIsOurs(o, expect) {
+			t.Errorf("originIsOurs(%q) = false, want true", o)
+		}
+	}
+	notOurs := []string{
+		"http://127.0.0.1:8080",
+		"http://localhost:8081",
+		"https://127.0.0.1:7799",
+		"http://evil.example",
+		"http://127.0.0.1",
+		"",
+		"not a url",
+	}
+	for _, o := range notOurs {
+		if originIsOurs(o, expect) {
+			t.Errorf("originIsOurs(%q) = true, want false", o)
+		}
+	}
+}
+
+func TestConfigPreviewIsRedacted(t *testing.T) {
+	// The preview existed to show what the rules produce, and it carried the core
+	// secret, every node UUID and every WebSocket path. The token is not an account
+	// boundary, so what the interface hands out should not be a credential even to a
+	// legitimate caller.
+	cfg := `mixed-port: 7890
+external-controller: 127.0.0.1:7797
+secret: "the-core-control-secret"
+proxies:
+  - name: "node"
+    type: vmess
+    server: example.com
+    uuid: 187d8fa9-569b-49e4-bd00-bbb318a4f295
+    ws-opts:
+      path: "/a-private-path"
+      headers:
+        Host: front.example.com
+rules:
+  - "DOMAIN-SUFFIX,example.com,PROXY"
+`
+	out := RedactConfigForDisplay(cfg)
+	for _, leak := range []string{
+		"the-core-control-secret",
+		"187d8fa9-569b-49e4-bd00-bbb318a4f295",
+		"/a-private-path",
+	} {
+		if strings.Contains(out, leak) {
+			t.Errorf("the preview still carries %q:\n%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, "<hidden>") {
+		t.Error("nothing was replaced, so the redaction did not run")
+	}
+	// The structure is the useful part and must survive: a preview that hid the
+	// keys would not be a preview.
+	for _, keep := range []string{
+		"mixed-port: 7890",
+		"external-controller: 127.0.0.1:7797",
+		"server: example.com",
+		"DOMAIN-SUFFIX,example.com,PROXY",
+		"secret:",
+		"uuid:",
+	} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("the preview lost %q, which makes it useless for its purpose:\n%s", keep, out)
+		}
+	}
+	// The Host header is deliberately kept, and that decision is recorded rather
+	// than accidental: it is what rules match on.
+	if !strings.Contains(out, "front.example.com") {
+		t.Error("the Host header was hidden; it is what rules match on")
+	}
+	// Line count is preserved, so the preview still lines up with the real file.
+	if strings.Count(out, "\n") != strings.Count(cfg, "\n") {
+		t.Errorf("redaction changed the number of lines: %d -> %d",
+			strings.Count(cfg, "\n"), strings.Count(out, "\n"))
+	}
+}
+
+func TestConfigRedactionLeavesCommentsAndBlanksAlone(t *testing.T) {
+	in := "# a comment mentioning secret: not-a-secret\n\nsecret: \"real\"\n"
+	out := RedactConfigForDisplay(in)
+	if !strings.Contains(out, "# a comment mentioning secret: not-a-secret") {
+		t.Error("a comment was altered")
+	}
+	if strings.Contains(out, `"real"`) {
+		t.Error("the real secret was not masked")
+	}
+}
+
+func TestUUIDLikeRecognisesOnlyUUIDs(t *testing.T) {
+	yes := []string{
+		"187d8fa9-569b-49e4-bd00-bbb318a4f295",
+		`"187d8fa9-569b-49e4-bd00-bbb318a4f295"`,
+	}
+	for _, v := range yes {
+		if !uuidLike(v) {
+			t.Errorf("uuidLike(%q) = false, want true", v)
+		}
+	}
+	no := []string{"", "short", "187d8fa9-569b-49e4-bd00-bbb318a4f29",
+		"187d8fa9x569b-49e4-bd00-bbb318a4f295", "example.com",
+		"187d8fa9-569b-49e4-bd00-bbb318a4f2955"}
+	for _, v := range no {
+		if uuidLike(v) {
+			t.Errorf("uuidLike(%q) = true, want false", v)
+		}
+	}
+}

@@ -29,6 +29,9 @@ type Server struct {
 	uiPort  int
 	mux     *http.ServeMux
 	webRoot string
+	// expectHost is the host:port this server answers on. Origin comparisons are
+	// made against it exactly, so another loopback port is not treated as ours.
+	expectHost string
 	// token is a per-launch secret required by every API route.
 	//
 	// The API binds to loopback, but loopback is not an authentication boundary:
@@ -42,6 +45,8 @@ type Server struct {
 }
 
 func NewServer(app *App, webRoot string, uiPort int) *Server {
+	// Set below from the port, so the origin check has an exact reference.
+
 	s := &Server{
 		app:     app,
 		uiPort:  uiPort,
@@ -126,10 +131,12 @@ func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) http.HandlerFu
 			})
 			return
 		}
-		// A browser sends Origin on cross-origin writes. Anything that is not our
-		// own page is refused outright, so a malicious site cannot drive the API
-		// even with the token somehow known.
-		if o := r.Header.Get("Origin"); o != "" && !s.originAllowed(o) {
+		// Refuse anything a page on another origin caused. This covers the Origin
+		// header and Fetch Metadata, and it is stricter than before: the Origin
+		// comparison is now exact on scheme, host and port, where it previously
+		// accepted any loopback origin - so another application on this machine was
+		// treated as ours.
+		if !interfaceRequestAllowed(r, s.expectHost) {
 			writeJSON(w, 403, map[string]interface{}{
 				"ok": false, "error": "跨源请求已被拒绝",
 			})
@@ -370,6 +377,23 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	// together with the Host and Origin checks that is what keeps the API ours.
 	// A strict CSP goes with it: the UI needs no remote origins at all.
 	if strings.HasSuffix(clean, ".html") {
+		// The page carries the API token, so a page on another origin must not be
+		// able to obtain it. A navigation from a hostile site to this port would
+		// otherwise deliver the token into a document that site can read.
+		//
+		// A request with no Fetch Metadata at all - a local script - still reaches
+		// the page without the token, which is the honest outcome: it cannot be
+		// distinguished from the browser, and serving it a page that simply lacks
+		// the token is better than refusing the interface.
+		if !interfaceRequestAllowed(r, s.expectHost) {
+			Log("refused to serve the interface with a token to a request from %q",
+				r.Header.Get("Sec-Fetch-Site"), "WARN")
+			w.Header().Set("Content-Security-Policy", "default-src 'none'")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			_, _ = w.Write([]byte("<!doctype html><title>Zenith</title>" +
+				"<p>请通过 Zenith 打开的窗口使用界面。"))
+			return
+		}
 		w.Header().Set("Content-Security-Policy",
 			"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "+
 				"script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -556,7 +580,9 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 			"directCN": st.DirectCNDomains,
 			// inverted on purpose: true means the game platforms go direct
 			"gamePlatformDirectOff": st.GamePlatformDirectOff,
-			"currentCfg":            s.app.CurrentConfigPreview(),
+			// Redacted: the preview is for reading the structure, and it used to carry
+			// the core secret, every node UUID and every WebSocket path.
+			"currentCfg": RedactConfigForDisplay(s.app.CurrentConfigPreview()),
 		})
 		return
 	}
