@@ -409,6 +409,9 @@ func (s *Store) saveLocked() error {
 		s.seenSize = st.Size()
 	}
 	s.seenRevision = s.state.Revision
+	// state.json holds the subscription URL and the settings, so it is narrowed like
+	// the other credentials rather than left with whatever the directory grants.
+	restrictSensitiveFiles(filepath.Dir(s.path))
 	return nil
 }
 
@@ -573,15 +576,72 @@ func (s *Store) SetSubscriptions(subs []Subscription) error {
 	return s.saveLocked()
 }
 
+// sameNodeMaterial reports whether two node lists would connect to the same thing.
+//
+// Compared on the fields that decide whether a node works: where it connects, what
+// credential it presents, and how it wraps the connection. A name is not among them,
+// because renaming a node does not invalidate an optimisation and re-running one
+// because a label moved would be its own defect.
+func sameNodeMaterial(a, b []Proxy) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		switch {
+		case x.Type != y.Type, x.Server != y.Server, x.Port != y.Port,
+			x.UUID != y.UUID, x.Password != y.Password, x.Cipher != y.Cipher,
+			x.SNI != y.SNI, x.Servername != y.Servername, x.Network != y.Network,
+			x.AlterID != y.AlterID:
+			return false
+		}
+		if !sameStringMap(x.WSOpts, y.WSOpts) ||
+			!sameStringMap(x.GrpcOpts, y.GrpcOpts) ||
+			!sameStringMap(x.H2Opts, y.H2Opts) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameStringMap compares two option maps by their scalar values.
+func sameStringMap(a, b map[string]interface{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || fmt.Sprint(av) != fmt.Sprint(bv) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Store) SetNodes(base, optimized []Proxy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// A change to the base nodes means the material optimisation works from has
 	// changed, so anything derived from the previous material is now stale.
+	//
+	// The generation is bumped only when the material actually differs, and that
+	// comparison is the point. It used to be bumped whenever base was supplied, which
+	// looked equivalent and is not: a subscription refresh that returns the same
+	// number of nodes with the same names but different credentials - which is what a
+	// provider's UUID reset produces - changed every hidden field and left the names
+	// alone, so the generation did not move, the stored optimisation still counted as
+	// current, and the program kept offering seventeen edge addresses carrying a
+	// credential that had been revoked. Every one of them failed its delay test, the
+	// health loop kept switching between them, and the interface showed a full node
+	// list with nothing usable in it.
+	//
+	// Compared on the fields that decide whether a node works, not on the whole
+	// struct: a name that changed is cosmetic, and re-running an optimisation because
+	// a label moved would be its own defect.
 	if base != nil {
-		s.state.SubGeneration++
-	}
-	if base != nil {
+		if !sameNodeMaterial(s.state.BaseNodes, base) {
+			s.state.SubGeneration++
+		}
 		s.state.BaseNodes = base
 	}
 	if optimized != nil {

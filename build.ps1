@@ -58,8 +58,25 @@ if (-not (Test-Path $core)) {
 }
 
 if ($Clean) {
-    foreach ($p in @($OutExe, (Join-Path $Root 'data'), (Join-Path $Root 'logs'))) {
-        if (Test-Path $p) { Remove-Item $p -Recurse -Force; Write-Step "已清理 $p" }
+    # Only build output and caches. NOT data\ and NOT logs\.
+    #
+    # It used to remove both, recursively. data\ is where the user's subscription, their
+    # settings, the generated configuration and the recovery copy live - so a build with
+    # -Clean destroyed the user's setup, and did it with a step line that read like
+    # routine tidying. Someone asking for a clean build is asking for the compiler's
+    # leftovers to go, not for their account to disappear.
+    #
+    # The build artifacts that actually accumulate are removed below. Anything in
+    # data\ or logs\ is the user's and is left alone; a build that needs it gone can
+    # say so, but it will not happen by accident.
+    $artifacts = @($OutExe, "$OutExe~",
+        (Join-Path $SrcDir 'zenith-build.log'))
+    foreach ($p in $artifacts) {
+        if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Step "已清理构建产物（data\ 和 logs\ 保留）"
+    if (Test-Path (Join-Path $Root 'data\state.json')) {
+        Write-Step "  你的订阅和设置在 data\ 里，本次未动" 'DarkGray'
     }
 }
 

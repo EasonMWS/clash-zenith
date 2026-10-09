@@ -105,6 +105,34 @@ func loadOrCreateSecret(dataDir string) (string, error) {
 	return secret, nil
 }
 
+// restrictSensitiveFiles narrows every file in the data directory that carries a
+// credential.
+//
+// Only the control secret was restricted, and that was the wrong scope. The generated
+// configuration holds the same control secret, every node UUID, every password and
+// every WebSocket path, and the last-good copy holds a full previous set - so the
+// protection was applied to the smallest of the three files that needed it. Measured:
+// the config was readable with an inherited ACE granting Users, which is every
+// account on the machine.
+//
+// Missing files are skipped rather than created: this runs at points where some of
+// them legitimately do not exist yet, and a function that made empty files to protect
+// them would be its own defect.
+func restrictSensitiveFiles(dataDir string) {
+	for _, name := range []string{
+		"control.secret",
+		"config.yaml",
+		"config.last-good.yaml",
+		"state.json",
+	} {
+		p := filepath.Join(dataDir, name)
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		restrictSecretFile(p)
+	}
+}
+
 // restrictSecretFile narrows a file to the accounts that must read it, and no
 // others.
 //

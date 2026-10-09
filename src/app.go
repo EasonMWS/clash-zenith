@@ -1278,6 +1278,11 @@ func (a *App) writeConfig(nodes []Proxy, st Settings) {
 	if err := os.WriteFile(a.configPath, []byte(cfg), 0o644); err != nil {
 		Log("could not write config: %v", err, "ERR")
 	}
+
+	// The generated configuration carries the control secret, every node UUID and
+	// every WebSocket path. Narrowed here so every path that writes it is covered,
+	// rather than each caller remembering.
+	restrictSensitiveFiles(a.dataDir)
 }
 
 // applyConfig rewrites the configuration and hot reloads it. No process restart.

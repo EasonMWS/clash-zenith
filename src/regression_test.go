@@ -3661,7 +3661,6 @@ func TestAdapterInstanceIDIsReadNotConstructed(t *testing.T) {
 	}
 }
 
-
 // ---- a starting core is not a dead proxy -----------------------------------
 
 func TestDeadProxyGuardLeavesOurOwnPortAlone(t *testing.T) {
@@ -3702,5 +3701,105 @@ func TestDeadProxyGuardLeavesOurOwnPortAlone(t *testing.T) {
 	sp.SetExpectedPort(0)
 	if sp.ownPortExpected(7899) {
 		t.Error("a zero configured port must not exempt anything")
+	}
+}
+
+// ---- a credential change invalidates the optimisation ----------------------
+
+func TestACredentialChangeInvalidatesTheOptimisation(t *testing.T) {
+	// Observed, after a provider reset a subscription's UUID:
+	//
+	// The refresh returned one node with the same name and the same shape and a new
+	// UUID. The generation counter did not move, so the stored optimisation still
+	// counted as current and the program kept offering seventeen edge addresses
+	// carrying a credential that had been revoked. Every one failed its delay test,
+	// the health loop kept switching between them, and the interface showed a full
+	// node list with nothing usable in it.
+	//
+	// The material comparison is the fix: a change to what a node connects with
+	// invalidates what was derived from it.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := []Proxy{{
+		Name: "n", Type: "vmess", Server: "1.2.3.4", Port: 443,
+		UUID: "aaaaaaaa-1111-2222-3333-444444444444", Network: "ws",
+		WSOpts: map[string]interface{}{"path": "/x"},
+	}}
+	if err := st.SetNodes(base, nil); err != nil {
+		t.Fatal(err)
+	}
+	gen := st.Snapshot().SubGeneration
+	// The optimisation is stored through the guarded setter, which is what records
+	// the generation it belongs to. Writing the list directly would leave the
+	// generation at zero and the result permanently "not current", which is a
+	// different bug from the one under test.
+	if ok, err := st.SetOptimizedIfCurrent(gen, []Proxy{{Name: "opt"}}); err != nil || !ok {
+		t.Fatalf("storing the optimisation failed: ok=%v err=%v", ok, err)
+	}
+	if !st.OptimizedIsCurrent() {
+		t.Fatal("a fresh optimisation should be current")
+	}
+
+	// The same material again: nothing to redo.
+	if err := st.SetNodes(base, nil); err != nil {
+		t.Fatal(err)
+	}
+	if st.Snapshot().SubGeneration != gen {
+		t.Error("re-importing identical material must not invalidate the optimisation")
+	}
+	if !st.OptimizedIsCurrent() {
+		t.Error("identical material must leave the optimisation current")
+	}
+
+	// A new credential with everything else identical - exactly what a UUID reset
+	// produces.
+	rotated := []Proxy{{
+		Name: "n", Type: "vmess", Server: "1.2.3.4", Port: 443,
+		UUID: "bbbbbbbb-1111-2222-3333-444444444444", Network: "ws",
+		WSOpts: map[string]interface{}{"path": "/x"},
+	}}
+	if err := st.SetNodes(rotated, nil); err != nil {
+		t.Fatal(err)
+	}
+	if st.Snapshot().SubGeneration == gen {
+		t.Error("a rotated credential must invalidate the optimisation")
+	}
+	if st.OptimizedIsCurrent() {
+		t.Error("the stored optimisation carries the revoked credential and must not " +
+			"be reported as current")
+	}
+}
+
+func TestMaterialComparisonIgnoresNamesOnly(t *testing.T) {
+	// A renamed node is the same node. Re-running an optimisation because a label
+	// moved would be its own defect, so the comparison deliberately omits the name.
+	a := []Proxy{{Name: "first", Type: "vmess", Server: "1.2.3.4", Port: 443,
+		UUID: "aaaaaaaa-1111-2222-3333-444444444444"}}
+	b := []Proxy{{Name: "second", Type: "vmess", Server: "1.2.3.4", Port: 443,
+		UUID: "aaaaaaaa-1111-2222-3333-444444444444"}}
+	if !sameNodeMaterial(a, b) {
+		t.Error("a name is cosmetic and must not count as a material change")
+	}
+	// Everything that decides whether the node works does count.
+	for _, mutate := range []func(*Proxy){
+		func(p *Proxy) { p.Server = "5.6.7.8" },
+		func(p *Proxy) { p.Port = 8443 },
+		func(p *Proxy) { p.UUID = "bbbbbbbb-1111-2222-3333-444444444444" },
+		func(p *Proxy) { p.Type = "vless" },
+		func(p *Proxy) { p.Network = "grpc" },
+		func(p *Proxy) { p.WSOpts = map[string]interface{}{"path": "/y"} },
+	} {
+		c := []Proxy{{Name: "first", Type: "vmess", Server: "1.2.3.4", Port: 443,
+			UUID: "aaaaaaaa-1111-2222-3333-444444444444"}}
+		mutate(&c[0])
+		if sameNodeMaterial(a, c) {
+			t.Errorf("a change to %+v must count as material", c[0])
+		}
+	}
+	if sameNodeMaterial(a, nil) {
+		t.Error("a different number of nodes is a material change")
 	}
 }
