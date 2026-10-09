@@ -3311,8 +3311,8 @@ func TestUUIDLikeRecognisesOnlyUUIDs(t *testing.T) {
 			t.Errorf("uuidLike(%q) = false, want true", v)
 		}
 	}
-	no := []string{"", "short", "deadbeef-569b-49e4-bd00-bbb318a4f29555",
-		"deadbeefx569b-49e4-bd00-bbb318a4f29", "example.com",
+	no := []string{"", "short", "deadbeef-0000-1111-bd00-22223333333355",
+		"deadbeefx0000-1111-bd00-bbb318a4f29", "example.com",
 		"00000000-1111-2222-3333-4444444444445"}
 	for _, v := range no {
 		if uuidLike(v) {
@@ -3658,5 +3658,49 @@ func TestAdapterInstanceIDIsReadNotConstructed(t *testing.T) {
 	}
 	if !strings.Contains(string(src), "PnPDeviceID") {
 		t.Error("the instance id is not read from the adapter")
+	}
+}
+
+
+// ---- a starting core is not a dead proxy -----------------------------------
+
+func TestDeadProxyGuardLeavesOurOwnPortAlone(t *testing.T) {
+	// Observed, with timestamps from the log:
+	//
+	//   19:53:52  the program starts
+	//   19:53:53  the watchdog arms on the configured port
+	//   19:54:03  "system proxy points at dead port 7899 -> fixing"
+	//   19:54:03  "system proxy disabled"       <- the machine is now offline
+	//   19:57:24  the core comes up (the user was answering the elevation prompt)
+	//   19:57:28  TUN verified carrying traffic
+	//
+	// Four minutes with no internet, because the guard could not tell a port about to
+	// be served from a port nothing would ever serve. The window is not theoretical:
+	// with TUN enabled the core is started by an elevated activation, so there is a
+	// prompt to read and answer between the window opening and the core answering.
+	dir := t.TempDir()
+	sp := NewSystemProxy(dir)
+
+	// Without a configured port, a dead port is still cleaned up - the guard keeps
+	// its original purpose.
+	if sp.ownPortExpected(7899) {
+		t.Error("with no configured port, no port should be treated as ours")
+	}
+
+	sp.SetExpectedPort(7899)
+	if !sp.ownPortExpected(7899) {
+		t.Error("the configured port must not be treated as a dead proxy")
+	}
+	// A different port is still somebody's leftover and still gets cleaned up.
+	for _, other := range []int{7908, 8080, 1, 65535} {
+		if sp.ownPortExpected(other) {
+			t.Errorf("port %d is not the configured port and must not be exempt", other)
+		}
+	}
+	// And the exemption is off when nothing is configured, so the guard does not stop
+	// working on a machine that has never set a port.
+	sp.SetExpectedPort(0)
+	if sp.ownPortExpected(7899) {
+		t.Error("a zero configured port must not exempt anything")
 	}
 }

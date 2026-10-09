@@ -188,6 +188,15 @@ func (a *App) rebindDirs(dataDir string) {
 		dataDir, a.configPath, a.secret, st.ControlPort)
 	a.opt = NewOptimizer(dataDir)
 	a.sysproxy = NewSystemProxy(dataDir)
+	// Tell the dead-proxy guard which port is ours before anything can call it.
+	//
+	// Without this the guard cannot tell a registry entry pointing at a port we are
+	// about to serve from one pointing at a port nothing will ever serve, so it
+	// treats a core that has not started yet as a broken proxy and disables it. That
+	// is what happened after a reboot: at 19:54:03 the proxy was disabled because the
+	// core had not come up, and the machine had no internet until the core was
+	// started by an elevated activation four minutes later.
+	a.sysproxy.SetExpectedPort(st.MixedPort)
 }
 
 // ---- geodata bootstrap ----------------------------------------------------

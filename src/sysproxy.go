@@ -39,6 +39,10 @@ type proxySnapshot struct {
 }
 
 type SystemProxy struct {
+	// expectedPort is the port this program is configured to listen on. The
+	// dead-proxy guard uses it to tell a registry entry pointing at a port we are
+	// about to serve from one pointing at a port nothing will ever serve.
+	expectedPort int
 	snapshotPath string
 	tookProxy    bool
 	proxyPort    int
@@ -374,10 +378,46 @@ func (s *SystemProxy) GuardDeadProxy() {
 	if port == 0 || IsPortListening(port) {
 		return
 	}
+	// The port this program is configured to use is not a dead port while the core is
+	// still starting. Disabling the proxy there is the difference between "the machine
+	// has no internet" and "the machine has internet in ten seconds", and it was
+	// observed doing exactly that: at 19:54:03 the interface found the registry
+	// pointing at the configured port before the core had come up, disabled the
+	// proxy, and the machine was offline until 19:57:28 when the core was started by
+	// an elevated activation and the setting was put back by hand.
+	//
+	// The window is real rather than theoretical. With TUN enabled the core is started
+	// by an elevated activation, so between this program opening its window and the
+	// core answering there is a prompt for the user to read and answer.
+	if s.ownPortExpected(port) {
+		return
+	}
 	Log("system proxy points at dead port %d -> fixing", port, "WARN")
 	if !s.Restore() {
 		s.Disable()
 	}
+}
+
+// ownPortExpected reports whether a port is the one this program is configured to
+// listen on, and therefore not evidence of a dead proxy.
+//
+// It answers yes only when the configured port matches, which keeps the original
+// purpose of the guard: a registry entry left pointing at a port this program will
+// never serve is still cleaned up, because that is the case the guard exists for.
+// What it stops doing is cleaning up the port it is about to serve.
+func (s *SystemProxy) ownPortExpected(port int) bool {
+	if s.expectedPort <= 0 || port != s.expectedPort {
+		return false
+	}
+	Log("system proxy points at port %d, which is the port this program serves; "+
+		"leaving it alone while the core starts", port)
+	return true
+}
+
+// SetExpectedPort records the port this program is configured to listen on, so the
+// dead-proxy guard does not mistake a starting core for a broken proxy.
+func (s *SystemProxy) SetExpectedPort(port int) {
+	s.expectedPort = port
 }
 
 // NeutraliseFromOtherProcess is the last resort for the case where Zenith's
