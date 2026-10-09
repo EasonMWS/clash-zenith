@@ -152,7 +152,13 @@ func main() {
 			}
 		}
 		app.rebindDirs(abs)
-		Log("isolated run: data dir=%s, system proxy disabled", abs, "WARN")
+		// Make the promise real. Announcing "the system proxy will not be touched"
+		// in the log was not enough: this run's own dead-port guard then disabled
+		// the proxy that the real instance was serving, because the guard cannot
+		// tell a broken proxy from one belonging to an instance it must not
+		// disturb. Every mutating path now returns early.
+		app.sysproxy.SetReadOnly(true)
+		Log("isolated run: data dir=%s, system proxy is read-only", abs, "WARN")
 	}
 	st := app.store.Settings()
 	uiPort := st.UIPort
@@ -162,11 +168,14 @@ func main() {
 	// An explicit "leave my network alone" switch. Two Zenith instances on
 	// different UI ports would otherwise both try to own the system proxy, and
 	// whichever started last would silently steal it.
-	if *noProxy && st.SystemProxy {
-		if _, err := app.store.UpdateSettings(map[string]interface{}{"systemProxy": false}); err == nil {
-			st.SystemProxy = false
-			Log("running with -no-proxy: the system proxy will not be touched")
+	if *noProxy {
+		app.sysproxy.SetReadOnly(true)
+		if st.SystemProxy {
+			if _, err := app.store.UpdateSettings(map[string]interface{}{"systemProxy": false}); err == nil {
+				st.SystemProxy = false
+			}
 		}
+		Log("running with -no-proxy: the system proxy will not be touched")
 	}
 
 	Log("root=%s uiPort=%d headless=%v", rootDir, uiPort, *headless)
@@ -186,6 +195,9 @@ func main() {
 		if !mode.Valid() || mode == TunOff {
 			mode = TunCompat
 		}
+		// The elevated helper manages the tunnel, not the system proxy. Claiming the
+		// proxy would make two processes own one setting.
+		app.sysproxy.SetReadOnly(true)
 		Log("elevated instance: activating TUN in %s mode", mode)
 		// No window, no tray, no second UI server: this process exists only for
 		// the activation, which needs rights the ordinary instance does not have.

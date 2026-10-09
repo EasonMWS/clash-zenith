@@ -1256,3 +1256,44 @@ func TestInjectedPortCannotReachTheRealConfiguration(t *testing.T) {
 		t.Error("a subscription enabled LAN exposure")
 	}
 }
+
+// ---- a run that promised not to touch the proxy must keep that promise -----
+
+func TestReadOnlySystemProxyRefusesToMutate(t *testing.T) {
+	// The promise used to be a log line. An isolated run then disabled the proxy
+	// the real instance was serving, because its dead-port guard cannot tell a
+	// broken proxy from one belonging to an instance it must not disturb.
+	dir := t.TempDir()
+	sp := NewSystemProxy(dir)
+	sp.SetReadOnly(true)
+
+	// Every mutating path must be inert. These are called with a port nothing is
+	// listening on, which is exactly the condition that used to trigger a write.
+	before := sp.Status()
+	sp.GuardDeadProxy()
+	if sp.Restore() {
+		t.Error("Restore reported success on a read-only handle")
+	}
+	sp.Disable()
+	after := sp.Status()
+	if before.Enabled != after.Enabled || before.Server != after.Server {
+		t.Errorf("a read-only handle changed the proxy state: %+v -> %+v", before, after)
+	}
+}
+
+func TestReadOnlyIsOffByDefault(t *testing.T) {
+	// A normal instance must still be able to manage the proxy, or the read-only
+	// guard would turn into a feature that silently stops working.
+	sp := NewSystemProxy(t.TempDir())
+	if sp.readOnly {
+		t.Error("a freshly created SystemProxy should not be read-only")
+	}
+	sp.SetReadOnly(true)
+	if !sp.readOnly {
+		t.Error("SetReadOnly(true) did not take effect")
+	}
+	sp.SetReadOnly(false)
+	if sp.readOnly {
+		t.Error("SetReadOnly(false) did not take effect")
+	}
+}

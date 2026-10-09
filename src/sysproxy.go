@@ -43,6 +43,22 @@ type SystemProxy struct {
 	tookProxy    bool
 	proxyPort    int
 	blockedBy    string
+	// readOnly makes every mutating method a no-op.
+	//
+	// It exists because a promise made in a log line is not a promise the code
+	// keeps. An isolated run announced that it would not touch the system proxy,
+	// and then its own dead-port guard disabled the proxy the real instance was
+	// serving - because the guard cannot tell "this proxy is broken" from "this
+	// proxy belongs to an instance I must not disturb". A flag on the handle is
+	// the stronger statement.
+	readOnly bool
+}
+
+// SetReadOnly makes this handle refuse to change anything. An isolated run still
+// needs to read the current state in order to report it, but must never write,
+// restore or clean up a setting that belongs to another instance.
+func (s *SystemProxy) SetReadOnly(v bool) {
+	s.readOnly = v
 }
 
 func NewSystemProxy(stateDir string) *SystemProxy {
@@ -283,6 +299,9 @@ func (s *SystemProxy) Enable(port int, bypass string, force bool) (took bool, er
 
 // Disable only flips the switch; it does not restore anything.
 func (s *SystemProxy) Disable() {
+	if s.readOnly {
+		return
+	}
 	_ = regSet("ProxyEnable", "REG_DWORD", "0")
 	s.tookProxy = false
 	NotifyWinInet()
@@ -292,6 +311,9 @@ func (s *SystemProxy) Disable() {
 // Restore hands the setting back to whoever owned it before, or switches it off
 // when that owner is gone. Returns true when it changed something.
 func (s *SystemProxy) Restore() bool {
+	if s.readOnly {
+		return false
+	}
 	if !s.tookProxy {
 		Log("system proxy was never taken by Zenith; leaving it untouched")
 		return false
@@ -337,6 +359,13 @@ func (s *SystemProxy) Restore() bool {
 // GuardDeadProxy is the background safety net: if the registry points at a port
 // nobody listens on the user is silently offline, so put it back.
 func (s *SystemProxy) GuardDeadProxy() {
+	if s.readOnly {
+		// A run that promised not to touch the system proxy must not interpret a
+		// dead port as its own to clean up. The port may belong to the instance it
+		// is not allowed to disturb, and doing so once took a live instance's proxy
+		// down and left the machine without one.
+		return
+	}
 	st := s.Status()
 	if !st.Enabled || st.Server == "" {
 		return
