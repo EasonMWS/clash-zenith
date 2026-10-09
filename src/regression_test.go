@@ -2412,3 +2412,62 @@ func TestWaitForCoreUpToleratesAnExitAfterSuccess(t *testing.T) {
 		t.Error("a core that is answering must be reported as up even if the exit channel is closed")
 	}
 }
+
+func TestHandoverHeartbeatDistinguishesStuckFromSlow(t *testing.T) {
+	// UpdatedAt moves on every write, including writes from the waiting side, so it
+	// cannot answer "is the helper still working". The heartbeat can, and the
+	// difference matters: a user waiting for something that will finish is in a
+	// different position from one waiting for something that will not.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	id := newHandoverID()
+	a.beginHandover(id, os.Getpid(), TunCompat)
+	back := a.readHandover()
+	if back.Heartbeat == "" {
+		t.Fatal("starting should record a heartbeat, or the wait cannot tell stuck from slow")
+	}
+	first := back.Heartbeat
+
+	time.Sleep(10 * time.Millisecond)
+	a.progressHandover(back, "建立虚拟网卡")
+	back = a.readHandover()
+	if back.Heartbeat == first {
+		t.Error("reporting progress should refresh the heartbeat")
+	}
+	if back.Stage != "建立虚拟网卡" {
+		t.Errorf("stage = %q", back.Stage)
+	}
+}
+
+func TestStaleHeartbeatEndsTheWait(t *testing.T) {
+	// A helper that has stopped reporting is reported as stuck at the stage it
+	// stopped at, rather than being waited on until the overall deadline.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	id := newHandoverID()
+	rec := a.beginHandover(id, os.Getpid(), TunCompat)
+	// Backdate the heartbeat past the threshold, keeping the record otherwise live.
+	// The record is edited rather than re-created so this exercises the path the
+	// waiting side actually reads.
+	rec.Heartbeat = time.Now().Add(-2 * handoverHeartbeatTimeout).Format(time.RFC3339Nano)
+	rec.Stage = "建立虚拟网卡"
+	a.writeHandover(rec)
+	_ = rec
+
+	start := time.Now()
+	res := a.awaitHandover(id, os.Getpid(), 60*time.Second)
+	elapsed := time.Since(start)
+
+	if !res.Done || res.OK {
+		t.Fatalf("a stalled helper must end the wait as a failure: %+v", res)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("took %v to notice a stalled heartbeat; it should be immediate", elapsed)
+	}
+	if !strings.Contains(res.Failure, "建立虚拟网卡") {
+		t.Errorf("the failure should name the stage it stalled at, got %q", res.Failure)
+	}
+	if !strings.Contains(res.Failure, "卡住") {
+		t.Errorf("the failure should say it was judged stuck rather than timing out, got %q", res.Failure)
+	}
+}

@@ -44,6 +44,15 @@ const (
 	handoverFailed    = "failed"
 )
 
+// handoverHeartbeatTimeout is how long a stage may go without progress before the
+// helper is considered stuck rather than slow.
+//
+// The longest legitimate step is the adapter appearing, which the activation polls
+// for up to twenty seconds, plus a core restart. Ninety seconds is comfortably past
+// that and far short of the overall deadline, so a genuine stall is reported while
+// the user is still watching rather than minutes later.
+const handoverHeartbeatTimeout = 90 * time.Second
+
 // handoverRecord is the helper's report, written where the waiting side can read
 // it.
 type handoverRecord struct {
@@ -68,6 +77,11 @@ type handoverRecord struct {
 	// ExitedAt is set when the helper is about to leave. It is the difference
 	// between "still working" and "gone without finishing".
 	ExitedAt string `json:"exitedAt,omitempty"`
+	// Heartbeat is refreshed every time the helper reports progress. It is the
+	// difference between "slow" and "stopped": UpdatedAt moves on every write,
+	// including writes from the waiting side, so it cannot answer that question on
+	// its own.
+	Heartbeat string `json:"heartbeat,omitempty"`
 }
 
 func (a *App) handoverPath() string {
@@ -188,6 +202,26 @@ func (a *App) awaitHandover(id string, helperPID int, timeout time.Duration) han
 			}
 		}
 
+		// A helper whose heartbeat has stopped is not slow, it is stuck. Saying so
+		// as soon as the heartbeat goes quiet is the difference between a user
+		// waiting for something that will finish and a user waiting for something
+		// that will not.
+		if rec != nil && rec.ID == id && rec.State == handoverRunning && rec.Heartbeat != "" {
+			if hb, err := time.Parse(time.RFC3339Nano, rec.Heartbeat); err == nil {
+				if time.Since(hb) > handoverHeartbeatTimeout {
+					return handoverResult{
+						Done:  true,
+						OK:    false,
+						Stage: lastStage,
+						Failure: fmt.Sprintf("提权实例停在「%s」已经超过 %s，没有任何进展，"+
+							"判定为卡住并停止等待。这通常意味着它在这一步被系统阻止了"+
+							"（例如授权没有生效，或系统策略不允许创建网卡）",
+							lastStage, handoverHeartbeatTimeout),
+					}
+				}
+			}
+		}
+
 		if time.Now().After(deadline) {
 			return handoverResult{
 				Done:  true,
@@ -235,6 +269,10 @@ func (a *App) beginHandover(id string, requesterPID int, mode TunMode) *handover
 		Mode:         string(mode),
 		Adapter:      adapter,
 		StartedAt:    time.Now().Format(time.RFC3339Nano),
+		// A heartbeat from the first moment, so the waiting side can tell "has not
+		// started reporting yet" from "stopped reporting" without waiting for the
+		// overall deadline to answer the wrong question.
+		Heartbeat: time.Now().Format(time.RFC3339Nano),
 	}
 	a.writeHandover(rec)
 	return rec
@@ -259,6 +297,7 @@ func (a *App) progressHandover(rec *handoverRecord, stage string) {
 		return
 	}
 	rec.Stage = stage
+	rec.Heartbeat = time.Now().Format(time.RFC3339Nano)
 	a.writeHandover(rec)
 }
 
