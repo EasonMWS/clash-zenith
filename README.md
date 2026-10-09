@@ -191,8 +191,20 @@ secrets differed — a core that was plainly running reported as unavailable.
 5. Proves the traffic goes through the tunnel, in the order the packets travel: the
    adapter is up, the default route points into it, a request leaves this process
    with **no proxy configured anywhere**, and the core's own connection table shows
-   it carried that request. DNS, IPv6 and UDP are checked against what the mode
-   promises.
+   it carried that request. Those are three separate questions — *is traffic being
+   taken*, *is it leaving through a proxy*, and *is anything bypassing it* — and each
+   is answered separately so a failure names the one that failed.
+
+   DNS and IPv6 are reported rather than enforced. This program does not claim to
+   prevent a leak, and the section below says what that means.
+
+6. **Enabling TUN switches the system proxy off**, and records that it did, so a
+   failed activation puts back the arrangement you started with. The two ways of
+   taking traffic are mutually exclusive: with TUN on, the routing table carries the
+   traffic and the proxy setting has no effect on it. Allowing both would give you a
+   machine where the checkbox says one thing, the routing table says another, and
+   nothing explains the difference. Turning the system proxy on while TUN is in use is
+   refused with an instruction rather than an error code.
 
 If any step fails it says which one and why. The adapter is removed, the previous
 configuration is restored and read back to confirm it matches, and the mode returns
@@ -205,12 +217,31 @@ still reached `configure tun interface: Access is denied`. It never opens that f
 Earlier versions checked for it and told you your build was incomplete, which was
 wrong.
 
-**Three states, described honestly:**
+**Two states, described honestly, and they are mutually exclusive:**
 
 | State | What it means |
 |---|---|
 | System proxy | Only applications that honour the system proxy are routed. Games and UDP go direct |
-| TUN takeover (compat) | Supported traffic is taken over and your rules still apply. **Direct is still allowed** — this is not "everything is proxied" and there is no kill switch |
+| TUN takeover | Supported traffic is taken over and your rules still apply. **Direct is still allowed** — this is not "everything is proxied" and there is no kill switch |
+
+Whichever is on, the other one is off. Enabling TUN turns the system proxy off;
+enabling the system proxy while TUN runs is refused, and the refusal tells you to turn
+TUN off first.
+
+**There was a third state, called privacy, and it is gone.** It was supposed to be a
+kill switch: protected traffic may only leave through the tunnel. What it did was
+install two Windows Firewall rules blocking all outbound and inbound traffic. Outbound
+traffic includes the tunnel's own traffic, so enabling it cut the connection before the
+tunnel could carry anything — and what it left behind was a machine with no internet and
+a firewall rule that this program could install but not remove, because `netsh` returns
+"The requested operation requires elevation" for the account it runs as. It was removed
+rather than repaired. What this program will not do is report "protected" while a mode
+like that fails.
+
+**And there is no kill switch of any kind.** If the tunnel drops, traffic that your
+rules send direct still goes direct. That is a property of the design, not an omission
+— a kill switch that can strand you offline with no way back is worse than none, which
+is the lesson the removed mode taught.
 
 **Uninstall removes only Zenith's own adapter.** The driver file is deliberately
 left in place, because another application may be using the same one.
@@ -220,7 +251,7 @@ the first list depends on the honesty of the second.
 
 Verified on a real Windows 11 machine, by a person clicking through the prompt:
 
-- An activation completed. The log reads
+- **TUN works, repeatedly.** The log reads
 
       TUN enabled in compat mode; adapter "Zenith" is up, the default route uses it,
       and a proxy-free request completed through it
@@ -228,30 +259,37 @@ Verified on a real Windows 11 machine, by a person clicking through the prompt:
   and the machine agrees: the adapter is up on its own interface index, the default
   route goes through it at metric 0, a request with no proxy configured anywhere
   returns a real status, and the core's own connection table shows it carried that
-  request. That chain is what the code requires before it will say the word
-  "enabled" — the check was written first and this is the first time it has passed.
-- The fallback path ran for real, because the service install failed on a
-  permissions defect at the time. A machine with no service still works.
-- The resident service's channel answers correctly: `/alive` without a credential,
-  and every endpoint that acts returns 401 without the secret and 200 with it,
-  checked against a live process.
+  request. That chain is what the code requires before it will say the word "enabled".
+  With the tunnel up and no system proxy set at all, baidu, google, github and youtube
+  all answered.
+- **A core that dies is replaced in about nine seconds.** Measured: the core was killed
+  at 22:15:55, the watchdog logged the failure at 22:16:02, the core was up at
+  22:16:03, and the network answered through it immediately after.
+- **A leftover proxy of ours is cleared at startup, before anything else runs.** The
+  check has three guards — the setting must be ours, must name exactly the port this
+  program serves, and there must be no core that is going to serve it — so it cannot
+  take away a working arrangement or touch another program's configuration.
+- **The service channel is authenticated.** `/alive` answers with a proof that the
+  service holds the shared secret, computed over a nonce the client chose; the secret
+  itself never crosses the wire, and nothing else is sent to the service until that
+  proof checks out. Verified against a live process, and against a server answering
+  with the wrong proof.
 
 Not verified:
 
-- **The one-authorisation service install has not completed.** The service is
-  registered on the test machine and will not start without elevation, which this
-  environment cannot supply — `sc create` and `sc start` both return `Access is
-  denied` without it. The registration code is written and reviewed, and the
-  service process itself is verified when run directly.
-- **The adapter has been created but privacy mode has never been exercised**, and
-  neither have sleep/wake, multiple network adapters, or coexistence with another
-  VPN. An activation succeeded in compat mode; that is the extent of what has been
-  observed.
-- **A core started under elevation cannot be restarted by the process that did not
-  start it.** The consequence is that the port and the configuration on disk can
-  disagree, and the interface can report a port that nothing is listening on. The
-  resident service is what removes this class of problem, which is the reason it
-  exists — and it is the piece that has not run.
+- **The one-authorisation service install has never completed.** The service is
+  registered on the test machine but will not start without elevation, which this
+  environment cannot supply — `sc create` and `sc start` both return `Access is denied`
+  without it. The SCM protocol is implemented and its behaviour is verified when run by
+  hand (it correctly refuses, saying it was not started by the service control manager),
+  but the one-prompt install has not run end to end. Until it does, TUN uses the
+  per-activation prompt, which works.
+- **Sleep/wake, multiple network adapters, and coexistence with another VPN have never
+  been exercised.**
+- **DNS and IPv6 are reported, not blocked.** The tunnel suppresses multihomed DNS
+  leakage through `strict-route`, and a global IPv6 address is reported as a path the
+  tunnel does not cover — but nothing prevents it. The program says so rather than
+  claiming otherwise.
 
 ### What this does not do
 
@@ -519,7 +557,15 @@ TUN 在流量前面放一块虚拟网卡来补上这个缺口。
    而不是猜一个睡眠时间够不够。
 5. **按包经过的顺序证明流量真的进了隧道**：网卡已启用 → 默认路由指向它 →
    本进程在**没有任何代理设置**的情况下发出请求 → 内核自己的连接表里有这次请求。
-   DNS、IPv6、UDP 按所选模式的要求分别检查。
+   这是**三个分开的问题**——*流量被接管了吗*、*它是从代理出去的吗*、*有东西绕过它吗*——
+   每个单独回答，所以失败时能说清是哪一个失败了。
+
+   DNS 和 IPv6 是**报告**，不是**阻断**。这个程序不声称能防泄露，下面写清了这意味着什么。
+
+6. **开 TUN 会自动关掉系统代理**，并把这个动作记录在事务里，所以激活失败会恢复你原本的状态。
+   两种接管方式**互斥**：TUN 开着时，路由表接管了流量，系统代理设置对它不起作用。
+   两个都开的结果是"勾选框说一套、路由表说另一套、界面不解释差在哪"。
+   TUN 在用时开系统代理会被拒绝，并告诉你先关哪个，而不是丢一个错误码。
 
 任何一步失败都会**说清是哪一步、为什么**。删掉本次创建的网卡，**恢复之前的配置并读回比对确认**，
 模式回到关闭。**没做到的事绝不会被报成成功。**
@@ -529,41 +575,61 @@ TUN 在流量前面放一块虚拟网卡来补上这个缺口。
 都到达 `configure tun interface: Access is denied`。它根本不读那个文件。
 早先的版本会检查它，然后告诉你"这个构建不完整"——那是错的。
 
-**三种状态，分别描述：**
+**两种状态，分别描述，而且互斥：**
 
 | 状态 | 含义 |
 |---|---|
 | 系统代理 | 只有遵循系统代理的应用被路由，游戏和 UDP 直连 |
-| TUN 接管（兼容） | 接管支持范围内的流量并仍按规则分流，**仍允许直连**——不等于"全部流量经代理"，也没有 Kill Switch |
+| TUN 接管 | 接管支持范围内的流量并仍按规则分流，**仍允许直连**——不等于"全部流量经代理"，也没有 Kill Switch |
 
+无论哪个开着，另一个就是关的。开 TUN 会关掉系统代理；TUN 在用时开系统代理会被拒绝，
+拒绝信息会告诉你先关 TUN。
+
+**曾经有第三种状态叫"隐私保护"，已经删除。** 它本意是个 Kill Switch：受保护流量只走隧道。
+实际做的是装两条 Windows 防火墙规则，阻断所有出站和入站流量。
+**出站流量包含隧道自己的流量**，所以一开就先断网，隧道根本建不起来；
+而它留下的是一台没有网络、外加一条**这个程序装得上却删不掉**的防火墙规则——
+因为 `netsh` 对程序运行的那个账户返回 `The requested operation requires elevation`。
+它是被**删除**的，不是被修好的。这个程序不会在一个这样的模式失败时还显示"已保护"。
+
+**而且它没有任何形式的 Kill Switch。** 隧道掉了，按规则直连的流量照旧直连。
+这是设计的一部分，不是遗漏——一个能把你锁在离线状态、又没有退路的 Kill Switch，
+比没有更糟。这是那个被删掉的模式留下的教训。
 **卸载只删除 Zenith 自己的网卡。** 驱动文件**故意不删**，因为别的软件可能正在用同一个。
 
 **哪些验证过、哪些没有** —— 分开写，因为前一份清单的价值取决于后一份的诚实程度。
 
 **在真实 Windows 11 上、由人点过一次授权之后验证过的：**
 
-- **一次激活完整跑通了。** 日志原话：
+- **TUN 能用，而且反复能开。** 日志原话：
 
       TUN enabled in compat mode; adapter "Zenith" is up, the default route uses it,
       and a proxy-free request completed through it
 
   机器也确认了：网卡在它自己的接口上处于 Up、默认路由指向它且 metric 为 0、
   在**没有任何代理设置**的情况下请求拿到了真实响应、内核自己的连接表里有这次请求。
-  这正是代码在说出"已启用"之前要求的证据链——**这条检查是先写的，这是它第一次通过**。
-- **回退路径真实跑过**（当时服务因为一个权限缺陷装不上）。没装服务的机器确实能用。
-- **常驻服务的通道应答正确**：`/alive` 无需凭据，所有会改变状态的端点无凭据返回 401、
-  正确凭据返回 200，都是对着一个真实运行的进程验的。
+  这正是代码在说出"已启用"之前要求的证据链。
+  隧道开着、系统代理完全不设的情况下，baidu、google、github、youtube 全部正常。
+- **内核死掉后大约 9 秒自动换新。** 实测：22:15:55 杀掉内核，22:16:02 看门狗记录失败，
+  22:16:03 新内核就绪，之后网络立刻恢复。（改之前这个数字是 2 分 54 秒。）
+- **程序自己留下的死代理会在启动时被清掉，而且排在所有事情之前。** 这条检查有三道闸：
+  设置必须是我们的、必须正好指向本程序服务的端口、并且必须**没有任何内核会来服务它**。
+  所以它既不会撤掉一个正常工作的配置，也不会碰别的程序的设置。
+- **服务通道是带认证的。** `/alive` 会用一段 HMAC 证明它持有共享密钥，覆盖客户端选的随机数、
+  时间戳和端口；**密钥本身两个方向都不传输**，证明验证通过之前不会向服务发送任何其他东西。
+  对着真实进程验过，也对着一个"回错证明"的服务器验过。
 
 **没有验证的：**
 
-- **"一次授权完成安装"没有走完过。** 服务在测试机上已注册，但没有管理员权限就起不来，
+- **"一次授权完成安装"从未完整跑通过。** 服务在测试机上已注册，但没有管理员权限就起不来，
   而当前环境提供不了——`sc create` 和 `sc start` 没有它都返回 `Access is denied`。
-  注册代码写完并审过；服务进程本身在直接运行时验证过了。
-- **网卡建起来过，但隐私模式从未被实际使用过**，睡眠唤醒、多网卡、
-  与其他 VPN 共存也都没有实测。成功的那次是兼容模式——观测到的就这么多。
-- **提权启动的内核，不能被"不是它父进程"的那个进程重启。** 后果是磁盘上的端口和配置
-  可能不一致，界面可能报一个没人在听的端口。**常驻服务就是用来消除这一类问题的，
-  这也正是它存在的理由——而它恰恰是没跑起来的那一块。**
+  SCM 服务协议已经实现，手工运行时的行为也验证过（它会正确地拒绝，并说明自己不是由
+  服务控制管理器启动的），但"一次授权装好"这条路没走完。在它走通之前，
+  TUN 用的是"每次授权"的方式——那条路能work。
+- **睡眠唤醒、多网卡、与其他 VPN 共存，都没有实测过。**
+- **DNS 和 IPv6 是报告出来的，不是阻断的。** 隧道通过 `strict-route` 抑制多宿主 DNS 泄露，
+  全局 IPv6 地址会作为"隧道没覆盖的路径"被报告出来——但没有任何东西阻止它。
+  程序如实这么说，而不是反过来声称。
 
 ### 这个软件做不到什么
 
@@ -571,7 +637,9 @@ TUN 在流量前面放一块虚拟网卡来补上这个缺口。
 
 - **默认是系统代理客户端，不是整机隧道。** 不读系统代理的程序——大多数游戏、
   任何走原始 UDP 的东西、任何自带网络栈的软件——都会直连。**TUN 接管能覆盖这部分**，
-  它在兼容模式下成功跑通过一次；除此之外，这里没有任何东西是"整机保证"。
+  它已经反复跑通；**但没有 Kill Switch**，隧道掉了，直连的流量照旧直连。
+- **DNS 和 IPv6 不阻断。** 隧道会抑制多宿主 DNS 泄露，全局 IPv6 会被报告成一条
+  隧道没覆盖的路径——但没有任何东西阻止它。想彻底干净，自己在网卡上关掉 IPv6。
 - **嗅探不是拦截。** 流量嗅探能从**已经进入内核**的连接里还原出域名，好让规则匹配它。
   它管不了根本没进内核的流量。
 - **一次出口检测成功不代表 DNS 干净。** 出口 IP 和 DNS 是某一时刻的抽样，
