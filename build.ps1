@@ -154,6 +154,22 @@ if ($subsystem -eq 2) {
     Write-Step "  警告：子系统为 $subsystem（应为 2），运行时会弹出命令行窗口" 'Yellow'
 }
 
+# The pre-parse dispatch has to be reachable, because the watchdog depends on it
+# and it used to sit after flag.Parse - which exits on an unknown flag, so the
+# helper died on its own argument and the crash protection did not exist.
+#
+# This is checked by looking for the marker string in the binary rather than by
+# running it. A GUI-subsystem binary has no console, so anything it prints goes
+# nowhere and cannot be captured - the same reason the checks above are on the
+# artefact rather than on its output. The release workflow runs on a console build
+# and does execute the path for real, which is where the behavioural check lives.
+$markBytes = [System.IO.File]::ReadAllBytes($OutExe)
+$markText = [System.Text.Encoding]::ASCII.GetString($markBytes)
+if ($markText -notmatch 'selftest ok') {
+    throw "产物自检失败：分派入口的标记字符串不在产物中"
+}
+Write-Step '  分派入口已编译进产物（行为检查在发布流水线执行）' 'Green'
+
 $bytes = [System.IO.File]::ReadAllBytes($OutExe)
 $hasRsrc = $false
 for ($i = 0; $i -lt $bytes.Length - 5; $i++) {

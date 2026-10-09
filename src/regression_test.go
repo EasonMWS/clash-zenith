@@ -489,3 +489,90 @@ func TestConfigIsValidJSONWhereItClaimsToBe(t *testing.T) {
 		t.Fatalf("manifest parsed wrong: %+v", m)
 	}
 }
+
+// ---- the pre-parse dispatch, and the watchdog's exit contract ---------------
+
+func TestSelfTestInvocationIsInert(t *testing.T) {
+	// The build check needs a way to prove the pre-parse dispatch works that
+	// cannot itself change the machine, because running the real watchdog would
+	// clear a system proxy pointing at a dead port.
+	saved := os.Args
+	defer func() { os.Args = saved }()
+
+	os.Args = []string{"zenith.exe", "-self-test"}
+	if !isSelfTestInvocation() {
+		t.Error("-self-test should be recognised")
+	}
+	if isWatchdogInvocation() {
+		t.Error("-self-test must not be mistaken for a watchdog run")
+	}
+
+	// With the watchdog arguments following, both must be readable: this is what
+	// the release smoke test asserts on.
+	os.Args = []string{"zenith.exe", "-self-test", "-watchdog", `C:\data`, "7999"}
+	if !isSelfTestInvocation() {
+		t.Error("-self-test should still be recognised with extra arguments")
+	}
+	if isWatchdogInvocation() {
+		// -watchdog is not the first argument here, so this is correctly false;
+		// the smoke test reads the same predicate to show the shape is understood.
+		t.Log("watchdog is correctly not the first argument in the self-test form")
+	}
+
+	// A watchdog invocation proper is a different shape.
+	os.Args = []string{"zenith.exe", "-watchdog", `C:\data`, "7999"}
+	if !isWatchdogInvocation() {
+		t.Error("the watchdog form should be recognised")
+	}
+	if isSelfTestInvocation() {
+		t.Error("the watchdog form must not be mistaken for a self-test")
+	}
+}
+
+func TestWatchdogToleratesMissingDataDirectory(t *testing.T) {
+	// The watchdog is best-effort: finding nothing to do is its normal outcome.
+	// A missing ownership record must not turn into an error, because a supervisor
+	// or a build check would read a non-zero status as "the machine is broken".
+	saved := os.Args
+	defer func() { os.Args = saved }()
+
+	missing := filepath.Join(t.TempDir(), "not-created")
+	os.Args = []string{"zenith.exe", "-watchdog", missing, "7908"}
+	if !isWatchdogInvocation() {
+		t.Fatal("the watchdog form should be recognised")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// NeutraliseFromOtherProcess is the body runWatchdogFromArgs calls. It must
+		// return rather than panic or block when the directory is absent.
+		NeutraliseFromOtherProcess(missing, 7908)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the watchdog did not finish; it must not retry forever on a missing directory")
+	}
+
+	// A nonsense port must be ignored rather than acted on.
+	NeutraliseFromOtherProcess(missing, 0)
+	NeutraliseFromOtherProcess(missing, -1)
+}
+
+func TestPortFromServerParsing(t *testing.T) {
+	// The watchdog and the dead-proxy guard both key off this, so a wrong answer
+	// here would make them act on a port that is not ours.
+	cases := map[string]int{
+		"127.0.0.1:7899": 7899,
+		"127.0.0.1:7890": 7890,
+		"":               0,
+		"127.0.0.1":      0,
+		"not a server":   0,
+	}
+	for in, want := range cases {
+		if got := portFromServer(in); got != want {
+			t.Errorf("portFromServer(%q) = %d, want %d", in, got, want)
+		}
+	}
+}

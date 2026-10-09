@@ -83,12 +83,23 @@ jobs:
           $v = & .\Zenith.exe -version
           Write-Host $v
           if ($v -notmatch 'Zenith') { throw "the binary does not run" }
-          # The watchdog entry must be reachable. It used to sit after flag.Parse,
-          # which exits on an unknown flag, so the helper died on its own argument
-          # and the crash protection silently did not exist.
-          & .\Zenith.exe -watchdog "$env:TEMP\zenith-smoke" 7999
-          if ($LASTEXITCODE -ne 0) { throw "the watchdog entry point is not reachable" }
-          Write-Host "watchdog entry point is reachable"
+          # The pre-parse dispatch must be reachable. It used to sit after
+          # flag.Parse, which exits with status 2 on an unknown flag, so the
+          # watchdog helper died on its own argument and the crash protection
+          # silently did not exist.
+          #
+          # The check uses the inert entry point rather than the watchdog itself:
+          # running the real watchdog would clear a system proxy that points at a
+          # dead port, and a build check must not be able to change the machine it
+          # runs on.
+          $s = & .\Zenith.exe -self-test
+          Write-Host $s
+          if ($LASTEXITCODE -ne 0) { throw "the pre-parse dispatch is not reachable" }
+          if ($s -notmatch 'selftest ok') { throw "unexpected self-test output: $s" }
+          # And the watchdog argument itself must be recognised as such.
+          $w = & .\Zenith.exe -self-test -watchdog "$env:TEMP\zenith-smoke" 7999
+          if ($w -notmatch 'watchdog=true') { throw "the watchdog invocation is not recognised: $w" }
+          Write-Host "pre-parse dispatch is reachable and the watchdog is recognised"
 
       - name: Package
         shell: pwsh
