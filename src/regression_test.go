@@ -1719,3 +1719,145 @@ func TestProcessRunningDistinguishesGoneFromUninspectable(t *testing.T) {
 		t.Error("this process should be reported as running")
 	}
 }
+
+// ---- P0-3: a failed activation must not destroy the way back ---------------
+
+func TestCandidateConfigDoesNotOverwriteTheKnownGood(t *testing.T) {
+	// The defect: the known-good copy was written at the same moment as the
+	// candidate, so a TUN configuration that then failed verification had already
+	// replaced the pre-TUN one. A rollback had nothing that actually ran to go back
+	// to. The candidate is now written alone, and the known-good copy only after the
+	// configuration is proven.
+	dir := t.TempDir()
+	a := &App{dataDir: dir, configPath: filepath.Join(dir, "config.yaml")}
+
+	working := []byte("mixed-port: 7899\nproxies: []\nproxy-groups: []\nrules: []\n")
+	if err := os.WriteFile(a.goodConfigPath(), working, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	candidate := []byte("mixed-port: 7899\ntun:\n  enable: true\nproxies: []\nproxy-groups: []\nrules: []\n")
+	if err := a.applyCandidateConfig(string(candidate)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The candidate is live; the way back is untouched.
+	if got, _ := os.ReadFile(a.configPath); !bytes.Equal(got, candidate) {
+		t.Error("the candidate was not written to the live configuration")
+	}
+	if got, _ := os.ReadFile(a.goodConfigPath()); !bytes.Equal(got, working) {
+		t.Fatalf("the known-good copy was replaced before the candidate was proven:\n%q", got)
+	}
+
+	// And a rollback now has a real configuration to restore.
+	if err := a.restoreConfig(); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	if got, _ := os.ReadFile(a.configPath); !bytes.Equal(got, working) {
+		t.Errorf("restore did not put the working configuration back:\n%q", got)
+	}
+}
+
+func TestRestoreConfigReportsFailureInsteadOfPretending(t *testing.T) {
+	// A rollback that could not put the previous configuration back is a different
+	// and more serious condition than one that did. Reporting it as a plain
+	// "rolled back" hid it.
+	dir := t.TempDir()
+	a := &App{dataDir: dir, configPath: filepath.Join(dir, "config.yaml")}
+
+	// Nothing known-good to restore.
+	if err := a.restoreConfig(); err == nil {
+		t.Error("restoring with no known-good copy must report failure, not succeed")
+	}
+
+	// An empty known-good copy is equally unusable.
+	if err := os.WriteFile(a.goodConfigPath(), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.restoreConfig(); err == nil {
+		t.Error("restoring from an empty known-good copy must report failure")
+	}
+
+	// A real one succeeds and the file matches byte for byte.
+	good := []byte("mixed-port: 7899\nproxies: []\nproxy-groups: []\nrules: []\n")
+	if err := os.WriteFile(a.goodConfigPath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.restoreConfig(); err != nil {
+		t.Fatalf("restore failed with a valid known-good copy: %v", err)
+	}
+	if got, _ := os.ReadFile(a.configPath); !bytes.Equal(got, good) {
+		t.Error("the restored file does not match the known-good copy")
+	}
+}
+
+func TestPrivacyBlockIsNotLiftedByAFailedActivation(t *testing.T) {
+	// The block is the feature. A failed enable must not be the event that quietly
+	// removes the protection the user asked for, so releasing it is a separate,
+	// explicit action rather than something a rollback does on its way out.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateSettings(map[string]interface{}{"tunMode": string(TunPrivacy)}); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
+
+	// A rollback in privacy mode leaves the mode alone.
+	txB := newTunTxn(txnActivate)
+	txB.Mode = TunPrivacy
+	txB.Owned.AdapterName = tunDefaultDevice
+	a.core = NewCore("", dir, a.configPath, "s", 7797)
+	a.rollbackActivate(txB, TunPrivacy)
+
+	if got := a.store.Settings().TunMode; got != TunPrivacy {
+		t.Errorf("tunMode = %q after a failed privacy activation, want %q: the block must stand",
+			got, TunPrivacy)
+	}
+	found := false
+	for _, s := range txB.Steps {
+		if s.Name == "隐私阻断" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the rollback should record that the privacy block was deliberately left standing")
+	}
+
+	// Releasing it is explicit and separate.
+	if err := a.releasePrivacyBlock("test"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.store.Settings().TunMode; got != TunOff {
+		t.Errorf("tunMode = %q after an explicit release, want off", got)
+	}
+}
+
+func TestRollbackWithoutAKnownGoodReportsRestoreFailure(t *testing.T) {
+	// End to end through the rollback: with no known-good configuration the
+	// transaction must not end as a clean "rolledBack", because nothing was put
+	// back.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
+	a.core = NewCore("", dir, a.configPath, "s", 7797)
+
+	txB := newTunTxn(txnActivate)
+	txB.Mode = TunCompat
+	a.rollbackActivate(txB, TunCompat)
+
+	if txB.State == "rolledBack" {
+		t.Error("a rollback with nothing to restore must not report a clean rollback")
+	}
+	if txB.State != "rollbackFailed" {
+		t.Errorf("state = %q, want rollbackFailed", txB.State)
+	}
+	if txB.RestoreFailure == "" {
+		t.Error("the restore failure must be recorded on its own, not folded into the general failure")
+	}
+}

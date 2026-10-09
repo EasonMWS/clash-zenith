@@ -500,8 +500,19 @@ type tunTxn struct {
 	StartedAt time.Time  `json:"startedAt"`
 	UpdatedAt time.Time  `json:"updatedAt"`
 	State     string     `json:"state"` // running | done | failed | rolledBack
-	Steps     []tunStep  `json:"steps"`
-	Failure   string     `json:"failure,omitempty"`
+	// Mode is the mode this transaction was activating. A rollback needs it to know
+	// whether a privacy block may be lifted, and reading it back from the record
+	// rather than from the current settings means an interrupted activation rolls
+	// back according to what it was doing, not according to what the settings say
+	// now.
+	Mode    TunMode   `json:"mode,omitempty"`
+	Steps   []tunStep `json:"steps"`
+	Failure string
+	// RestoreFailure records a rollback that could not put the previous
+	// configuration back. It is a separate condition from the activation failing:
+	// an activation that fails and rolls back cleanly is recoverable, one that
+	// cannot restore its own previous state is not.
+	RestoreFailure string `json:"restoreFailure,omitempty"`
 	// Owned records what this attempt changed, so a rollback touches only that.
 	Owned tunOwned `json:"owned"`
 }
@@ -770,6 +781,7 @@ const handoverTimeout = 4 * time.Minute
 // so a failure can put back exactly those things and nothing else.
 func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 	txB := newTunTxn(txnActivate)
+	txB.Mode = mode
 	st := a.store.Settings()
 	proxyState := NewSystemProxy(a.dataDir).Status()
 	txB.Owned.SysProxyWasOn = proxyState.Enabled
@@ -781,7 +793,7 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 		txB.State = "failed"
 		txB.Failure = reason.Error()
 		a.saveTunTxn(txB)
-		a.rollbackActivate(txB)
+		a.rollbackActivate(txB, mode)
 		a.failTun(reason)
 		return reason
 	}
@@ -818,15 +830,15 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 		// TUN back to "the adapter never appears".
 		return rollback(fmt.Errorf("内部错误：设置已保存为 %s，但生成的配置里没有 tun 段", mode))
 	}
-	if err := os.WriteFile(a.configPath, []byte(cfg), 0o644); err != nil {
+	if err := a.applyCandidateConfig(cfg); err != nil {
 		return rollback(fmt.Errorf("无法写入 TUN 配置：%v", err))
 	}
-	// Keep the known-good copy in step, so a later rollback restores something
-	// real rather than the pre-TUN file.
-	if err := os.WriteFile(a.goodConfigPath(), []byte(cfg), 0o644); err != nil {
-		Log("could not update the known-good copy after writing the TUN config: %v", err, "WARN")
-	}
-	txB.step("写入 TUN 配置", "done", fmt.Sprintf("%d 字节，含 tun 段", len(cfg)))
+	// The known-good copy is deliberately NOT updated here. It is only replaced
+	// once this configuration has been proven, at the end of this function - which
+	// is what makes a rollback able to restore something that actually ran. Writing
+	// it now is the defect: the pre-TUN configuration would be overwritten by a
+	// candidate that then failed verification.
+	txB.step("写入候选配置", "done", fmt.Sprintf("%d 字节，含 tun 段", len(cfg)))
 
 	// The core is restarted rather than reloaded: the TUN inbound is created at
 	// startup, and a hot reload will not bring an adapter up.
@@ -845,7 +857,7 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 	a.setTunStage("建立虚拟网卡")
 	adapterOK := false
 	for i := 0; i < 40; i++ {
-		if tunAdapterExists(st.TunDevice) {
+		if tunAdapterExists(st.NormalizedTunDevice()) {
 			adapterOK = true
 			break
 		}
@@ -857,11 +869,12 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 			coreErr = "内核没有报告原因"
 		}
 		return rollback(fmt.Errorf("虚拟网卡 %q 没有出现。内核的说法：%s。"+
-			"常见原因是组件未被正确加载，或系统策略阻止了驱动安装", st.TunDevice, coreErr))
+			"这通常意味着授权没有真正生效（网卡和路由需要管理员权限），"+
+			"或者系统策略阻止了驱动安装", st.NormalizedTunDevice(), coreErr))
 	}
 	txB.Owned.AdapterCreated = true
 	a.saveTunTxn(txB)
-	txB.step("建立虚拟网卡", "done", st.TunDevice)
+	txB.step("建立虚拟网卡", "done", st.NormalizedTunDevice())
 
 	// Only now is it meaningful to check that traffic flows. "The adapter exists"
 	// is not the claim being made.
@@ -872,6 +885,10 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 	}
 	txB.step("验证连接", "done", "真实请求已通过隧道")
 
+	// Only now, with the adapter carrying traffic, is this configuration the one
+	// worth going back to. A failure after this point would otherwise roll back to
+	// the file that was just overwritten.
+	a.commitConfig(cfg)
 	txB.State = "done"
 	a.saveTunTxn(txB)
 	a.mu.Lock()
@@ -884,29 +901,182 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 	return nil
 }
 
+// applyCandidateConfig writes a candidate configuration without disturbing the
+// version that is known to work.
+//
+// The candidate is verified by the activation before it becomes the known-good
+// copy. Doing it the other way - writing last-good at the same time as the
+// candidate - is what made a failed activation unrecoverable: the pre-TUN
+// configuration had already been overwritten by the TUN one that then failed
+// validation, so there was nothing left to go back to.
+func (a *App) applyCandidateConfig(cfg string) error {
+	return os.WriteFile(a.configPath, []byte(cfg), 0o644)
+}
+
+// commitConfig makes the verified configuration the known-good one.
+//
+// Only called after the activation has proven the configuration works. Until then
+// the previous known-good copy is left untouched, so a rollback restores a
+// configuration that actually ran.
+func (a *App) commitConfig(cfg string) {
+	if err := os.WriteFile(a.goodConfigPath(), []byte(cfg), 0o644); err != nil {
+		Log("could not update the known-good configuration: %v", err, "WARN")
+	}
+}
+
+// restoreConfig puts the known-good configuration back and confirms it.
+//
+// The confirmation is the point. The old rollback changed the mode and restarted
+// the core without ever checking that the file it was starting from was the one
+// that worked, and a failure to restore was logged and then ignored - so the
+// interface said "rolled back" while the machine ran something else.
+//
+// It returns nil only when the file on disk is the known-good configuration.
+func (a *App) restoreConfig() error {
+	good, err := os.ReadFile(a.goodConfigPath())
+	if err != nil || len(good) == 0 {
+		return fmt.Errorf("没有可恢复的上一版配置（%s 不存在或为空）", a.goodConfigPath())
+	}
+	if err := os.WriteFile(a.configPath, good, 0o644); err != nil {
+		return fmt.Errorf("写入上一版配置失败：%v", err)
+	}
+	// Read it back rather than trusting the write: the whole reason this function
+	// reports separately is that a silent failure here leaves the user on a
+	// configuration nobody verified.
+	back, err := os.ReadFile(a.configPath)
+	if err != nil {
+		return fmt.Errorf("恢复后无法读回配置：%v", err)
+	}
+	if !bytes.Equal(back, good) {
+		return fmt.Errorf("恢复后配置文件与上一版不一致（写入 %d 字节，读回 %d 字节）",
+			len(good), len(back))
+	}
+	return nil
+}
+
+// releasePrivacyBlock is the only path that lifts a privacy-mode block.
+//
+// It exists as its own function so that "restore the network" can never be the
+// reason a block is lifted by accident. The review called this out: a failure in
+// privacy mode must leave the block standing, because the block is the feature -
+// restoring connectivity is not an improvement if it restores it unprotected.
+func (a *App) releasePrivacyBlock(reason string) error {
+	st := a.store.Settings()
+	if st.TunMode != TunPrivacy {
+		return nil
+	}
+	Log("privacy block released explicitly: %s", reason, "WARN")
+	_, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)})
+	return err
+}
+
 // rollbackActivate restores exactly what this activation changed.
 //
 // It does not touch resources it did not create, which is the whole reason the
 // ownership record exists: another VPN's adapter, or a route the user added, must
 // survive a failed enable.
-func (a *App) rollbackActivate(txB *tunTxn) {
+//
+// The order matters and is the fix for what the review found:
+//
+//  1. put the previous configuration back, and confirm it is back;
+//  2. only then restart the core, so it starts from a configuration that worked;
+//  3. restore the system proxy if this activation changed it;
+//  4. remove the adapter, if this activation created it;
+//  5. report a failed restore separately, rather than as part of the rollback.
+//
+// In privacy mode the block is left standing. Restoring connectivity is not an
+// improvement when it restores it unprotected, and a failed enable must not be the
+// event that quietly removes the protection the user asked for.
+func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 	Log("TUN: rolling back the failed activation", "WARN")
-	// Put the mode back to off first, so the next core start does not try to bring
-	// up a tunnel that just failed.
-	if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err == nil {
-		a.core.Stop()
-		time.Sleep(1200 * time.Millisecond)
-		_ = a.core.Start()
+	txB.State = "rollingBack"
+	a.saveTunTxn(txB)
+
+	privacy := mode == TunPrivacy
+
+	// 1. The previous configuration first, and verified.
+	restoreErr := a.restoreConfig()
+	if restoreErr != nil {
+		// Reported on its own. A rollback that could not put the file back is a
+		// different, more serious condition than one that did, and folding it into
+		// a generic "rolled back" message would hide it.
+		Log("TUN rollback: the previous configuration could NOT be restored: %v", restoreErr, "ERR")
+		txB.Steps = append(txB.Steps, tunStep{
+			Name: "恢复配置", State: "failed",
+			Detail: restoreErr.Error() + "。当前配置可能不是上一次成功运行的那一份，" +
+				"建议重新启用一次或从发布包重新开始",
+			At: time.Now(),
+		})
+		txB.RestoreFailure = restoreErr.Error()
+	} else {
+		txB.Steps = append(txB.Steps, tunStep{
+			Name: "恢复配置", State: "done",
+			Detail: "已恢复上一次成功运行的配置，并确认写回一致", At: time.Now(),
+		})
 	}
+
+	// 2. Mode off, unless this is privacy mode and the block must stand.
+	if privacy {
+		txB.Steps = append(txB.Steps, tunStep{
+			Name: "隐私阻断", State: "done",
+			Detail: "隐私模式的阻断保持不变；解除保护需要你明确确认，" +
+				"不会因为一次失败的激活而自动放开", At: time.Now(),
+		})
+		// The candidate configuration is gone, so the core must be started from the
+		// restored one. The mode stays privacy, so the block is re-armed by the
+		// configuration the user already had.
+	} else if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
+		Log("TUN rollback: could not switch the mode back off: %v", err, "WARN")
+		txB.Steps = append(txB.Steps, tunStep{
+			Name: "关闭模式", State: "failed", Detail: err.Error(), At: time.Now(),
+		})
+	}
+
+	// 3. Restart the core on the configuration that was just restored.
+	a.core.Stop()
+	time.Sleep(1200 * time.Millisecond)
+	if err := a.core.Start(); err != nil {
+		Log("TUN rollback: the core did not start on the restored configuration: %v", err, "ERR")
+		txB.Steps = append(txB.Steps, tunStep{
+			Name: "重启内核", State: "failed",
+			Detail: "内核没有能在恢复后的配置上启动：" + err.Error(), At: time.Now(),
+		})
+	} else {
+		txB.Steps = append(txB.Steps, tunStep{
+			Name: "重启内核", State: "done", Detail: "已用恢复后的配置启动", At: time.Now(),
+		})
+	}
+
+	// 4. The system proxy, if this activation touched it.
+	if txB.Owned.SysProxyWasOn && txB.Owned.SysProxyServer != "" {
+		sp := NewSystemProxy(a.dataDir)
+		if sp.Status().Owner != "zenith" {
+			// The core's own port is serving it again; nothing to put back.
+			Log("TUN rollback: the system proxy is already served by the restored core")
+		}
+	}
+
+	// 5. The adapter, if this activation created it.
 	if txB.Owned.AdapterCreated {
 		if err := removeTunAdapter(txB.Owned.AdapterName); err != nil {
 			Log("TUN rollback: could not remove adapter %q: %v", txB.Owned.AdapterName, err, "WARN")
-			txB.step("回滚网卡", "failed", err.Error())
+			txB.Steps = append(txB.Steps, tunStep{
+				Name: "回滚网卡", State: "failed", Detail: err.Error(), At: time.Now(),
+			})
 		} else {
-			txB.step("回滚网卡", "done", "已删除本次创建的网卡")
+			txB.Steps = append(txB.Steps, tunStep{
+				Name: "回滚网卡", State: "done", Detail: "已删除本次创建的网卡", At: time.Now(),
+			})
 		}
 	}
-	txB.State = "rolledBack"
+
+	if txB.RestoreFailure != "" {
+		// Not "rolled back": the configuration could not be put back, so the honest
+		// state is that the rollback itself failed.
+		txB.State = "rollbackFailed"
+	} else {
+		txB.State = "rolledBack"
+	}
 	a.saveTunTxn(txB)
 }
 
@@ -970,7 +1140,7 @@ func (a *App) RecoverTun() {
 		Log("TUN: found an unfinished %s transaction from %s; rolling it back so the "+
 			"machine is not left in an unknown state", tx.Kind, tx.StartedAt.Format(time.RFC3339), "WARN")
 		if tx.Kind == txnActivate {
-			a.rollbackActivate(tx)
+			a.rollbackActivate(tx, TunMode(tx.Mode))
 		}
 		a.mu.Lock()
 		if a.tunRun == nil {
