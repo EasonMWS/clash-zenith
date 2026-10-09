@@ -51,6 +51,13 @@ type App struct {
 	// helperPID is the elevated helper this process started, so a cancel can
 	// stop it. Zero when there is none.
 	helperPID int
+	// proxyClearedAtStartup records that this run found a leftover proxy of ours
+	// pointing at a dead port and cleared it, so the interface can say why the
+	// setting changed from what the user last saw.
+	proxyClearedAtStartup bool
+	// coreStartedAt is when this process last started a core, so a port that is
+	// not bound yet can be told apart from a port nothing will ever serve.
+	coreStartedAt time.Time
 
 	mu         sync.Mutex
 	optimizing bool
@@ -204,6 +211,48 @@ func (a *App) rebindDirs(dataDir string) {
 	// core had not come up, and the machine had no internet until the core was
 	// started by an elevated activation four minutes later.
 	a.sysproxy.SetExpectedPort(st.MixedPort)
+}
+
+// ensureNotOfflineBecauseOfUs takes this program's own dead port out of the system
+// proxy setting.
+//
+// The narrowest possible version of the idea, on purpose. It acts only when all of
+// these hold:
+//
+//   - the core is not running, so the port it was serving is certainly dead;
+//   - the system proxy is enabled and points at exactly the port this program is
+//     configured to use, so the setting is ours and not another program's;
+//   - that port has no listener, so nothing else has taken it over.
+//
+// Under those conditions the setting can only make the machine worse: every
+// application that honours it is trying to reach a port with nothing behind it. It
+// is cleared, and the reason is logged, because a user whose proxy just turned itself
+// off is owed an explanation.
+//
+// It does NOT touch a proxy setting pointing anywhere else. Another program's
+// configuration is not this program's to change, the same way another program's
+// adapter is not ours to remove.
+func (a *App) ensureNotOfflineBecauseOfUs() {
+	sp := NewSystemProxy(a.dataDir)
+	st := sp.Status()
+	if !st.Enabled || st.Server == "" {
+		return
+	}
+	port := portFromServer(st.Server)
+	want := a.store.Settings().MixedPort
+	if port == 0 || port != want {
+		return // somebody else's setting
+	}
+	if portHasListener(port) {
+		return // something is serving it after all
+	}
+	Log("core is down and the system proxy points at its dead port %d; "+
+		"clearing the setting so the machine stays online", port, "WARN")
+	sp.Disable()
+	if _, err := a.store.UpdateSettings(map[string]interface{}{"systemProxy": false}); err != nil {
+		Log("could not record that the system proxy was cleared: %v", err, "WARN")
+	}
+	a.lastErr = fmt.Sprintf("内核没有起来，已暂时关闭系统代理以免断网（端口 %d 没有响应）", port)
 }
 
 // ---- geodata bootstrap ----------------------------------------------------
@@ -530,6 +579,9 @@ func (a *App) bootCore() {
 	//
 	// StartCoreThroughOwner starts one only when nobody else holds it, and asks the
 	// service when the service is the owner.
+	a.mu.Lock()
+	a.coreStartedAt = time.Now()
+	a.mu.Unlock()
 	if err := a.StartCoreThroughOwner(nil, ""); err != nil {
 		a.lastErr = err.Error()
 		Log("core start failed: %v", err, "ERR")
@@ -602,9 +654,26 @@ func (a *App) background() {
 				}
 				continue
 			}
+			// Recovery, and then the part that was missing.
+			//
+			// A dead core was restarted here and nowhere was it asked what happened to
+			// the system proxy in the meantime. Measured: the core exited at 21:59:46,
+			// the registry still said `ProxyEnable=1` pointing at the port the core had
+			// been using, and every application that honours the system proxy was
+			// offline. The program's own interface showed the proxy as on, because the
+			// registry said so. Recovery that only restarts the core leaves the machine
+			// unusable for as long as it takes, and leaves it permanently unusable if
+			// the restart keeps failing.
+			//
+			// So: bring the core back, and if it does not come back, take the dead port
+			// out of the registry. Being online without a proxy is a worse experience
+			// than being online through one, and it is enormously better than being
+			// offline while a checkbox says otherwise.
 			if a.core.Ensure() {
 				a.lastErr = ""
+				continue
 			}
+			a.ensureNotOfflineBecauseOfUs()
 		}
 		// take the system proxy once, as soon as the core is really listening.
 		// Enable returns early when the proxy is already ours, so the flag is set

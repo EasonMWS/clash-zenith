@@ -287,6 +287,11 @@ func main() {
 	// Reconcile the remembered TUN state with what the machine actually has. A
 	// reboot or another VPN can make the stored switch wrong, and believing it
 	// would mean reporting protection that is not there.
+	// Before anything else: do not be offline. A leftover proxy of ours pointing at
+	// a port with no listener takes the machine off the internet, and a crash of
+	// the previous run is exactly how that happens. Measured: with the setting on
+	// and nothing on the port, baidu and bilibili both fail to connect.
+	app.claimProxyForStartup()
 	app.RecoverTun()
 	// A configuration activation that never finished may have left a candidate on
 	// disk that failed verification. The transaction record is what distinguishes
@@ -300,6 +305,11 @@ func main() {
 	// waits for the proxy port to come up and, if it never does, clears the
 	// registry entry so the machine is not left with no internet.
 	startWatchdog(app.dataDir, app.store.Settings().MixedPort)
+	// The same rule again, once the core has had its chance. The startup path has a
+	// window of its own: if the core never binds, the machine is offline for as long
+	// as this program runs, and the previous checks only covered what was already on
+	// disk. Bounded and in the background, so it cannot delay the window.
+	go app.waitForCoreThenClaimProxy(90 * time.Second)
 
 	srv := NewServer(app, filepath.Join(rootDir, "web"), uiPort)
 	if err := srv.Listen(); err != nil {

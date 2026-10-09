@@ -3956,3 +3956,164 @@ func TestCancelIsReachableFromTheInterface(t *testing.T) {
 		t.Error("the interface does not call the cancel endpoint")
 	}
 }
+
+// ---- a dead core must not leave the machine offline ------------------------
+
+func TestADeadCoreTakesItsOwnDeadPortOutOfTheProxy(t *testing.T) {
+	// Measured, and it is the failure the user actually lived through: the core exited
+	// at 21:59:46, the registry still said ProxyEnable=1 pointing at the port the core
+	// had been serving, and every application that honours the system proxy was
+	// offline. The interface showed the proxy as on, because the registry said so.
+	//
+	// Recovery restarted the core and nothing asked what had happened to the proxy in
+	// the meantime. If the restart keeps failing, the machine stays offline for good
+	// while the program reports that everything is fine.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "func (a *App) ensureNotOfflineBecauseOfUs()") {
+		t.Fatal("nothing clears our own dead port out of the proxy setting")
+	}
+	// The recovery loop must call it.
+	i := strings.Index(text, "if a.core.Ensure() {")
+	if i < 0 {
+		t.Fatal("the recovery loop is missing")
+	}
+	tail := text[i:]
+	if end := strings.Index(tail, "// ---- "); end > 0 {
+		tail = tail[:end]
+	}
+	if !strings.Contains(tail, "ensureNotOfflineBecauseOfUs") {
+		t.Error("the recovery loop restarts the core and does not consider the proxy, " +
+			"so a core that will not come back leaves the machine offline")
+	}
+}
+
+func TestTheRecoveryDoesNotTouchSomebodyElsesProxy(t *testing.T) {
+	// The narrowest possible version of the idea: it acts only when the setting points
+	// at exactly the port this program serves, and that port has no listener. Another
+	// program's configuration is not this program's to change, the same way another
+	// program's adapter is not ours to remove.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) ensureNotOfflineBecauseOfUs()")
+	if i < 0 {
+		t.Fatal("the helper is missing")
+	}
+	j := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+j+3]
+
+	for _, guard := range []string{
+		"!st.Enabled || st.Server == \"\"", // nothing set
+		"port != want",                     // not our port
+		"portHasListener(port)",            // something is serving it
+	} {
+		if !strings.Contains(body, guard) {
+			t.Errorf("the recovery is missing the guard %q, so it could change a "+
+				"setting that is not its to change", guard)
+		}
+	}
+	// And it must say why, because a proxy that turns itself off is owed an
+	// explanation.
+	if !strings.Contains(body, "clearing the setting so the machine stays online") {
+		t.Error("the recovery does not log why the proxy was cleared")
+	}
+}
+
+// ---- a leftover proxy of ours must never leave the machine offline ---------
+
+func TestADeadProxyReallyDoesTakeTheMachineOffline(t *testing.T) {
+	// The premise the whole file rests on, measured rather than assumed: with
+	// `ProxyEnable=1`, `ProxyServer=127.0.0.1:7899` and nothing listening on 7899,
+	// requests fail. Windows does not treat a loopback proxy as optional and does not
+	// diagnose it - the browser says the site is unreachable and the site is fine.
+	//
+	// This test does not reproduce the network condition (it would need to change the
+	// machine's proxy). It asserts the guards that make the clearing safe, which is
+	// what can be checked without side effects.
+	src, err := os.ReadFile("startup.go")
+	if err != nil {
+		t.Skipf("startup.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "func (a *App) claimProxyForStartup() bool") {
+		t.Fatal("nothing clears a leftover proxy at startup, so a crash leaves the " +
+			"machine offline until the user works out why")
+	}
+}
+
+func TestTheStartupClearingCannotTakeAwayAWorkingProxy(t *testing.T) {
+	// The first version of the startup check cleared a perfectly good proxy because it
+	// ran a moment before the core had bound its port. A check meant to protect a
+	// working arrangement took it away, which is the same class of mistake as the
+	// thing it was written to prevent.
+	//
+	// The question is not "is the port bound right now" but "is there a core that is
+	// going to serve it", and this program knows the answer without guessing.
+	src, err := os.ReadFile("startup.go")
+	if err != nil {
+		t.Skipf("startup.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) claimProxyForStartup() bool")
+	j := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+j+3]
+
+	for _, guard := range []string{
+		"!st.Enabled || st.Server == \"\"", // nothing is set
+		"port != want",                     // not the port we serve
+		"portHasListener(port)",            // something is serving it
+		"a.core.IsUp()",                    // our own core is answering
+		"a.serviceReachable()",             // the service owns it and is answering
+		"a.recentCoreStart()",              // a core was just started and is coming up
+	} {
+		if !strings.Contains(body, guard) {
+			t.Errorf("the startup check is missing the guard %q, so it can clear a "+
+				"proxy that is working", guard)
+		}
+	}
+	// And it must consider the core's own state, not only whether the port is bound.
+	if !strings.Contains(text, "func (a *App) recentCoreStart() bool") {
+		t.Error("a port that is not bound yet cannot be told from a port nothing will " +
+			"ever serve, so a starting core looks like a dead run")
+	}
+}
+
+func TestTheCoreStartIsTimedSoAStartingCoreIsNotReadAsDead(t *testing.T) {
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "coreStartedAt") {
+		t.Error("the core's start is not timed, so the startup check cannot tell a " +
+			"starting core from an absent one")
+	}
+	if !strings.Contains(text, "a.coreStartedAt = time.Now()") {
+		t.Error("bootCore does not record when it started the core")
+	}
+}
+
+func TestTheRuleIsAppliedAgainAfterTheCoreShouldHaveStarted(t *testing.T) {
+	// The startup path has a window of its own: the proxy is read from the saved
+	// settings, the core is started, and if the core never manages to bind, the machine
+	// is offline for as long as the program runs. The first check only covers what was
+	// already on disk.
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Skipf("main.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "app.claimProxyForStartup()") {
+		t.Error("main does not clear a leftover proxy before starting")
+	}
+	if !strings.Contains(text, "go app.waitForCoreThenClaimProxy(") {
+		t.Error("main does not apply the same rule again once the core has had its " +
+			"chance to bind")
+	}
+}
