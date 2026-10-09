@@ -1390,7 +1390,7 @@ func (a *App) nodeExists(name string) bool {
 // ---- subscriptions --------------------------------------------------------
 
 func (a *App) AddSubscription(rawURL, name string) (*Subscription, error) {
-	text, info, err := FetchSubscription(rawURL, "")
+	text, info, err := FetchSubscription(rawURL, "", a.store.Settings().AllowInsecureSubscription)
 	if err != nil {
 		return nil, err
 	}
@@ -1451,7 +1451,7 @@ func (a *App) UpdateSubscription(id string) (int, error) {
 	if target == nil {
 		return 0, fmt.Errorf("找不到该订阅")
 	}
-	text, info, err := FetchSubscription(target.URL, target.UserAgent)
+	text, info, err := FetchSubscription(target.URL, target.UserAgent, a.store.Settings().AllowInsecureSubscription)
 	if err != nil {
 		target.LastError = err.Error()
 		_ = a.store.SetSubscriptions(snap.Subscriptions)

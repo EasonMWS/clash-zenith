@@ -128,11 +128,17 @@ type OptimizeSummary struct {
 }
 
 type Optimizer struct {
-	dataDir     string
-	mu          sync.Mutex
-	running     bool
-	prog        OptimizeProgress
-	cancel      chan struct{}
+	dataDir string
+	mu      sync.Mutex
+	running bool
+	prog    OptimizeProgress
+	cancel  chan struct{}
+	// verifyTLS decides whether the stage probes validate the edge certificate.
+	// It mirrors the subscription setting: a subscription served over a
+	// self-signed certificate cannot be probed against a public trust store, but
+	// a normal one can, and validating it is what stops an intercepted probe
+	// from reporting an attacker's edge as fast and healthy.
+	verifyTLS   bool
 	lastSummary OptimizeSummary
 }
 
@@ -358,8 +364,8 @@ func (o *Optimizer) learnCandidates(ips []string) int {
 
 // probeWS performs one WebSocket upgrade attempt against an edge IP and returns
 // the time to the 101 response.
-func probeWS(ip, sni, path, host string, timeout time.Duration) (time.Duration, bool) {
-	return probeWSVerbose(ip, sni, path, host, timeout, nil)
+func probeWS(ip, sni, path, host string, timeout time.Duration, skipVerify bool) (time.Duration, bool) {
+	return probeWSVerbose(ip, sni, path, host, timeout, nil, skipVerify)
 }
 
 // probeHTTPS fetches a URL through the tunnel, end to end.
@@ -370,11 +376,11 @@ func probeWS(ip, sni, path, host string, timeout time.Duration) (time.Duration, 
 // reported 239 ms while every real request through that node timed out. The
 // upgrade only proves the edge accepts the request, not that it carries the
 // response back, so a candidate must also return a real status line here.
-func probeHTTPS(ip, sni, host, requestPath string, timeout time.Duration) (time.Duration, bool) {
+func probeHTTPS(ip, sni, host, requestPath string, timeout time.Duration, skipVerify bool) (time.Duration, bool) {
 	dialer := &tls.Dialer{
 		Config: &tls.Config{
 			ServerName:         sni,
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: skipVerify,
 			MinVersion:         tls.VersionTLS12,
 		},
 	}
@@ -427,7 +433,7 @@ func randomWSKey() string {
 	return base64.StdEncoding.EncodeToString(buf)
 }
 
-func probeWSVerbose(ip, sni, path, host string, timeout time.Duration, why *string) (time.Duration, bool) {
+func probeWSVerbose(ip, sni, path, host string, timeout time.Duration, why *string, skipVerify bool) (time.Duration, bool) {
 	fail := func(reason string) (time.Duration, bool) {
 		if why != nil {
 			*why = reason
@@ -437,7 +443,7 @@ func probeWSVerbose(ip, sni, path, host string, timeout time.Duration, why *stri
 	dialer := &tls.Dialer{
 		Config: &tls.Config{
 			ServerName:         sni,
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: skipVerify,
 			MinVersion:         tls.VersionTLS12,
 		},
 	}
@@ -596,6 +602,7 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Prox
 			g.index, g.ep.SNI, g.ep.Host, g.ep.Path, g.template.Name)
 	}
 
+	o.verifyTLS = !st.AllowInsecureSubscription
 	ips := o.rankCandidates(o.Candidates())
 	total := len(ips)
 	if total == 0 {
@@ -807,7 +814,7 @@ func (o *Optimizer) scanPass(ips []string, template *Proxy, sni, path, host stri
 			var times []float64
 			ok := 0
 			for i := 0; i < rounds; i++ {
-				wsTime, good := probeWS(ip, sni, path, host, 6*time.Second)
+				wsTime, good := probeWS(ip, sni, path, host, 6*time.Second, !o.verifyTLS)
 				if !good {
 					continue
 				}
@@ -815,7 +822,7 @@ func (o *Optimizer) scanPass(ips []string, template *Proxy, sni, path, host stri
 				// drop ordinary traffic, so every round must also fetch a real
 				// response through the same tunnel. The cost recorded is the
 				// round trip the user will actually experience.
-				httpTime, carried := probeHTTPS(ip, sni, host, httpProbePath, 6*time.Second)
+				httpTime, carried := probeHTTPS(ip, sni, host, httpProbePath, 6*time.Second, !o.verifyTLS)
 				if !carried {
 					continue
 				}

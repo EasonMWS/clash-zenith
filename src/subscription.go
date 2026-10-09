@@ -790,13 +790,27 @@ func ParseSubscription(body string) []Proxy {
 // FetchSubscription downloads a subscription. It never goes through a system
 // proxy: Zenith itself may be that proxy, and fetching through a core that is
 // still starting would deadlock the first launch.
-func FetchSubscription(rawURL, ua string) (string, *SubscriptionInfo, error) {
+//
+// allowInsecure disables certificate verification for this one fetch. It exists
+// only because private subscriptions occasionally live behind a self-signed
+// certificate; it is off by default and the caller is expected to have asked the
+// user. Verification being on by default is the point: without it, anyone who
+// can intercept the connection can replace every node in the subscription, and
+// the client would install their servers and credentials without a word.
+func FetchSubscription(rawURL, ua string, allowInsecure bool) (string, *SubscriptionInfo, error) {
 	if ua == "" {
 		ua = "mihomo/1.19.32"
 	}
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || u.Host == "" {
 		return "", nil, fmt.Errorf("订阅地址无效")
+	}
+	// A subscription carries server addresses and credentials, so it is never
+	// fetched in the clear. Plain http would let any hop on the path rewrite it,
+	// and there is no downgrade that makes that acceptable.
+	if !strings.EqualFold(u.Scheme, "https") {
+		return "", nil, fmt.Errorf("订阅地址必须是 https（当前是 %q）；"+
+			"明文下载会让中途任何一跳都能替换你的节点和凭据", u.Scheme)
 	}
 	// Make sure every non-ascii byte in the path is percent-encoded exactly
 	// once. Assigning the escaped form back to Path and RawPath together used to
@@ -819,15 +833,35 @@ func FetchSubscription(rawURL, ua string) (string, *SubscriptionInfo, error) {
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "*/*")
 
+	// No redirect may leave https, and none may cross to a different host: a
+	// redirect is the simplest way to hand a credential-bearing URL to a third
+	// party. Same-host redirects are allowed because providers do use them.
+	originHost := strings.ToLower(u.Host)
 	tr := &http.Transport{
 		Proxy: nil,
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: allowInsecure,
 			MinVersion:         tls.VersionTLS12,
 		},
 		ForceAttemptHTTP2: true,
 	}
-	client := &http.Client{Transport: tr, Timeout: 45 * time.Second}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   45 * time.Second,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("重定向次数过多")
+			}
+			if !strings.EqualFold(r.URL.Scheme, "https") {
+				return fmt.Errorf("订阅服务器试图把 https 降级到 %s，已拒绝", r.URL.Scheme)
+			}
+			if !strings.EqualFold(r.URL.Host, originHost) {
+				return fmt.Errorf("订阅服务器试图重定向到另一个域名（%s），"+
+					"这会把你的订阅凭据交给第三方，已拒绝", r.URL.Host)
+			}
+			return nil
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", nil, err

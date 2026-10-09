@@ -106,6 +106,12 @@ type Settings struct {
 	// that way. Stored inverted so an older settings file without the field
 	// defaults to on.
 	GamePlatformDirectOff bool `json:"gamePlatformDirectOff"`
+	// AllowInsecureSubscription disables certificate verification when
+	// downloading subscriptions. Off by default and deliberately not inverted:
+	// this is a security downgrade, so it has to be something the user turns on
+	// knowingly rather than something inherited from an older settings file.
+	// Only needed when the subscription sits behind a self-signed certificate.
+	AllowInsecureSubscription bool `json:"allowInsecureSubscription"`
 
 	// meta
 	WindowWidth  int    `json:"windowWidth"`
