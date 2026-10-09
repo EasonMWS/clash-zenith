@@ -36,6 +36,14 @@ type Core struct {
 	// lastErr records why the most recent start failed, so a refused TUN enable
 	// can report the core's own words instead of guessing.
 	lastErr string
+	// noOrphanCleanup disables the startup sweep.
+	//
+	// An elevated activation instance shares the data directory with the ordinary
+	// instance, so the sweep's match on "the command line names this data
+	// directory" also matches the core the ordinary instance is running - and it
+	// killed it, which is why the first real TUN attempt hung. A process that does
+	// not own the core must not clean up cores.
+	noOrphanCleanup bool
 }
 
 func NewCore(exePath, dataDir, configPath, secret string, apiPort int) *Core {
@@ -123,8 +131,13 @@ func (c *Core) Start() error {
 	if _, err := os.Stat(c.exePath); err != nil {
 		return fmt.Errorf("找不到内核文件 %s", c.exePath)
 	}
-	// a previous run killed mid-flight can leave a core holding our ports
-	c.killOrphansLocked()
+	// A previous run killed mid-flight can leave a core holding our ports. Only
+	// the process that owns the core may clean up: an activation instance shares
+	// the data directory, so this sweep would otherwise kill the very core it is
+	// about to hand over from.
+	if !c.noOrphanCleanup {
+		c.killOrphansLocked()
+	}
 
 	if c.logFile == nil {
 		execLog := filepath.Join(c.dataDir, "..", "logs", "engine.log")
@@ -404,6 +417,15 @@ func (c *Core) CloseConnections() {
 // killOrphansLocked terminates mihomo processes that belong to us but are not
 // the one we are tracking. Uses PowerShell's CIM query because wmic no longer
 // ships with current Windows builds.
+// SetNoOrphanCleanup disables the startup sweep for a process that does not own
+// the core. An elevated activation runs against the same data directory as the
+// ordinary instance, and the sweep matches on exactly that, so without this it
+// kills the core it is trying to take over from.
+func (c *Core) SetNoOrphanCleanup(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.noOrphanCleanup = v
+}
 func (c *Core) killOrphansLocked() int {
 	keep := 0
 	if c.proc != nil && c.proc.Process != nil {

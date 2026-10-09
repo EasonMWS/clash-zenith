@@ -1297,3 +1297,27 @@ func TestReadOnlyIsOffByDefault(t *testing.T) {
 		t.Error("SetReadOnly(false) did not take effect")
 	}
 }
+
+// ---- the system proxy must follow the port --------------------------------
+
+func TestPortRotationMustRepointAnOwnedProxy(t *testing.T) {
+	// The registry kept pointing at the port nothing was listening on after a
+	// rotation, so every application that honours the system proxy was silently
+	// offline while the interface still reported the proxy as on. That is the
+	// worst outcome this program can produce, and it happened.
+	//
+	// This asserts the decision rule rather than the registry itself, since the
+	// test must not change the machine it runs on.
+	owned := []string{"", "zenith", "mihomo", "Zenith", "MIHOMO"}
+	for _, o := range owned {
+		if !proxyOwnerIsOurs(o) {
+			t.Errorf("owner %q should be treated as ours, so the proxy can follow the port", o)
+		}
+	}
+	foreign := []string{"clash-verge", "FlClash", "v2rayN", "sing-box", "Clash for Windows"}
+	for _, o := range foreign {
+		if proxyOwnerIsOurs(o) {
+			t.Errorf("owner %q is another product; its proxy setting must be left alone", o)
+		}
+	}
+}

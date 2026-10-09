@@ -353,7 +353,48 @@ func (a *App) EnsureUsablePort() {
 		Log("could not persist the new mixed port: %v", err, "WARN")
 		return
 	}
+	// The system proxy has to follow the port. It did not, and the result was the
+	// worst outcome this program can produce: the registry kept pointing at the
+	// port nothing was listening on, so every application that honours the system
+	// proxy was silently offline while the interface still reported the proxy as
+	// on.
+	//
+	// Only a proxy this instance owns is repointed. Someone else's is left alone
+	// and the user is told, because taking over another client's setting is worse
+	// than leaving it.
+	if st.SystemProxy {
+		sp := NewSystemProxy(a.dataDir)
+		owner := systemProxyOwner(a.dataDir)
+		if sp.Status().Enabled && proxyOwnerIsOurs(owner) {
+			if _, err := sp.Enable(free, st.ProxyBypass, true); err != nil {
+				Log("mixed port moved to %d but the system proxy could not follow: %v", free, err, "ERR")
+			} else {
+				Log("system proxy followed the mixed port to %d", free)
+			}
+		} else if owner != "" {
+			Log("mixed port moved to %d but the system proxy belongs to %q; leaving it "+
+				"alone. Applications using it are offline until it is repointed or disabled",
+				free, owner, "WARN")
+			a.lastErr = fmt.Sprintf("端口 %d 被占用，已改用 %d。系统代理属于 %s，我没有改动它"+
+				"——请手动把代理端口改成 %d，或关掉系统代理", want, free, owner, free)
+			return
+		}
+	}
 	a.lastErr = fmt.Sprintf("端口 %d 已被其他程序占用，已自动改用 %d（旧端口上的连接会断开，重启一下浏览器即可）", want, free)
+}
+
+// proxyOwnerIsOurs reports whether the current system proxy setting appears to be
+// ours, so a port change may repoint it.
+//
+// An empty owner means the port has no listener, which is the case this whole
+// path exists for. A named owner that is not us means another product holds the
+// setting, and taking it over would be worse than leaving it: the user would
+// silently lose the client they chose.
+func proxyOwnerIsOurs(owner string) bool {
+	if owner == "" {
+		return true
+	}
+	return strings.EqualFold(owner, "zenith") || strings.EqualFold(owner, "mihomo")
 }
 
 // portHasListener reports whether something is really listening on the port,
@@ -406,20 +447,23 @@ func (a *App) background() {
 		}
 		st := a.store.Settings()
 
+		// An activation that has claimed the core owns it for the duration. This
+		// instance steps back entirely: no core recovery, no liveness checking, no
+		// switching, because all of those act on a core that is about to be
+		// replaced. Checking this before the core is touched rather than after is
+		// the point - doing either is what made the first real TUN attempt hang,
+		// with the two instances spending the handover killing and restarting each
+		// other's core.
+		if a.activationYielded() {
+			continue
+		}
+
 		if !a.core.IsUp() {
 			// Give the core room to finish its first start. A brand new data
 			// directory has no rule databases yet, so mihomo downloads them and
 			// that takes far longer than the health check interval. Restarting
 			// it mid-download looped forever, because every restart began the
 			// same download again and the core never got to answer.
-			//
-			// The same gate covers a handover. An elevated instance must stop this
-			// core to take the ports for a TUN activation, and without a yield this
-			// loop would see "core is down" and start a second one on top of it,
-			// leaving two cores fighting for the same listener.
-			if a.activationYielded() {
-				continue
-			}
 			if time.Since(started) < coreStartGrace {
 				continue
 			}

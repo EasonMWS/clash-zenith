@@ -158,6 +158,8 @@ func main() {
 		// tell a broken proxy from one belonging to an instance it must not
 		// disturb. Every mutating path now returns early.
 		app.sysproxy.SetReadOnly(true)
+		// An isolated run must not sweep cores belonging to a real instance.
+		app.core.SetNoOrphanCleanup(true)
 		Log("isolated run: data dir=%s, system proxy is read-only", abs, "WARN")
 	}
 	st := app.store.Settings()
@@ -198,6 +200,10 @@ func main() {
 		// The elevated helper manages the tunnel, not the system proxy. Claiming the
 		// proxy would make two processes own one setting.
 		app.sysproxy.SetReadOnly(true)
+		// This process does not own the core; it is taking it over for the
+		// activation. The startup sweep would match the ordinary instance's core
+		// and kill it, which is what hung the first real attempt.
+		app.core.SetNoOrphanCleanup(true)
 		Log("elevated instance: activating TUN in %s mode", mode)
 		// No window, no tray, no second UI server: this process exists only for
 		// the activation, which needs rights the ordinary instance does not have.
