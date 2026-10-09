@@ -45,3 +45,10 @@ desktop.ini
 /data/tun-transaction.json
 /data/candidates.stat.json
 /data/activation.yield
+
+# The control secret grants control of the core's configuration API, which is
+# enough to redirect every connection this machine makes. It was tracked for seven
+# commits before this line existed - the file-level ACL did not help, because git
+# does not read ACLs. Rotate it if it has ever been pushed: deleting a file from a
+# repository does not remove it from the history other people already have.
+/data/control.secret
