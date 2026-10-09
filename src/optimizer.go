@@ -51,12 +51,22 @@ func Log(format string, args ...interface{}) {
 	if level != "" {
 		line = fmt.Sprintf("[%s] [%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), level, msg)
 	}
+	// Credentials must not reach the file. A subscription URL is a bearer token,
+	// and the log is the file most likely to be pasted somewhere while asking for
+	// help.
+	line = redactLine(line)
+
 	logMu.Lock()
 	defer logMu.Unlock()
 	if logPath != "" {
+		// Rotate before appending rather than on a timer, so a burst of output
+		// cannot outrun the cap. Without this a weeks-long run grows without
+		// bound, and the core's log writes a line per connection.
+		rotateIfNeeded(logPath)
 		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
-			_, _ = f.WriteString(line)
+			n, _ := f.WriteString(line)
 			_ = f.Close()
+			accountLogWrite(logPath, n)
 		}
 	}
 	fmt.Print(line)

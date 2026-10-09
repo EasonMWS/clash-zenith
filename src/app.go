@@ -1121,13 +1121,13 @@ func (a *App) writeConfig(nodes []Proxy, st Settings) {
 	}
 }
 
-// applyConfig rewrites the config and hot reloads it. No process restart.
+// applyConfig rewrites the configuration and hot reloads it. No process restart.
+//
+// Every caller goes through the transactional path, so a failure restores the
+// last version that worked and reports the failure instead of leaving a broken
+// file for the next start to trip over.
 func (a *App) applyConfig() error {
-	a.writeConfig(a.mergedNodes(), a.store.Settings())
-	if !a.core.IsUp() {
-		return a.core.Start()
-	}
-	return a.core.Reload()
+	return a.applyConfigTransactional(a.mergedNodes(), a.store.Settings())
 }
 
 func (a *App) CurrentConfigPreview() string {

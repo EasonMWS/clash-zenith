@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -570,7 +571,17 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	} else {
 		text = TailLog(lines)
 	}
-	writeJSON(w, 200, map[string]interface{}{"ok": true, "which": which, "text": text})
+	// Redact before it leaves the process. A log is the file most likely to be
+	// pasted somewhere while asking for help, and a subscription URL is a bearer
+	// credential rather than an address.
+	text = redactForDisplay(text)
+	writeJSON(w, 200, map[string]interface{}{
+		"ok": true, "which": which, "text": text,
+		// Report what the logs occupy, so unbounded growth is something the user
+		// can see rather than discover when the disk fills.
+		"dirBytes": logDirUsage(s.app.logDir),
+		"rotated":  logRotatedFiles(filepath.Join(s.app.logDir, "engine.log")),
+	})
 }
 
 func tailString(s string, lines int) string {

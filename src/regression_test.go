@@ -602,3 +602,149 @@ func TestPortFromServerParsing(t *testing.T) {
 		}
 	}
 }
+
+// ---- R06: configuration changes must be verifiable and reversible -----------
+
+func TestValidateCandidateConfigCatchesWhatTheCoreWouldReject(t *testing.T) {
+	good := BuildConfig(
+		[]Proxy{{Name: "n1", Type: "vmess", Server: "1.2.3.4", Port: 443, Network: "ws"}},
+		[]string{"n1"},
+		Settings{MixedPort: 7890, ControlPort: 7797, Mode: "rule", TunDevice: defaultTunDevice, TunStack: "gvisor"},
+		"secret", "n1", 8199)
+	if err := validateCandidateConfig(good); err != nil {
+		t.Fatalf("a configuration the app generated was rejected: %v", err)
+	}
+
+	// Each of these is a shape the core would refuse, and installing one would
+	// take the running core down. They must be caught before anything is written.
+	bad := []struct{ name, cfg string }{
+		{"empty", ""},
+		{"whitespace only", "   \n\n  "},
+		{"no port", "proxies:\n  - {name: n1, type: socks5, server: 1.2.3.4, port: 1}\nproxy-groups: []\nrules: []\n"},
+		{"no proxies", "mixed-port: 7890\nproxy-groups: []\nrules: []\n"},
+		{"no groups", "mixed-port: 7890\nproxies:\n  - {name: n1, type: socks5, server: 1.2.3.4, port: 1}\nrules: []\n"},
+		{"no rules", "mixed-port: 7890\nproxies:\n  - {name: n1, type: socks5, server: 1.2.3.4, port: 1}\nproxy-groups: []\n"},
+		{"group references a node that does not exist",
+			"mixed-port: 7890\nproxies:\n  - {name: n1, type: socks5, server: 1.2.3.4, port: 1}\n" +
+				"proxy-groups:\n  - name: \"PROXY\"\n    type: select\n    proxies:\n      - \"n2\"\n      - \"DIRECT\"\nrules:\n  - \"MATCH,PROXY\"\n"},
+	}
+	for _, c := range bad {
+		if err := validateCandidateConfig(c.cfg); err == nil {
+			t.Errorf("%s: the candidate was accepted but the core would refuse it", c.name)
+		}
+	}
+
+	// A group naming a built-in is fine; DIRECT and REJECT are not proxies.
+	withBuiltins := "mixed-port: 7890\nproxies:\n  - {name: n1, type: socks5, server: 1.2.3.4, port: 1}\n" +
+		"proxy-groups:\n  - name: \"PROXY\"\n    type: select\n    proxies:\n" +
+		"      - \"n1\"\n      - \"DIRECT\"\n      - \"REJECT\"\nrules:\n  - \"MATCH,PROXY\"\n"
+	if err := validateCandidateConfig(withBuiltins); err != nil {
+		t.Errorf("built-in targets should be allowed: %v", err)
+	}
+}
+
+func TestConfigRollbackWithoutAPreviousVersionSaysSo(t *testing.T) {
+	// On a first run there is nothing to restore. Claiming otherwise would leave
+	// the user believing a configuration is in effect when none ever was.
+	dir := t.TempDir()
+	a := &App{dataDir: dir, configPath: filepath.Join(dir, "config.yaml")}
+	tx := &configTxn{ID: "t", State: "failed", StartedAt: time.Now()}
+
+	a.rollbackConfig(tx)
+
+	if tx.State != "rolledBack" {
+		t.Errorf("state = %q, want rolledBack", tx.State)
+	}
+	found := false
+	for _, s := range tx.Steps {
+		if s.Name == "回滚" && s.State == "skipped" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a rollback with nothing to restore must record that, not silently do nothing")
+	}
+	if _, err := os.Stat(a.configPath); err == nil {
+		t.Error("a rollback with no known-good version must not create a configuration file")
+	}
+}
+
+func TestConfigRollbackRestoresTheGoodVersion(t *testing.T) {
+	dir := t.TempDir()
+	a := &App{dataDir: dir, configPath: filepath.Join(dir, "config.yaml")}
+	good := []byte("mixed-port: 7890\nproxies: []\nproxy-groups: []\nrules: []\n")
+	if err := os.WriteFile(a.goodConfigPath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The candidate that failed is what is on disk now.
+	if err := os.WriteFile(a.configPath, []byte("this is not valid yaml at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tx := &configTxn{ID: "t", State: "failed", StartedAt: time.Now()}
+	a.rollbackConfig(tx)
+
+	got, err := os.ReadFile(a.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(good) {
+		t.Errorf("rollback did not restore the known-good configuration:\n%q", got)
+	}
+	if tx.State != "rolledBack" {
+		t.Errorf("state = %q, want rolledBack", tx.State)
+	}
+}
+
+func TestConfigTransactionRecordSurvivesARestart(t *testing.T) {
+	// A crash mid-activation is exactly the case the record exists for, so it has
+	// to be durable and readable back.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	tx := &configTxn{ID: "cfg-1", State: "activated", StartedAt: time.Now(), Digest: "abc123"}
+	a.saveConfigTxn(tx)
+	back := a.loadConfigTxn()
+	if back == nil {
+		t.Fatal("the transaction record could not be read back")
+	}
+	if back.State != "activated" || back.Digest != "abc123" {
+		t.Errorf("record lost data: %+v", back)
+	}
+}
+
+func TestDigestOfIsStableAndDistinguishing(t *testing.T) {
+	a := digestOf([]byte("hello"))
+	b := digestOf([]byte("hello"))
+	c := digestOf([]byte("hello!"))
+	if a != b {
+		t.Error("the same input produced different digests")
+	}
+	if a == c {
+		t.Error("different inputs produced the same digest")
+	}
+	if len(a) != 64 {
+		t.Errorf("digest should be 64 hex characters, got %d", len(a))
+	}
+}
+
+func TestToIntAcceptsTheShapesJSONProduces(t *testing.T) {
+	// The core reports ports as JSON numbers, which decode to float64, but other
+	// fields arrive as strings. A wrong answer here would make the activation
+	// verification compare against garbage.
+	cases := []struct {
+		in   interface{}
+		want int
+		ok   bool
+	}{
+		{float64(7890), 7890, true},
+		{int(7891), 7891, true},
+		{"7892", 7892, true},
+		{"not a number", 0, false},
+		{nil, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := toInt(c.in)
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("toInt(%v) = (%d, %v), want (%d, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}

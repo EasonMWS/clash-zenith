@@ -158,6 +158,10 @@ func main() {
 	// reboot or another VPN can make the stored switch wrong, and believing it
 	// would mean reporting protection that is not there.
 	app.RecoverTun()
+	// A configuration activation that never finished may have left a candidate on
+	// disk that failed verification. The transaction record is what distinguishes
+	// that from a deliberate state.
+	app.RecoverConfigTransaction()
 	// An elevated instance continues an enable that the普通 instance started; it
 	// does not open its own window or tray icon, and it exits when the activation
 	// finishes so no elevated process is left running by default.

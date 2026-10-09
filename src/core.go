@@ -127,8 +127,14 @@ func (c *Core) Start() error {
 	c.killOrphansLocked()
 
 	if c.logFile == nil {
-		f, err := os.OpenFile(filepath.Join(c.dataDir, "..", "logs", "engine.log"),
-			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		execLog := filepath.Join(c.dataDir, "..", "logs", "engine.log")
+		// Rotate before handing the file to the child. The core writes straight to
+		// this descriptor, so there is no write hook to rotate on, and the core's
+		// log is the one that actually grows: at info level it writes a line per
+		// connection. Rotating here means the cap holds across restarts, which the
+		// watchdog makes regular.
+		rotateIfNeeded(execLog)
+		f, err := os.OpenFile(execLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err == nil {
 			c.logFile = f
 		}
@@ -223,6 +229,16 @@ func (c *Core) Reload() error {
 	}
 	Log("config reloaded in place (no restart)")
 	return nil
+}
+
+// LiveConfig asks the core what it is actually running.
+//
+// It exists because a successful reload call is not proof that the core took the
+// new configuration. This reads the running state, so activation can be verified
+// rather than assumed - which is the difference between "we asked it to reload"
+// and "it is running what we intended".
+func (c *Core) LiveConfig() (map[string]interface{}, error) {
+	return c.api(http.MethodGet, "/configs", nil, 8*time.Second)
 }
 
 // SetMode switches rule/global/direct at runtime.
