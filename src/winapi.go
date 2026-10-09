@@ -131,6 +131,27 @@ func tunAdapterExists(name string) bool {
 // removeTunAdapter deletes exactly one adapter, by name, and refuses if that name
 // is not Zenith's. It exists so uninstall and rollback cannot remove a network
 // interface belonging to anything else.
+//
+// The removal goes through pnputil, because the cmdlets that look right are not
+// there. Measured on this machine:
+//
+//	Get-NetAdapter       resolves
+//	Remove-NetAdapter    does NOT resolve
+//	Remove-PnpDevice     does NOT resolve
+//	Disable-PnpDevice    resolves
+//	pnputil.exe          present, and reports Access is denied without elevation
+//
+// So disabling TUN reported success and left the adapter in place, and the next
+// activation then described it as "another tunnel or virtual adapter" - the program
+// warning the user about its own leftover, in the log they were reading.
+//
+// pnputil removes the device by its instance id, which is matched from the adapter's
+// own name, so nothing else can be caught by it. It needs elevation, and this
+// function runs inside the elevated helper and the service, which is where it needs
+// to be anyway.
+//
+// The verification at the end is the part that matters most: the previous version
+// returned whatever the command said, and the command said nothing useful.
 func removeTunAdapter(name string) error {
 	if name == "" || name != defaultTunDevice {
 		return fmt.Errorf("拒绝删除非 Zenith 自己的网卡（%q）", name)
@@ -144,11 +165,60 @@ func removeTunAdapter(name string) error {
 	if !tunAdapterExists(name) {
 		return nil
 	}
-	if _, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
-		fmt.Sprintf("Remove-NetAdapter -Name '%s' -Confirm:$false -ErrorAction Stop", name)); err != nil {
+	// Read the instance id from the adapter itself rather than constructing one, so
+	// the removal cannot be pointed at anything but the interface we are looking at.
+	inst, err := adapterInstanceID(name)
+	if err != nil {
 		return err
 	}
+	out, runErr := HiddenCommand("pnputil", "/remove-device", inst)
+	if runErr != nil {
+		// Fall back to disabling it. A disabled adapter carries no traffic, which is
+		// what the caller needs, and leaving it disabled-but-present is a better
+		// outcome than leaving it up. Reported either way, because a leftover that is
+		// merely disabled will be found by the next activation.
+		if derr := disableTunAdapter(name); derr == nil {
+			return fmt.Errorf("网卡 %q 无法删除（%v），已改为禁用它；"+
+				"它不会承载流量，但会一直留在系统里直到手动移除",
+				name, strings.TrimSpace(out))
+		}
+		return fmt.Errorf("删除网卡 %q 失败：%v（%s）", name, runErr, strings.TrimSpace(out))
+	}
+	// Confirm rather than trust. The whole reason this function was rewritten is that
+	// a removal reported success and did nothing.
+	if tunAdapterExists(name) {
+		if derr := disableTunAdapter(name); derr == nil {
+			return fmt.Errorf("删除网卡 %q 的命令返回成功，但网卡仍然存在；已改为禁用它", name)
+		}
+		return fmt.Errorf("删除网卡 %q 的命令返回成功，但网卡仍然存在", name)
+	}
 	return nil
+}
+
+// adapterInstanceID reads the PnP instance id for an adapter, from the OS.
+func adapterInstanceID(name string) (string, error) {
+	out, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf(`(Get-NetAdapter -Name '%s' -ErrorAction SilentlyContinue).PnPDeviceID`, name))
+	if err != nil {
+		return "", fmt.Errorf("无法读取网卡 %q 的实例 ID：%v", name, err)
+	}
+	id := strings.TrimSpace(out)
+	if id == "" {
+		return "", fmt.Errorf("网卡 %q 没有报告实例 ID，无法安全地删除它", name)
+	}
+	// The id goes to pnputil as an argument, not through a shell, but a value with a
+	// newline in it is still not an instance id.
+	if strings.ContainsAny(id, "\r\n\t\"") {
+		return "", fmt.Errorf("网卡 %q 报告的实例 ID 形状不对，拒绝使用", name)
+	}
+	return id, nil
+}
+
+// disableTunAdapter is the weaker fallback: the adapter stays but carries nothing.
+func disableTunAdapter(name string) error {
+	_, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf(`Disable-NetAdapter -Name '%s' -Confirm:$false -ErrorAction Stop`, name))
+	return err
 }
 
 // ---- system proxy ownership ----------------------------------------------

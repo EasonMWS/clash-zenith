@@ -3556,7 +3556,6 @@ func TestServiceRefusesToRunOutsideTheScm(t *testing.T) {
 	}
 }
 
-
 func TestServerKnowsItsOwnOrigin(t *testing.T) {
 	// expectHost was declared and never assigned, so the origin check compared against
 	// an empty string and refused every request carrying an Origin header - including
@@ -3604,5 +3603,60 @@ func TestServerKnowsItsOwnOrigin(t *testing.T) {
 	r.Header.Set("Origin", "https://evil.example")
 	if interfaceRequestAllowed(r, srv.expectHost) {
 		t.Error("a foreign origin must still be refused")
+	}
+}
+
+func TestAdapterRemovalUsesAToolThatExists(t *testing.T) {
+	// Measured on this machine:
+	//
+	//   Get-NetAdapter       resolves
+	//   Remove-NetAdapter    does NOT resolve
+	//   Remove-PnpDevice     does NOT resolve
+	//   Disable-PnpDevice    resolves
+	//   pnputil.exe          present
+	//
+	// So the old call failed with CommandNotFoundException every time, the error went
+	// to the log, and the adapter stayed. The next activation then reported it as
+	// "another tunnel or virtual adapter" - the program warning the user about its own
+	// leftover.
+	src, err := os.ReadFile("winapi.go")
+	if err != nil {
+		t.Skipf("winapi.go is not readable: %v", err)
+	}
+	text := string(src)
+	// Whether it is *called*, not whether it is mentioned: the comment above the
+	// function names both cmdlets to explain why they are not used, and a test that
+	// forbade the name would forbid the explanation.
+	for _, call := range []string{
+		`Remove-NetAdapter -Name`,
+		`Remove-PnpDevice -InstanceId`,
+	} {
+		if strings.Contains(text, call) {
+			t.Errorf("the removal still calls %q, which does not resolve here", call)
+		}
+	}
+	if !strings.Contains(text, "pnputil") {
+		t.Error("the removal does not use pnputil, the tool that is actually present")
+	}
+	// And it must check the outcome rather than trusting the command, because the
+	// defect being fixed is a removal that reported success and did nothing.
+	if !strings.Contains(text, "但网卡仍然存在") {
+		t.Error("the removal does not verify that the adapter is gone")
+	}
+	// A fallback that at least stops it carrying traffic.
+	if !strings.Contains(text, "Disable-NetAdapter") {
+		t.Error("there is no fallback for a removal that cannot complete")
+	}
+}
+
+func TestAdapterInstanceIDIsReadNotConstructed(t *testing.T) {
+	// The instance id is read from the adapter, so the removal cannot be pointed at
+	// anything but the interface being looked at.
+	src, err := os.ReadFile("winapi.go")
+	if err != nil {
+		t.Skipf("winapi.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(src), "PnPDeviceID") {
+		t.Error("the instance id is not read from the adapter")
 	}
 }
