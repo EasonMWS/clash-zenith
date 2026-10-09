@@ -609,6 +609,22 @@ type tunRun struct {
 	Steps  []string `json:"steps"`
 	Error  string   `json:"error,omitempty"`
 	Mode   TunMode  `json:"mode"`
+	// WaitingForApproval is true while this process is waiting for the user to answer
+	// the Windows permission prompt.
+	//
+	// This is the state that used to be invisible. Enabling TUN asks for elevation,
+	// which puts a system dialog on screen that the user may not have noticed, behind
+	// another window, or on another monitor - and until they answer it, this program
+	// does nothing at all for up to four minutes. From the interface it looked exactly
+	// like a hang, because nothing distinguished "waiting for you" from "stuck". The
+	// user's own words for it were sitting there waiting like an idiot.
+	WaitingForApproval bool `json:"waitingForApproval"`
+	// WaitedSeconds and WaitLimitSeconds make the wait a number on screen rather than
+	// an open-ended promise.
+	WaitedSeconds    int `json:"waitedSeconds"`
+	WaitLimitSeconds int `json:"waitLimitSeconds"`
+	// ApprovalHint is what to do about it.
+	ApprovalHint string `json:"approvalHint,omitempty"`
 }
 
 // EnableTun is the single product action: one call, and every step behind it runs
@@ -664,6 +680,14 @@ func (a *App) TunRunState() *tunRun {
 	}
 	cp := *a.tunRun
 	cp.Steps = append([]string(nil), a.tunRun.Steps...)
+	// The countdown is computed when it is read, so the interface sees it move without
+	// anything having to tick in the background.
+	if cp.WaitingForApproval && !a.approvalWaitStart.IsZero() {
+		cp.WaitedSeconds = int(time.Since(a.approvalWaitStart) / time.Second)
+		if cp.WaitedSeconds > approvalGraceSeconds && cp.ApprovalHint != "" {
+			cp.ApprovalHint += " 已经等了 " + fmt.Sprint(cp.WaitedSeconds) + " 秒。"
+		}
+	}
 	return &cp
 }
 
@@ -884,8 +908,16 @@ func (a *App) runEnableTun(mode TunMode) {
 		// recorded nowhere and it read that empty object to decide the outcome -
 		// which meant a failed activation could report success. Nothing below reads
 		// this process's own memory to decide what the helper achieved.
-		a.setTunStage("已授权，等待提权实例接管")
+		a.mu.Lock()
+		a.helperPID = helperPID
+		a.mu.Unlock()
+		a.setTunStage("等待系统授权，请在弹窗里点「是」")
+		a.setApprovalWait(true)
 		result := a.awaitHandover(id, helperPID, handoverTimeout)
+		a.setApprovalWait(false)
+		a.mu.Lock()
+		a.helperPID = 0
+		a.mu.Unlock()
 		if result.OK {
 			txA.step("提权实例完成", "done", "由提权实例报告成功")
 			a.saveTunTxn(txA)
@@ -919,11 +951,117 @@ func (a *App) runEnableTun(mode TunMode) {
 
 // handoverTimeout bounds the wait for the helper.
 //
-// It is generous because the steps it covers are slow: a core restart, driver
-// binding and a real request through the tunnel. It is not the primary way the
-// wait ends - a helper that exits is noticed as soon as it does - so this only
-// catches a helper that is still alive and stuck.
-const handoverTimeout = 4 * time.Minute
+// It was four minutes, and four minutes is the wrong number for the part of the wait
+// a user actually experiences. Most of that window is not the helper working - it is
+// the Windows permission prompt sitting unanswered. From the interface, "waiting for
+// you to click something" and "hung" looked identical, and the user described it as
+// sitting there like an idiot.
+//
+// Two changes rather than one, because shortening the number alone would turn a slow
+// success into a failure on a machine that is merely slow:
+//
+//   - the window is now two minutes, which is generous for approving a prompt;
+//   - the wait reports that it is waiting for approval, with a countdown and an
+//     instruction, so the number is on screen instead of implied. See
+//     tunRun.WaitingForApproval.
+//
+// It remains a bound and not the primary way the wait ends: a helper that exits is
+// noticed as soon as it does, and a helper whose heartbeat stops is reported as stuck
+// rather than slow.
+const handoverTimeout = 2 * time.Minute
+
+// approvalGrace is how long the wait is expected to last before it is the user's turn
+// to act. Past it, the interface says the prompt is probably waiting to be answered.
+const approvalGrace = 8 * time.Second
+
+// approvalGraceSeconds is the same bound in the units the interface reads.
+const approvalGraceSeconds = int(approvalGrace / time.Second)
+
+// CancelTunActivation ends a wait that is still going.
+//
+// The interface needs this because the wait can be two minutes long and the user may
+// have decided. Without it the only way out was to close the program - which is what
+// someone does when a button appears to have hung, and closing the program during an
+// activation is the state that leaves a half-applied arrangement behind.
+//
+// It stops the helper if one was started, marks the attempt failed with a reason the
+// user chose, and clears the running state so the interface stops showing progress.
+// It does not touch the network: a cancelled activation has not changed anything yet
+// at the point it is cancelled, and if it has, the ordinary failure path runs.
+func (a *App) CancelTunActivation() error {
+	a.mu.Lock()
+	active := a.tunRun != nil && a.tunRun.Active
+	helperPID := a.helperPID
+	a.mu.Unlock()
+	if !active {
+		return fmt.Errorf("当前没有正在进行的启用过程")
+	}
+
+	// Stop the helper first, so it cannot report a success after the user cancelled.
+	if helperPID > 0 {
+		if err := killHelperProcess(helperPID); err != nil {
+			Log("cancel: could not stop the elevated helper (pid %d): %v", helperPID, err, "WARN")
+		}
+	}
+	// And tell any waiter, by writing the failure into the record it reads. This is the
+	// same channel the helper would have used, so there is one way for a wait to end
+	// rather than two that can disagree.
+	if rec := a.readHandover(); rec != nil && rec.State == handoverRunning {
+		rec.State = handoverFailed
+		rec.Failure = "你取消了这次启用"
+		rec.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+		a.writeHandover(rec)
+	}
+	a.setApprovalWait(false)
+	a.mu.Lock()
+	if a.tunRun != nil {
+		a.tunRun.Active = false
+		a.tunRun.Stage = "已取消"
+		a.tunRun.Error = "你取消了这次启用"
+	}
+	a.helperPID = 0
+	a.mu.Unlock()
+	Log("TUN activation cancelled by the user")
+	return nil
+}
+
+// setApprovalWait records that this process is waiting on the Windows permission
+// prompt, and starts the clock the interface counts from.
+//
+// The clock matters as much as the flag. "Waiting for approval" with no bound is the
+// same experience as a hang; "waiting for approval, 12s of 120s" is something a user
+// can decide about - including deciding to cancel, which is why the interface has a
+// button that reaches this state.
+func (a *App) setApprovalWait(waiting bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.tunRun == nil {
+		a.tunRun = &tunRun{Mode: a.store.Settings().TunMode}
+	}
+	a.tunRun.WaitingForApproval = waiting
+	a.tunRun.WaitLimitSeconds = int(handoverTimeout / time.Second)
+	if waiting {
+		a.approvalWaitStart = time.Now()
+		a.tunRun.WaitedSeconds = 0
+		a.tunRun.ApprovalHint = "Windows 正在询问是否允许 Zenith 创建虚拟网卡。" +
+			"请在弹出的窗口里点「是」。如果没看到窗口，检查任务栏是否有闪烁的盾牌图标，" +
+			"或者它可能被其他窗口挡住了。"
+	} else {
+		a.approvalWaitStart = time.Time{}
+		a.tunRun.ApprovalHint = ""
+	}
+}
+
+// approvalWaitElapsed is how long the current wait has been going, for the interface.
+func (a *App) approvalWaitElapsed() int {
+	a.mu.Lock()
+	start := a.approvalWaitStart
+	a.mu.Unlock()
+	if start.IsZero() {
+		return 0
+	}
+	return int(time.Since(start) / time.Second)
+}
 
 // runActivateTun is transaction B. It records what it changed before changing it,
 // so a failure can put back exactly those things and nothing else.
@@ -931,9 +1069,32 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 	txB := newTunTxn(txnActivate)
 	txB.Mode = mode
 	st := a.store.Settings()
+	// Turn the system proxy off, and record that we did.
+	//
+	// The two are mutually exclusive and this is the direction that matters. Once the
+	// tunnel is up, the routing table carries the traffic and the proxy setting has no
+	// effect on it - but every application that honours the setting keeps trying to
+	// reach a local port, and that port belongs to a core this activation is about to
+	// restart. The result is a machine where some applications are briefly offline and
+	// the interface shows both switches on, neither of which is a description of what
+	// is happening.
+	//
+	// Recorded in the transaction rather than just switched, so the failure path can
+	// put it back: a user who had the proxy on and whose activation then failed should
+	// get the arrangement they started with, not a third one.
 	proxyState := NewSystemProxy(a.dataDir).Status()
 	txB.Owned.SysProxyWasOn = proxyState.Enabled
 	txB.Owned.SysProxyServer = proxyState.Server
+	if proxyState.Enabled {
+		a.setTunStage("关闭系统代理（与 TUN 互斥）")
+		NewSystemProxy(a.dataDir).Disable()
+		if _, err := a.store.UpdateSettings(map[string]interface{}{"systemProxy": false}); err != nil {
+			Log("TUN activate: could not record that the system proxy was switched off: %v",
+				err, "WARN")
+		}
+		txB.step("关闭系统代理", "done",
+			"TUN 接管与系统代理互斥，已关闭系统代理；这次激活失败的话会恢复它")
+	}
 	txB.Owned.AdapterName = st.NormalizedTunDevice()
 	a.saveTunTxn(txB)
 
@@ -1045,17 +1206,21 @@ func (a *App) runActivateTun(mode TunMode, env tunEnvironment) error {
 		Log("TUN 提示：%s", traffic.IPv6)
 	}
 
-	// Privacy mode's block goes in before the configuration is committed, because
-	// it is part of what "protected" means and a commit that skipped it would
-	// record a success the machine does not back up.
-	if mode == TunPrivacy {
-		a.setTunStage("建立独立于内核的阻断")
-		if err := ApplyPrivacyBlock("privacy mode activation"); err != nil {
-			return rollback(fmt.Errorf("隐私模式需要建立阻断，但防火墙规则没有建立成功：%v。"+
-				"没有阻断的隐私模式只是普通 TUN，所以这次激活按失败处理", err))
-		}
-		txB.step("建立阻断", "done", "防火墙规则已建立并读回确认；它不依赖内核存活")
-	}
+	// There is no firewall block here, and there was.
+	//
+	// What was added: two rules blocking all outbound and inbound traffic "so that
+	// protected traffic cannot leave outside the tunnel". What it did: blocked the
+	// tunnel as well, because the tunnel's own traffic is outbound traffic. Enabling
+	// privacy mode therefore started by cutting the machine off, the tunnel could
+	// never come up, and the state it left behind was a firewall with no internet and
+	// no way out - the rules could be installed by this program and could only be
+	// removed by an administrator by hand.
+	//
+	// A safety feature that can strand the user, and that the program cannot undo, is
+	// worse than the absence of the feature. It is not being fixed here; it is being
+	// withdrawn. Privacy mode is strict-route and an explicit refusal to fall back,
+	// which is a real thing that it does, and the README says what it does not do.
+	//
 
 	// Only now, with the adapter carrying traffic, is this configuration the one
 	// worth going back to. A failure after this point would otherwise roll back to
@@ -1127,29 +1292,6 @@ func (a *App) restoreConfig() error {
 	return nil
 }
 
-// releasePrivacyBlock is the only path that lifts a privacy-mode block.
-//
-// It exists as its own function so that "restore the network" can never be the
-// reason a block is lifted by accident. The review called this out: a failure in
-// privacy mode must leave the block standing, because the block is the feature -
-// restoring connectivity is not an improvement if it restores it unprotected.
-func (a *App) releasePrivacyBlock(reason string) error {
-	st := a.store.Settings()
-	if st.TunMode != TunPrivacy {
-		return nil
-	}
-	// Release the system policy first, then the setting. In that order, because the
-	// setting is what the interface reads to decide whether to say "protected": a
-	// failure between the two leaves a setting that asks for a block with no block
-	// behind it, which the status reports as a disagreement rather than as safety.
-	if err := ReleasePrivacyBlock(reason); err != nil {
-		return err
-	}
-	Log("privacy block released explicitly: %s", reason, "WARN")
-	_, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)})
-	return err
-}
-
 // rollbackActivate restores exactly what this activation changed.
 //
 // It does not touch resources it did not create, which is the whole reason the
@@ -1172,8 +1314,6 @@ func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 	txB.State = "rollingBack"
 	a.saveTunTxn(txB)
 
-	privacy := mode == TunPrivacy
-
 	// 1. The previous configuration first, and verified.
 	restoreErr := a.restoreConfig()
 	if restoreErr != nil {
@@ -1195,39 +1335,17 @@ func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 		})
 	}
 
-	// 2. Mode off, unless this is privacy mode and the block must stand.
-	if privacy {
-		// The block is deliberately left standing, and now that it is a real
-		// firewall policy this sentence describes something rather than asserting
-		// it. Restoring connectivity is not an improvement when it restores it
-		// unprotected, and a failed enable must not be the event that quietly
-		// removes the protection the user asked for.
-		enforced, _, err := PrivacyBlockEnforced()
-		switch {
-		case err != nil:
-			txB.Steps = append(txB.Steps, tunStep{
-				Name: "隐私阻断", State: "failed",
-				Detail: "无法确认阻断是否仍在生效：" + err.Error(), At: time.Now(),
-			})
-		case enforced:
-			txB.Steps = append(txB.Steps, tunStep{
-				Name: "隐私阻断", State: "done",
-				Detail: "阻断仍然生效（防火墙规则在读回时存在）。这次激活失败了，" +
-					"但保护没有被解除——解除必须是你的明确操作", At: time.Now(),
-			})
-		default:
-			// The one case that must never be reported as fine.
-			txB.Steps = append(txB.Steps, tunStep{
-				Name: "隐私阻断", State: "failed",
-				Detail: "隐私模式要求阻断，但防火墙规则不在。当前流量不受阻断保护。" +
-					"重新启用一次隐私模式会重新建立它", At: time.Now(),
-			})
-			txB.RestoreFailure = "隐私阻断未生效"
-		}
-		// The candidate configuration is gone, so the core must be started from the
-		// restored one. The mode stays privacy, so the block is re-armed by the
-		// configuration the user already had.
-	} else if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
+	// 2. The mode goes back to off, because the activation that would have turned it
+	// on did not complete.
+	//
+	// There used to be a branch here for a mode that kept a firewall block standing
+	// through the failure. That mode is gone: the block it installed blocked all
+	// outbound traffic, which includes the tunnel's own traffic, so engaging it cut
+	// the connection before the tunnel could carry anything - and the rule it left
+	// behind could only be removed by hand as an administrator. A mode that can
+	// strand the user, that the program cannot undo, and that reports "protected"
+	// while doing it is worse than no mode at all.
+	if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
 		Log("TUN rollback: could not switch the mode back off: %v", err, "WARN")
 		txB.Steps = append(txB.Steps, tunStep{
 			Name: "关闭模式", State: "failed", Detail: err.Error(), At: time.Now(),
@@ -1284,21 +1402,16 @@ func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 
 // ---- disabling ------------------------------------------------------------
 
-// DisableTun turns the tunnel off and restores the previous arrangement. In
-// privacy mode nothing may call it implicitly: releasing the block is the user's
-// decision, which is why releasePrivacy exists as an explicit argument.
-func (a *App) DisableTun(releasePrivacy bool) error {
+// DisableTun turns the tunnel off and restores the previous arrangement.
+//
+// The signature used to take a releasePrivacy argument, because one mode required the
+// user to confirm before its block was lifted. That mode is gone: the block it
+// installed blocked the tunnel along with everything else, so it is removed from the
+// program rather than repaired.
+func (a *App) DisableTun() error {
 	st := a.store.Settings()
 	if st.TunMode == TunOff {
 		return nil
-	}
-	if st.TunMode == TunPrivacy && !releasePrivacy {
-		return fmt.Errorf("当前是隐私保护模式：请先确认要退出保护并恢复常规联网")
-	}
-	if st.TunMode == TunPrivacy {
-		if err := ReleasePrivacyBlock("TUN disable"); err != nil {
-			return err
-		}
 	}
 	if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
 		return err
@@ -1395,7 +1508,7 @@ func (a *App) RecoverTun() {
 func (a *App) RepairTun(release bool) (tunEnvironment, error) {
 	env := a.checkTunEnvironment()
 	if release {
-		if err := a.DisableTun(true); err != nil {
+		if err := a.DisableTun(); err != nil {
 			return env, err
 		}
 	}
@@ -1410,7 +1523,7 @@ func (a *App) RepairTun(release bool) (tunEnvironment, error) {
 func (a *App) UninstallTun() error {
 	st := a.store.Settings()
 	if st.TunMode != TunOff {
-		if err := a.DisableTun(true); err != nil {
+		if err := a.DisableTun(); err != nil {
 			return err
 		}
 	}

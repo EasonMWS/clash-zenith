@@ -150,7 +150,7 @@ mainstream clients leave to external scripts.
 | **Strict TLS by default** | Subscriptions and probes verify certificates; plain http and cross-host redirects are refused. A self-signed subscription needs an explicit opt-in |
 | **A local API that is actually local** | Every API route requires a per-launch token, the Host must be loopback, cross-origin requests are refused, and writes must be JSON |
 | **TUN takeover, one click** | Click enable, approve the system prompt, and the rest is automatic: the signed driver is verified by digest and signature, the adapter is created, routes and DNS are configured, and a real request is made through the tunnel before anything is called a success |
-| **TUN state you can trust** | `system proxy` / `TUN takeover` / `privacy` are three separate states with three separate descriptions. An adapter existing is never reported as protection |
+| **TUN state you can trust** | `system proxy` and `TUN takeover` are two separate states with two separate descriptions. An adapter existing is never reported as protection |
 | **Bounded by what it can undo** | Enabling runs as two recorded transactions. A failure restores only what that attempt changed, so another VPN's adapter or your own routes are never touched |
 | **Built in logs** | Application and core logs, viewable in the app |
 
@@ -211,7 +211,6 @@ wrong.
 |---|---|
 | System proxy | Only applications that honour the system proxy are routed. Games and UDP go direct |
 | TUN takeover (compat) | Supported traffic is taken over and your rules still apply. **Direct is still allowed** — this is not "everything is proxied" and there is no kill switch |
-| Privacy | Protected traffic may only leave through an approved route, and a dropped connection keeps refusing rather than falling back to direct. Leaving this state is a decision you make explicitly, and **a failed activation never lifts the block for you** |
 
 **Uninstall removes only Zenith's own adapter.** The driver file is deliberately
 left in place, because another application may be using the same one.
@@ -536,7 +535,6 @@ TUN 在流量前面放一块虚拟网卡来补上这个缺口。
 |---|---|
 | 系统代理 | 只有遵循系统代理的应用被路由，游戏和 UDP 直连 |
 | TUN 接管（兼容） | 接管支持范围内的流量并仍按规则分流，**仍允许直连**——不等于"全部流量经代理"，也没有 Kill Switch |
-| 隐私保护 | 受保护流量只走批准线路，断线保持阻断而不是回退直连。退出保护必须你主动确认，**失败的激活永远不会替你解除阻断** |
 
 **卸载只删除 Zenith 自己的网卡。** 驱动文件**故意不删**，因为别的软件可能正在用同一个。
 

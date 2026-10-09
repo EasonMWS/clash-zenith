@@ -44,6 +44,13 @@ type App struct {
 	// start - typically the one an elevated activation left running. Zero means
 	// none.
 	adoptedCorePID int
+	// approvalWaitStart is when this process began waiting for the Windows
+	// permission prompt. The interface counts from it, so the wait is a number on
+	// screen rather than an open-ended promise.
+	approvalWaitStart time.Time
+	// helperPID is the elevated helper this process started, so a cancel can
+	// stop it. Zero when there is none.
+	helperPID int
 
 	mu         sync.Mutex
 	optimizing bool

@@ -26,6 +26,7 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os/exec"
@@ -179,6 +180,28 @@ func directRequest(target string, timeout time.Duration) (int, error) {
 // coreHandledHost reports whether the core's connection table shows it carrying
 // traffic to this host.
 //
+// directBody fetches a URL with no proxy configured anywhere, and returns the body.
+//
+// "No proxy" is the point of every use of this: it is how a check tells whether the
+// tunnel is carrying traffic, rather than whether the program can reach the internet
+// through a proxy it configured itself.
+func directBody(url string, timeout time.Duration) (string, error) {
+	client := directHTTPClient(timeout)
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 // Correlation rather than assumption: a request can succeed for reasons that have
 // nothing to do with the tunnel, and this is what distinguishes the two.
 func (a *App) coreHandledHost(host string, within time.Duration) (bool, string) {
@@ -333,7 +356,6 @@ func (a *App) VerifyTunTraffic(mode TunMode, env tunEnvironment) tunTrafficRepor
 	targets := []string{
 		"https://www.gstatic.com/generate_204",
 		"https://cp.cloudflare.com/generate_204",
-		"https://www.baidu.com",
 	}
 	var lastErr error
 	for _, t := range targets {

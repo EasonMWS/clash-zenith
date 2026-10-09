@@ -288,7 +288,7 @@ func TestComponentVerificationRejectsWrongContent(t *testing.T) {
 
 func TestTunModeValidityAndLabels(t *testing.T) {
 	// An unrecognised stored value must be treated as off, not guessed at.
-	for _, m := range []TunMode{"", TunOff, TunCompat, TunPrivacy} {
+	for _, m := range []TunMode{"", TunOff, TunCompat} {
 		if !m.Valid() {
 			t.Errorf("%q should be valid", m)
 		}
@@ -301,7 +301,7 @@ func TestTunModeValidityAndLabels(t *testing.T) {
 	// The three states must be described differently: conflating "an adapter
 	// exists" with "protected" is the specific mistake the labels guard against.
 	labels := map[string]string{}
-	for _, m := range []TunMode{TunOff, TunCompat, TunPrivacy} {
+	for _, m := range []TunMode{TunOff, TunCompat} {
 		l := m.Label()
 		if l == "" {
 			t.Errorf("mode %q has no label", m)
@@ -311,7 +311,7 @@ func TestTunModeValidityAndLabels(t *testing.T) {
 		}
 		labels[l] = l
 	}
-	if !strings.Contains(TunPrivacy.Label(), "隐私") {
+	if !strings.Contains(TunCompat.Label(), "TUN") {
 		t.Error("the privacy mode label should say so plainly")
 	}
 	if !strings.Contains(TunCompat.Label(), "不承诺") {
@@ -463,7 +463,7 @@ func TestConfigEmitsTunOnlyWhenRequested(t *testing.T) {
 	}{
 		{TunOff, false},
 		{TunCompat, true},
-		{TunPrivacy, true},
+		{TunCompat, true},
 	} {
 		cfg := BuildConfig(nodes, []string{"n1"}, Settings{
 			MixedPort: 7890, ControlPort: 7797, Mode: "rule", TunMode: tc.mode,
@@ -473,11 +473,18 @@ func TestConfigEmitsTunOnlyWhenRequested(t *testing.T) {
 		if has != tc.want {
 			t.Errorf("mode %q: tun block present = %v, want %v", tc.mode, has, tc.want)
 		}
-		if tc.mode == TunPrivacy && !strings.Contains(cfg, "strict-route: true") {
-			t.Error("privacy mode must ask the core for strict-route")
+		// strict-route is emitted with the tunnel, not with a mode.
+		//
+		// It used to be set only for a mode called "privacy", which is gone. Its
+		// documented meaning is narrower than that name suggested - it suppresses
+		// multihomed DNS leakage, it is not a kill switch, and it stops doing anything
+		// once the core stops - so it is on for every tunnel and described for what it
+		// does rather than for what a mode was called.
+		if has && !strings.Contains(cfg, "strict-route: true") {
+			t.Error("the tunnel should ask the core to suppress DNS leakage")
 		}
-		if tc.mode == TunCompat && !strings.Contains(cfg, "strict-route: false") {
-			t.Error("compat mode must not claim strict routing")
+		if !has && strings.Contains(cfg, "strict-route:") {
+			t.Error("no tunnel means no tunnel options")
 		}
 	}
 }
@@ -1388,7 +1395,7 @@ func TestTunModeProducesATunBlockInTheGeneratedConfig(t *testing.T) {
 	}
 
 	on := base
-	on.TunMode = TunPrivacy
+	on.TunMode = TunCompat
 	withTun := BuildConfig([]Proxy{{Name: "n", Type: "socks5", Server: "1.2.3.4", Port: 1080}},
 		[]string{"n"}, on, "s", "n", 8199)
 	if !strings.Contains(withTun, "\ntun:\n") {
@@ -1596,7 +1603,7 @@ func TestHandoverRecordRoundTrips(t *testing.T) {
 		t.Fatal("a fresh data directory should have no handover record")
 	}
 	id := newHandoverID()
-	rec := a.beginHandover(id, 4242, TunPrivacy)
+	rec := a.beginHandover(id, 4242, TunCompat)
 	if rec.ID != id || rec.RequesterPID != 4242 || rec.State != handoverRunning {
 		t.Fatalf("the record was not started correctly: %+v", rec)
 	}
@@ -1799,50 +1806,6 @@ func TestRestoreConfigReportsFailureInsteadOfPretending(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(a.configPath); !bytes.Equal(got, good) {
 		t.Error("the restored file does not match the known-good copy")
-	}
-}
-
-func TestPrivacyBlockIsNotLiftedByAFailedActivation(t *testing.T) {
-	// The block is the feature. A failed enable must not be the event that quietly
-	// removes the protection the user asked for, so releasing it is a separate,
-	// explicit action rather than something a rollback does on its way out.
-	dir := t.TempDir()
-	st, err := NewStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.UpdateSettings(map[string]interface{}{"tunMode": string(TunPrivacy)}); err != nil {
-		t.Fatal(err)
-	}
-	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
-
-	// A rollback in privacy mode leaves the mode alone.
-	txB := newTunTxn(txnActivate)
-	txB.Mode = TunPrivacy
-	txB.Owned.AdapterName = tunDefaultDevice
-	a.core = NewCore("", dir, a.configPath, "s", 7797)
-	a.rollbackActivate(txB, TunPrivacy)
-
-	if got := a.store.Settings().TunMode; got != TunPrivacy {
-		t.Errorf("tunMode = %q after a failed privacy activation, want %q: the block must stand",
-			got, TunPrivacy)
-	}
-	found := false
-	for _, s := range txB.Steps {
-		if s.Name == "隐私阻断" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("the rollback should record that the privacy block was deliberately left standing")
-	}
-
-	// Releasing it is explicit and separate.
-	if err := a.releasePrivacyBlock("test"); err != nil {
-		t.Fatal(err)
-	}
-	if got := a.store.Settings().TunMode; got != TunOff {
-		t.Errorf("tunMode = %q after an explicit release, want off", got)
 	}
 }
 
@@ -2732,10 +2695,10 @@ func TestSettingsPickUpAnotherProcessesWrite(t *testing.T) {
 	}
 
 	// And the other direction, so this is not one-way.
-	if _, err := a.UpdateSettings(map[string]interface{}{"tunMode": string(TunPrivacy)}); err != nil {
+	if _, err := a.UpdateSettings(map[string]interface{}{"tunMode": string(TunCompat)}); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.Settings().TunMode; got != TunPrivacy {
+	if got := b.Settings().TunMode; got != TunCompat {
 		t.Errorf("tunMode = %q in the other store; the change was not noticed", got)
 	}
 }
@@ -2933,105 +2896,6 @@ func TestNoRuntimeFileIsTrackedByGit(t *testing.T) {
 }
 
 // ---- the privacy block must be a system policy, not a declaration ----------
-
-func TestPrivacyBlockHasNoExecutionPathByAccident(t *testing.T) {
-	// The setting existed and nothing read it. That is the defect this file fixes,
-	// and it is worth a test that fails if the block is ever disconnected from the
-	// paths that establish it - a security control that is only declared is worse
-	// than one that is absent, because the interface reports it as on.
-	src, err := os.ReadFile("tun.go")
-	if err != nil {
-		t.Skipf("tun.go is not readable: %v", err)
-	}
-	text := string(src)
-	if !strings.Contains(text, "ApplyPrivacyBlock(") {
-		t.Error("the privacy activation does not establish the block")
-	}
-	if !strings.Contains(text, "ReleasePrivacyBlock(") {
-		t.Error("nothing releases the block, so it could never be turned off")
-	}
-	// And the rollback must check whether it is still enforced rather than assert
-	// that it is.
-	if !strings.Contains(text, "PrivacyBlockEnforced()") {
-		t.Error("the rollback does not verify the block survived a failed activation")
-	}
-}
-
-func TestPrivacyBlockRuleNamesAreScopedToThisProgram(t *testing.T) {
-	// The rules are found by exact name. A prefix match would risk deleting a rule
-	// belonging to something else, the same way an adapter is matched by name.
-	names := blockRuleNames()
-	if len(names) != 2 {
-		t.Fatalf("expected two rules (one per direction), got %d", len(names))
-	}
-	for _, n := range names {
-		if !strings.HasPrefix(n, blockRulePrefix) {
-			t.Errorf("rule %q does not carry the prefix %q", n, blockRulePrefix)
-		}
-		if !strings.Contains(n, "Zenith") {
-			t.Errorf("rule %q does not name this program", n)
-		}
-	}
-	// Both directions, because an outbound block alone leaves an established
-	// inbound connection carrying replies.
-	joined := strings.Join(names, " ")
-	if !strings.Contains(joined, "(in)") || !strings.Contains(joined, "(out)") {
-		t.Errorf("the block must cover both directions, got %v", names)
-	}
-}
-
-func TestPrivacyBlockStatusReportsEnforcedNotRequested(t *testing.T) {
-	// The interface decides whether to say "protected" from this. Reporting the
-	// setting instead of the system would reproduce the original defect in a new
-	// place: a claim of protection backed by nothing.
-	dir := t.TempDir()
-	st, err := NewStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.UpdateSettings(map[string]interface{}{"tunMode": string(TunPrivacy)}); err != nil {
-		t.Fatal(err)
-	}
-	a := &App{dataDir: dir, store: st}
-
-	got := a.PrivacyBlockStatus()
-	if !got.Requested {
-		t.Fatal("privacy mode with block-on-failure should be reported as requested")
-	}
-	if got.CheckedAt == "" {
-		t.Error("the status should record when it was read")
-	}
-	// This test runs without elevation, so the rules cannot be installed. The point
-	// is which field carries the answer: Enforced must reflect the system, and the
-	// detail must say plainly that the two disagree.
-	if got.Enforced {
-		t.Skip("firewall rules are present on this machine; the disagreement case cannot be exercised")
-	}
-	if got.Detail == "" {
-		t.Error("a disagreement between the setting and the system must be explained")
-	}
-	if !strings.Contains(got.Detail, "不受阻断保护") && !strings.Contains(got.Detail, "防火墙规则") {
-		t.Errorf("the detail should name the condition, got %q", got.Detail)
-	}
-}
-
-func TestPrivacyBlockStatusQuietWhenNothingIsAsked(t *testing.T) {
-	// With TUN off there is nothing to protect, and the status should not read as a
-	// warning.
-	dir := t.TempDir()
-	st, err := NewStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a := &App{dataDir: dir, store: st}
-	got := a.PrivacyBlockStatus()
-	if got.Requested {
-		t.Error("nothing was asked for")
-	}
-	if got.Enforced {
-		t.Error("no rules should be present in a fresh data directory")
-	}
-}
 
 // ---- a subscription must not be able to add a field to the document --------
 
@@ -3940,5 +3804,155 @@ func TestServiceMustProveItsIdentityBeforeItIsSentTheSecret(t *testing.T) {
 	defer notAService.Close()
 	if err := verifyServiceIdentityAgainst(secret, notAService.URL, time.Second); err == nil {
 		t.Error("something that cannot answer the protocol must not be trusted")
+	}
+}
+
+// ---- the two ways of taking traffic are mutually exclusive ----------------
+
+func TestAStoredModeThisVersionDoesNotHaveBecomesOff(t *testing.T) {
+	// A settings file still holding `"tunMode": "privacy"` from the version that had
+	// that mode caused two answers to one question. The accessor that validates
+	// reported the tunnel as off, while every `st.TunMode != TunOff` test answered yes
+	// - so the program believed a tunnel it had not started was running, refused to
+	// enable the system proxy because of the mutual exclusion, and showed TUN as off
+	// at the same time.
+	//
+	// Normalising on load is the fix: an unknown mode is not merely ignored, it is
+	// gone.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write the file the way the older version would have left it.
+	raw := `{"settings":{"tunMode":"privacy","mixedPort":7899},"revision":1}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := st2.Settings().TunMode
+	if got != TunOff {
+		t.Errorf("tunMode = %q after loading a mode this version does not have, want off",
+			got)
+	}
+	if !got.Valid() {
+		t.Errorf("the value left in settings, %q, is still not one this version knows", got)
+	}
+	// And the interface must agree with the code that decides.
+	if st2.Settings().TunMode != TunOff {
+		t.Error("the reported mode and the stored mode disagree, which is the defect")
+	}
+	_ = st
+}
+
+func TestSystemProxyRefusesWhileTunIsUsing(t *testing.T) {
+	// They are not two features that happen to coexist. With TUN on, the routing table
+	// carries the traffic and the proxy setting has no effect on it - so allowing both
+	// produces a machine where the checkbox says one thing, the routing table says
+	// another, and nothing explains the difference.
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Skipf("server.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, `"conflict": "tun"`) {
+		t.Error("enabling the system proxy while TUN is on is not refused with a reason " +
+			"the interface can act on")
+	}
+	if !strings.Contains(text, "两者互斥") {
+		t.Error("the refusal does not explain the relationship, so a user turning one on " +
+			"is not told what to do about the other")
+	}
+}
+
+func TestEnablingTunTurnsTheSystemProxyOff(t *testing.T) {
+	// The direction that matters. Once the tunnel is up, every application that honours
+	// the proxy setting keeps trying to reach a local port that belongs to a core the
+	// activation is about to restart.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "关闭系统代理（与 TUN 互斥）") {
+		t.Error("the activation does not switch the system proxy off")
+	}
+	// And it must record that it did, so the failure path can put it back rather than
+	// leaving the user with a third arrangement.
+	if !strings.Contains(text, "SysProxyWasOn = proxyState.Enabled") {
+		t.Error("the activation does not record whether it switched the proxy off")
+	}
+}
+
+func TestAWaitedApprovalIsVisibleAndCancellable(t *testing.T) {
+	// Enabling TUN asks for elevation, which puts a system dialog on screen that the
+	// user may not have noticed. Until they answer it, nothing happens for up to two
+	// minutes - and before this, nothing distinguished "waiting for you" from "stuck".
+	// The user's description of it was sitting there like an idiot.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	// The wait is bounded, and the bound is short enough to be a wait rather than a
+	// hang. It was four minutes, most of which was a prompt nobody had answered.
+	if !strings.Contains(text, "const handoverTimeout = 2 * time.Minute") {
+		t.Error("the approval wait is not bounded at two minutes")
+	}
+	// The wait is described, with a countdown.
+	for _, need := range []string{
+		"setApprovalWait(true)",
+		"WaitingForApproval",
+		"WaitLimitSeconds",
+		"ApprovalHint",
+	} {
+		if !strings.Contains(text, need) {
+			t.Errorf("the wait does not report %s, so it still looks like a hang", need)
+		}
+	}
+	// And it can be ended by the user rather than only by the clock.
+	if !strings.Contains(text, "func (a *App) CancelTunActivation() error") {
+		t.Error("there is no way to cancel a wait in progress, so the only exit is to " +
+			"close the program - which is what someone does when a button looks hung, " +
+			"and closing it mid-activation is the state that leaves a half-applied " +
+			"arrangement behind")
+	}
+	// Cancelling must reach the helper, or the helper finishes after the cancel and
+	// reports a success the user did not ask for.
+	if !strings.Contains(text, "killHelperProcess(helperPID)") {
+		t.Error("cancelling does not stop the elevated helper")
+	}
+}
+
+func TestCancelIsReachableFromTheInterface(t *testing.T) {
+	// A cancel that has no route is a comment.
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Skipf("server.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(src), `"/api/tun/cancel"`) {
+		t.Error("the cancel endpoint is not routed, so the interface cannot reach it")
+	}
+	html, err := os.ReadFile("../web/index.html")
+	if err != nil {
+		t.Skipf("index.html is not readable: %v", err)
+	}
+	h := string(html)
+	for _, need := range []string{"tun-approval", "tun-approval-clock", "btn-tun-cancel"} {
+		if !strings.Contains(h, need) {
+			t.Errorf("the interface has no %s, so a wait in progress is still invisible "+
+				"or unescapable", need)
+		}
+	}
+	js, err := os.ReadFile("../web/app.js")
+	if err != nil {
+		t.Skipf("app.js is not readable: %v", err)
+	}
+	if !strings.Contains(string(js), "/api/tun/cancel") {
+		t.Error("the interface does not call the cancel endpoint")
 	}
 }

@@ -767,3 +767,32 @@ a:hover { text-decoration: underline; }
 .tun-env-val.bad { color: #ff8f8f; }
 .tun-env-val.good { color: #35d07f; }
 .tun-env-val.warn { color: #ffb020; }
+
+/* 等待系统授权。单独一块，因为它和别的进度不是一回事：这一步是程序在等你，
+   而不是你在等程序。 */
+#tun-approval {
+  margin: 10px 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--warn-border, #d9a441);
+  border-left-width: 4px;
+  border-radius: 8px;
+  background: var(--warn-bg, rgba(217, 164, 65, 0.08));
+}
+.tun-approval-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+#tun-approval-clock {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+.tun-approval-hint {
+  font-size: 12.5px;
+  line-height: 1.6;
+  opacity: 0.85;
+  margin-bottom: 10px;
+}

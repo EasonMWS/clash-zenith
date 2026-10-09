@@ -345,12 +345,15 @@ func BuildConfig(nodes []Proxy, optimised []string, st Settings, secret string, 
 	//   auto-route            installs the routes that pull traffic into the tunnel
 	//   auto-detect-interface keeps the core's own outbound on the real adapter, so
 	//                         the tunnel cannot swallow its own upstream connection
-	//   strict-route          refuses traffic that would otherwise escape the tunnel
+	//   strict-route          suppresses multihomed DNS leakage
 	//   stack: gvisor         userspace TCP/IP, which is what makes UDP work
 	//   dns-hijack            53/udp is taken over, so lookups cannot go out in clear
 	//
-	// wintun.dll is loaded by bare name, and Windows searches the executable's own
-	// directory first, which is why the verified copy lives next to the core.
+	// strict-route used to be conditional, set only for a mode called "privacy". That
+	// mode is gone. Its documented meaning is narrower than the name suggested - it
+	// suppresses multihomed DNS leakage, it is not a kill switch, and it does nothing
+	// once the core stops - so it is now on for every tunnel and described for what it
+	// does rather than for what a mode was named.
 	if st.TunMode != TunOff {
 		stack := st.TunStack
 		if stack == "" {
@@ -362,12 +365,12 @@ func BuildConfig(nodes []Proxy, optimised []string, st Settings, secret string, 
   stack: %s
   auto-route: true
   auto-detect-interface: true
-  strict-route: %v
+  strict-route: true
   mtu: 9000
   dns-hijack:
     - any:53
   route-exclude-address: []
-`, q(st.TunDevice), q(stack), st.TunMode == TunPrivacy)
+`, q(st.TunDevice), q(stack))
 	}
 
 	b.WriteString("\nproxies:\n")

@@ -55,10 +55,25 @@ type Proxy struct {
 
 // TunMode is how far Zenith goes in taking over traffic.
 //
-// The three values are deliberately distinct in the interface as well as in the
-// code. Reporting "protected" because an adapter exists is the mistake this type
-// exists to prevent: taking over traffic and forbidding direct connections are
-// separate promises, and only the third one makes the second.
+// The values are deliberately distinct in the interface as well as in the code.
+// Reporting "protected" because an adapter exists is the mistake this type exists to
+// prevent.
+//
+// There was a third value, "privacy". It was withdrawn, and the reason is worth
+// keeping here rather than only in a commit message.
+//
+// What it was supposed to be: a mode where protected traffic can only leave through
+// the tunnel. What it was: `strict-route` in the generated configuration plus a
+// firewall block that blocked all outbound traffic. Outbound traffic includes the
+// tunnel's own traffic, so engaging the mode cut the connection before the tunnel
+// could carry anything, and the state it left was a machine with no internet and a
+// firewall rule that this program could not remove. The user had to remove it by hand
+// as an administrator.
+//
+// A safety feature that can strand the person using it, and that the program cannot
+// undo, is worse than not having it. The mode is gone rather than repaired: a
+// half-working kill switch that reports "protected" is the specific failure that must
+// not be shipped.
 type TunMode string
 
 const (
@@ -68,15 +83,14 @@ const (
 	// TunCompat routes the traffic it can reach through the user's rules, with
 	// direct still allowed. This is "TUN is on", not "nothing can leak".
 	TunCompat TunMode = "compat"
-	// TunPrivacy additionally requires that protected traffic can only leave
-	// through an approved route, and keeps refusing when the core is down.
-	TunPrivacy TunMode = "privacy"
 )
 
 // Valid reports whether a stored value is one this version understands. An
-// unrecognised value is treated as off rather than guessed at.
+// unrecognised value is treated as off rather than guessed at, which is how a stored
+// "privacy" from an older version is handled: it becomes off, and the interface shows
+// TUN as not enabled rather than showing a protection that no longer exists.
 func (m TunMode) Valid() bool {
-	return m == TunOff || m == TunCompat || m == TunPrivacy
+	return m == TunOff || m == TunCompat
 }
 
 // Label is the honest description of what the mode does, for the interface.
@@ -84,8 +98,6 @@ func (m TunMode) Label() string {
 	switch m {
 	case TunCompat:
 		return "TUN 接管已启用（仍按规则允许直连，不承诺全部流量经代理）"
-	case TunPrivacy:
-		return "隐私保护已生效（受保护流量只走批准线路，断线保持阻断）"
 	default:
 		return "系统代理兼容模式（仅对遵循系统代理的应用生效）"
 	}
@@ -159,10 +171,6 @@ type Settings struct {
 	TunMode   TunMode `json:"tunMode"`
 	TunDevice string  `json:"tunDevice"` // adapter name Zenith creates and owns
 	TunStack  string  `json:"tunStack"`  // gvisor | system | mixed
-	// TunBlockOnFailure keeps the tunnel's refusal in place when the core dies.
-	// Only meaningful in privacy mode, where recovering connectivity by falling
-	// back to a direct connection would be the opposite of the intent.
-	TunBlockOnFailure bool `json:"tunBlockOnFailure"`
 
 	// meta
 	WindowWidth  int    `json:"windowWidth"`
@@ -196,7 +204,6 @@ func defaultSettings() Settings {
 		TunMode:                   TunOff,
 		TunDevice:                 defaultTunDevice,
 		TunStack:                  "gvisor",
-		TunBlockOnFailure:         true,
 		WindowWidth:               1200,
 		WindowHeight:              780,
 		ProxyBypass: "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;" +
@@ -347,6 +354,20 @@ func mergeDefaults(s *Settings, def Settings) {
 	// edit JSON before the feature can work for the first time.
 	s.TunDevice = s.NormalizedTunDevice()
 	s.TunStack = s.NormalizedTunStack()
+	// A mode this version does not know becomes off, and it becomes off *here* rather
+	// than only in the accessor that validates. That is the difference between a
+	// stored value that is ignored and one that is gone.
+	//
+	// It matters because the value is compared, not only displayed. A file still
+	// holding `"tunMode": "privacy"` from the version that had that mode made every
+	// `st.TunMode != TunOff` test answer yes: the program believed a tunnel it had not
+	// started was running, refused to enable the system proxy because of the mutual
+	// exclusion, and showed TUN as off in the interface - all at once, from one value.
+	if !s.TunMode.Valid() {
+		Log("settings: tunMode %q is not a mode this version has; treating it as off",
+			truncateForMessage(string(s.TunMode), 20), "WARN")
+		s.TunMode = TunOff
+	}
 	if s.MixedPort == 0 {
 		s.MixedPort = def.MixedPort
 	}

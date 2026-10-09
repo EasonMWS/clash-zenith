@@ -249,19 +249,21 @@
           <label class="switch"><input type="checkbox" id="sw-tun-compat"><span class="slider"></span></label>
         </div>
 
-        <div class="switch-row">
-          <div class="switch-text">
-            <div class="switch-title">隐私保护</div>
-            <div class="switch-desc">
-              在 TUN 接管之上要求受保护流量<strong>只走批准线路</strong>，
-              断线时保持阻断而不是回退直连。<strong>退出保护会恢复常规联网，必须由你主动确认。</strong>
-            </div>
-          </div>
-          <label class="switch"><input type="checkbox" id="sw-tun-privacy"><span class="slider"></span></label>
-        </div>
-
         <div id="tun-progress" class="hidden">
           <div class="switch-title">正在：<span id="tun-stage">—</span></div>
+          <!-- The approval wait gets its own block, because it is the one step where
+               the program is waiting for the user and not the other way round. Before
+               this existed the interface showed "进行中" for up to four minutes with
+               nothing to distinguish "waiting for you to click something" from
+               "hung", which is exactly how it was experienced. -->
+          <div id="tun-approval" class="hidden">
+            <div class="tun-approval-line">
+              <strong>等待你在系统弹窗里点「是」</strong>
+              <span id="tun-approval-clock">—</span>
+            </div>
+            <div id="tun-approval-hint" class="tun-approval-hint"></div>
+            <button class="btn sm" id="btn-tun-cancel">取消这次启用</button>
+          </div>
           <ul class="tun-steps" id="tun-steps"></ul>
         </div>
 

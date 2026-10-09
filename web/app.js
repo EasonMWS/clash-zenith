@@ -913,8 +913,11 @@ function bindSettings() {
 
 /* --------------------------------------------------------------- TUN 面板 */
 
-// TUN 的三种状态在界面上必须分得清：系统代理兼容、TUN 接管、隐私保护。
+// TUN 的两种状态在界面上必须分得清：系统代理兼容、TUN 接管。
 // 把"网卡建好了"说成"已经保护"是这块代码最需要避免的错误。
+//
+// 这里曾经有第三种状态叫"隐私保护"，已经删除：它的阻断规则会连隧道一起挡掉，
+// 开启即断网，规则还只能由管理员手动清除。
 const TUN_POLL_MS = 1500;
 let tunPoll = null;
 
@@ -935,9 +938,6 @@ function renderTunEnv(env, run, mode) {
   } else if (failed) {
     pill.textContent = '未启用';
     pill.className = 'pill err';
-  } else if (m === 'privacy') {
-    pill.textContent = '隐私保护已生效';
-    pill.className = 'pill on';
   } else if (m === 'compat') {
     pill.textContent = 'TUN 接管已启用';
     pill.className = 'pill on';
@@ -947,10 +947,7 @@ function renderTunEnv(env, run, mode) {
   }
 
   // 保护范围的说明随实际状态变化，不用一句笼统的话糊过去。
-  if (m === 'privacy') {
-    scope.innerHTML = '当前是<strong>隐私保护模式</strong>：受保护流量只走批准线路，' +
-      '断线时保持阻断。退出保护需要你主动确认。';
-  } else if (m === 'compat') {
+        if (m === 'compat') {
     scope.innerHTML = '当前是<strong>TUN 接管（兼容策略）</strong>：接管支持范围内的流量并按规则分流，' +
       '<strong>仍允许直连</strong>。这不是"所有流量经代理"，也没有 Kill Switch。';
   } else {
@@ -958,10 +955,37 @@ function renderTunEnv(env, run, mode) {
       '游戏、原始 UDP 和自带网络栈的程序会直连。';
   }
 
-  const boxes = [$('#sw-tun-compat'), $('#sw-tun-privacy')];
+  // 等待授权：这是唯一一步"程序在等你"的地方，必须和"卡住"区分开。
+  const approval = $('#tun-approval');
+  const clock = $('#tun-approval-clock');
+  const hint = $('#tun-approval-hint');
+  if (approval) {
+    if (running && run.waitingForApproval) {
+      approval.classList.remove('hidden');
+      const waited = run.waitedSeconds || 0;
+      const limit = run.waitLimitSeconds || 0;
+      if (clock) {
+        clock.textContent = limit
+          ? `已等待 ${waited} 秒 / 最多 ${limit} 秒`
+          : `已等待 ${waited} 秒`;
+      }
+      if (hint) {
+        let text = run.approvalHint || '';
+        // 过了宽限期还没有回应，多半是弹窗被挡住了或没注意到。
+        if (waited > 10) {
+          text += ' 提示：弹窗可能被其他窗口挡住了，试试按 Alt+Tab 找一下，' +
+            '或者看看任务栏上有没有闪动的盾牌图标。';
+        }
+        hint.textContent = text;
+      }
+    } else {
+      approval.classList.add('hidden');
+    }
+  }
+
+  const boxes = [$('#sw-tun-compat')];
   boxes.forEach((b) => { if (b) b.disabled = !!running; });
   if ($('#sw-tun-compat')) $('#sw-tun-compat').checked = (m === 'compat');
-  if ($('#sw-tun-privacy')) $('#sw-tun-privacy').checked = (m === 'privacy');
 
   // 进度：把每一步的真实结果列出来，而不是一个百分比。
   if (running || failed) {
@@ -1059,10 +1083,6 @@ function bindTun() {
     if (this.checked) { setMode('compat'); }
     else { disableTun(false); }
   });
-  $('#sw-tun-privacy').addEventListener('change', function () {
-    if (this.checked) { setMode('privacy'); }
-    else { disableTun(true); }
-  });
 
   $('#btn-tun-check').addEventListener('click', function () {
     guard(this, async () => { await loadTun(); toast('已重新检查环境', 'ok'); });
@@ -1089,19 +1109,35 @@ function bindTun() {
   });
 }
 
-async function disableTun(privacy) {
-  // 退出隐私保护是用户的决定，所以要问一次，而不是默默解除。
-  if (privacy && !confirm('退出隐私保护会恢复常规联网，断线时不再保持阻断。确认退出保护？')) {
+async function disableTun() {
+  // 退出 TUN 会恢复走系统代理。这里问一次，而不是默默关掉。
+  if (!confirm('关闭 TUN 接管后，不遵循系统代理的程序会直接联网。确认关闭？')) {
     await loadTun();
     return;
   }
-  const r = await api('/api/tun/disable', { releasePrivacy: !!privacy });
+  const r = await api('/api/tun/disable', {});
   if (r.ok) { toast('TUN 已关闭', 'ok'); }
   else { toast(r.error || '关闭失败', 'err'); }
   await loadTun();
 }
 
 /* --------------------------------------------------------------- 启动流程 */
+
+// 取消按钮：接进 /api/tun/cancel，这样倒计时不是唯一出路。
+const cancelBtn = $('#btn-tun-cancel');
+if (cancelBtn) {
+  cancelBtn.addEventListener('click', async function () {
+    cancelBtn.disabled = true;
+    try {
+      const r = await api('/api/tun/cancel', {});
+      if (r.ok) { toast('已取消', 'ok'); }
+      else { toast(r.error || '取消失败', 'err'); }
+    } finally {
+      cancelBtn.disabled = false;
+      await loadTun();
+    }
+  });
+}
 
 function boot() {
   let tab = 'overview';

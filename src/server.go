@@ -100,6 +100,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/tun/check", s.wrap(s.handleTunCheck))
 	s.mux.HandleFunc("/api/tun/enable", s.wrap(s.handleTunEnable))
 	s.mux.HandleFunc("/api/tun/disable", s.wrap(s.handleTunDisable))
+	s.mux.HandleFunc("/api/tun/cancel", s.wrap(s.handleTunCancel))
 	s.mux.HandleFunc("/api/tun/repair", s.wrap(s.handleTunRepair))
 	s.mux.HandleFunc("/api/tun/uninstall", s.wrap(s.handleTunUninstall))
 	// A real request through the selected node, on demand. The stage probes the
@@ -220,22 +221,17 @@ func isLoopbackHost(host string) bool {
 func (s *Server) handleTunCheck(w http.ResponseWriter, r *http.Request) {
 	env := s.app.checkTunEnvironment()
 	writeJSON(w, 200, map[string]interface{}{
-		"ok":  true,
-		"env": env,
-		"run": s.app.TunRunState(),
-		// What is enforced, not what was requested. The interface says "protected"
-		// from this field, so it has to come from the system rather than from the
-		// setting that asked for it.
-		"privacyBlock": s.app.PrivacyBlockStatus(),
-		"mode":         s.app.store.Settings().TunMode,
-		"labels":       tunModeLabels(),
+		"ok":     true,
+		"env":    env,
+		"run":    s.app.TunRunState(),
+		"mode":   s.app.store.Settings().TunMode,
+		"labels": tunModeLabels(),
 	})
 }
 
 func tunModeLabels() map[string]string {
 	return map[string]string{
-		string(TunCompat):  TunCompat.Label(),
-		string(TunPrivacy): TunPrivacy.Label(),
+		string(TunCompat): TunCompat.Label(),
 	}
 }
 
@@ -262,10 +258,20 @@ func (s *Server) handleTunEnable(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTunDisable(w http.ResponseWriter, r *http.Request) {
-	body := readBody(r)
-	// Releasing privacy protection is a decision, so it has to be stated.
-	release := body["releasePrivacy"] == true
-	if err := s.app.DisableTun(release); err != nil {
+	// The body is still read so a client that sends one is not surprised by an error,
+	// and it is not used: there is no longer a mode whose exit needs stating.
+	_ = readBody(r)
+	if err := s.app.DisableTun(); err != nil {
+		writeJSON(w, 409, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+}
+
+// handleTunCancel ends a wait in progress, so a user who has decided is not stuck
+// watching a countdown.
+func (s *Server) handleTunCancel(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.CancelTunActivation(); err != nil {
 		writeJSON(w, 409, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
 	}
@@ -625,6 +631,30 @@ func (s *Server) handleSystemProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	st := s.app.store.Settings()
 	if want {
+		// The two ways of taking traffic are mutually exclusive, and the answer says
+		// so rather than quietly doing both.
+		//
+		// They are not two features that happen to coexist. With TUN on, the routing
+		// table sends everything into the adapter and the system proxy setting has no
+		// effect on that traffic - so turning the proxy on as well produces a machine
+		// where the checkbox says one thing, the routing table says another, and
+		// nothing in the interface explains the difference. Worse, the proxy setting
+		// then points at a port that the TUN activation is about to restart the core
+		// on, and every application that honours it is offline for as long as that
+		// takes.
+		//
+		// Refused with an instruction, not with an error code: the user turned one on
+		// and wants to know what to do about the other.
+		if st.TunMode != TunOff {
+			writeJSON(w, 200, map[string]interface{}{
+				"ok": false,
+				"error": "TUN 接管正在使用中。两者互斥：TUN 通过路由表接管流量，" +
+					"系统代理对已经被接管的流量不起作用。请先关闭 TUN 接管，" +
+					"再打开系统代理",
+				"conflict": "tun",
+			})
+			return
+		}
 		if _, err := s.app.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
 			writeJSON(w, 200, map[string]interface{}{"ok": false, "error": err.Error()})
 			return

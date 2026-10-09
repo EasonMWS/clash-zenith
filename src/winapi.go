@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -219,6 +220,32 @@ func disableTunAdapter(name string) error {
 	_, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
 		fmt.Sprintf(`Disable-NetAdapter -Name '%s' -Confirm:$false -ErrorAction Stop`, name))
 	return err
+}
+
+// killHelperProcess stops the elevated helper this process started.
+//
+// Used by cancel. It deliberately does not fail when the process is already gone:
+// a helper that finished between the decision to cancel and the attempt is a
+// successful cancel, not an error to report.
+func killHelperProcess(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	running, err := processRunning(pid)
+	if err != nil || !running {
+		return nil
+	}
+	cmd := exec.Command("taskkill", "/PID", fmt.Sprint(pid), "/F", "/T")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	out, _ := cmd.CombinedOutput()
+	// Re-read rather than trusting the exit code: taskkill reports success for a
+	// process that exited on its own, and reports failure for one that is already
+	// gone, and neither of those is a cancel that did not work.
+	if still, err := processRunning(pid); err == nil && still {
+		return fmt.Errorf("无法结束提权助手（pid %d）：%v（%s）", pid, err,
+			strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // ---- system proxy ownership ----------------------------------------------
