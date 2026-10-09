@@ -207,7 +207,24 @@ func main() {
 	// The resident service. It holds the core and answers the authenticated
 	// channel; it never opens a window or a tray icon.
 	if *serviceFlag {
-		if err := RunService(rootDir, app.dataDir, app.secret); err != nil {
+		// Speak the Service Control Manager's protocol.
+		//
+		// This used to just open a socket and serve. From the SCM's side that is not
+		// a service: it starts the process, waits for it to connect to the
+		// dispatcher, and when it does not, concludes the start failed. Which is
+		// exactly what happened - the service was AUTO_START and had never once run.
+		//
+		// RunAsService connects, reports states, and calls the body. When the binary
+		// is run by hand with -service rather than by the SCM, the connection fails
+		// and the message says so, because that is how this will be tested.
+		if !IsRunningAsService() {
+			Log("service: this process was not started by the service control "+
+				"manager (parent is not services.exe). Connecting will fail, which is "+
+				"the correct behaviour; use the registered service instead", "WARN")
+		}
+		if err := RunAsService(serviceName, func(stop <-chan struct{}) error {
+			return RunService(rootDir, app.dataDir, app.secret, stop)
+		}); err != nil {
 			Log("service: %v", err, "ERR")
 			os.Exit(1)
 		}

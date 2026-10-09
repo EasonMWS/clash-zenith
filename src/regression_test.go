@@ -3486,3 +3486,123 @@ func TestNothingReEntersEnableTun(t *testing.T) {
 		t.Error("the install branch should continue into the same state machine")
 	}
 }
+
+// ---- the service must speak the SCM protocol -------------------------------
+
+func TestServiceSpeaksTheServiceControlManagerProtocol(t *testing.T) {
+	// The service was registered with Windows and could never start. The review found
+	// the reason by reading the source: no StartServiceCtrlDispatcher, no control
+	// handler, no status reporting - the -service branch opened a socket and served.
+	//
+	// From the SCM's side that is not a service. It starts the process, waits for it
+	// to connect to the dispatcher, and when it does not, concludes the start failed.
+	// Confirmed on this machine: AUTO_START, and STOPPED, having never once run.
+	src, err := os.ReadFile("scm.go")
+	if err != nil {
+		t.Fatalf("scm.go is missing, so no SCM protocol is implemented: %v", err)
+	}
+	text := string(src)
+	for _, need := range []string{
+		"StartServiceCtrlDispatcherW",
+		"RegisterServiceCtrlHandlerExW",
+		"SetServiceStatus",
+	} {
+		if !strings.Contains(text, need) {
+			t.Errorf("the SCM protocol needs %s and does not have it", need)
+		}
+	}
+	// The four states that make a service manageable rather than a process that
+	// happens to be running.
+	for _, state := range []string{
+		"svcStateStartPending", "svcStateRunning", "svcStateStopPending", "svcStateStopped",
+	} {
+		if !strings.Contains(text, state) {
+			t.Errorf("the service never reports %s, so the SCM cannot tell what it is doing", state)
+		}
+	}
+	// And it must honour stop, or it is killed with its children - which for this
+	// service means the core it owns.
+	if !strings.Contains(text, "svcControlStop") {
+		t.Error("the service does not handle a stop request")
+	}
+	// The clean shutdown lives in service.go, which is where the listener is.
+	svc, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Skipf("service.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(svc), "srv.Shutdown") {
+		t.Error("the service does not shut its listener down cleanly on stop")
+	}
+	if !strings.Contains(string(svc), "app.core.Stop()") {
+		t.Error("stopping the service does not stop the core it owns, which would " +
+			"leave an orphan with no owner - the state this design exists to avoid")
+	}
+}
+
+func TestServiceRefusesToRunOutsideTheScm(t *testing.T) {
+	// Running the binary by hand with -service must fail with a message that says
+	// why. That is not a limitation to work around: it is how the protocol behaves,
+	// and it is also how the implementation gets tested without installing anything.
+	src, err := os.ReadFile("scm.go")
+	if err != nil {
+		t.Skipf("scm.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "无法连接到服务控制管理器") {
+		t.Error("a failed dispatcher connection must be reported in terms of what it means")
+	}
+	if !strings.Contains(text, "func IsRunningAsService()") {
+		t.Error("the program should be able to say whether it was started by the SCM")
+	}
+}
+
+
+func TestServerKnowsItsOwnOrigin(t *testing.T) {
+	// expectHost was declared and never assigned, so the origin check compared against
+	// an empty string and refused every request carrying an Origin header - including
+	// the interface's own. The symptom was "跨源请求已被拒绝" with the system proxy and
+	// TUN switches refusing to move, which is how it was found.
+	//
+	// A field that must be set and is not is invisible until something depends on it,
+	// so this asserts the dependence rather than the field.
+	srv := NewServer(&App{}, t.TempDir(), 7799)
+	if srv.expectHost == "" {
+		t.Fatal("the server does not know its own host, so every request with an " +
+			"Origin header will be refused - including its own page's")
+	}
+	if !originIsOurs("http://127.0.0.1:7799", srv.expectHost) {
+		t.Errorf("the server does not recognise its own origin: expectHost=%q", srv.expectHost)
+	}
+	if !originIsOurs("http://localhost:7799", srv.expectHost) {
+		t.Errorf("localhost is the same server and must be recognised: expectHost=%q", srv.expectHost)
+	}
+	if originIsOurs("http://127.0.0.1:8080", srv.expectHost) {
+		t.Error("another loopback port is another application and must not be recognised")
+	}
+
+	// And end to end through the middleware, with the headers a real same-origin
+	// request carries.
+	for _, hdrs := range []map[string]string{
+		{"Origin": "http://127.0.0.1:7799"},
+		{"Origin": "http://127.0.0.1:7799", "Sec-Fetch-Site": "same-origin"},
+		{"Sec-Fetch-Site": "same-origin"},
+		{"Sec-Fetch-Site": "none"},
+		{},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7799/api/status", nil)
+		r.Host = "127.0.0.1:7799"
+		for k, v := range hdrs {
+			r.Header.Set(k, v)
+		}
+		if !interfaceRequestAllowed(r, srv.expectHost) {
+			t.Errorf("our own request was refused with headers %v", hdrs)
+		}
+	}
+	// And a genuinely foreign one is still refused.
+	r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7799/api/status", nil)
+	r.Host = "127.0.0.1:7799"
+	r.Header.Set("Origin", "https://evil.example")
+	if interfaceRequestAllowed(r, srv.expectHost) {
+		t.Error("a foreign origin must still be refused")
+	}
+}

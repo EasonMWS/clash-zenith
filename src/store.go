@@ -221,6 +221,10 @@ type State struct {
 	SubGeneration int64 `json:"subGeneration"`
 	// OptimizedGeneration is the generation the stored results came from.
 	OptimizedGeneration int64 `json:"optimizedGeneration"`
+	// Revision increments on every write. It is how a second process notices that
+	// the file changed: a timestamp is too coarse on NTFS to separate two writes in
+	// the same tick, and a counter has no such problem.
+	Revision int64 `json:"revision"`
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +235,11 @@ type Store struct {
 	mu    sync.RWMutex
 	path  string
 	state State
+	// seenRevision is the counter last read from or written to the file. It is the
+	// decision; size and time below are only a cheap gate before reading.
+	seenRevision int64
+	// seenSize is the file size last seen, used with seenMod as the cheap gate.
+	seenSize int64
 	// seenMod is the modification time of the file this process last read or wrote.
 	//
 	// It exists because the state file has more than one legitimate writer. An
@@ -251,12 +260,16 @@ func NewStore(dir string) (*Store, error) {
 	if err := s.load(); err != nil {
 		return nil, err
 	}
+	// Record the counter that was just loaded, so the first Settings() call does not
+	// treat this store's own starting state as a change written by somebody else.
+	s.seenRevision = s.state.Revision
 	return s, nil
 }
 
 func (s *Store) load() error {
 	if st, err := os.Stat(s.path); err == nil {
 		s.seenMod = st.ModTime()
+		s.seenSize = st.Size()
 	}
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
@@ -376,6 +389,10 @@ func mergeDefaults(s *Settings, def Settings) {
 }
 
 func (s *Store) saveLocked() error {
+	// Every write advances the counter, which is what a second process compares
+	// against. Doing it here rather than in each mutating method means a new method
+	// cannot forget.
+	s.state.Revision++
 	raw, err := json.MarshalIndent(s.state, "", "  ")
 	if err != nil {
 		return err
@@ -389,7 +406,9 @@ func (s *Store) saveLocked() error {
 	}
 	if st, err := os.Stat(s.path); err == nil {
 		s.seenMod = st.ModTime()
+		s.seenSize = st.Size()
 	}
+	s.seenRevision = s.state.Revision
 	return nil
 }
 
@@ -418,24 +437,25 @@ func (s *Store) Settings() Settings {
 
 // syncFromDiskLocked reloads the state when another process has written it.
 //
-// The comparison is by modification time rather than by content: reading and
-// parsing the whole file on every settings read would be wasteful for the common
-// case where nothing changed, and a stat is cheap.
+// The decision is a counter, not a modification time. A timestamp was tried first
+// and is not reliable enough: NTFS records times at a coarse granularity, so two
+// writes inside the same tick are indistinguishable and the second one is missed.
+// The counter is exact, and it also survives a clock change, a file copied over the
+// top, and a filesystem that does not keep times at all.
 //
-// Only a file that has moved forward is adopted. A file that has gone backwards -
-// restored from a backup, or a clock change - is left alone, because silently
-// replacing live settings with an older set would be worse than the staleness this
-// fixes.
+// Size and time are still checked first, as a cheap gate that avoids reading and
+// parsing the file on every settings read. They are an optimisation; the counter is
+// the decision.
 //
-// The reload is skipped while this process holds un-flushed changes, which cannot
-// happen here because every mutating method writes through, but the guard is kept
-// so a future buffered write cannot be silently discarded by a reload.
+// Only a file whose counter has moved forward is adopted. A file that has gone
+// backwards - restored from a backup - is left alone, because silently replacing live
+// settings with an older set would be worse than the staleness this fixes.
 func (s *Store) syncFromDiskLocked() {
 	st, err := os.Stat(s.path)
 	if err != nil {
 		return
 	}
-	if !st.ModTime().After(s.seenMod) {
+	if st.Size() == s.seenSize && st.ModTime().Equal(s.seenMod) {
 		return
 	}
 	raw, err := os.ReadFile(s.path)
@@ -450,9 +470,18 @@ func (s *Store) syncFromDiskLocked() {
 		Log("state file changed but could not be parsed; keeping the in-memory copy: %v", err, "WARN")
 		return
 	}
+	if next.Revision <= s.seenRevision {
+		// Same revision or older. Record what was seen so the cheap gate works, then
+		// keep the in-memory copy.
+		s.seenMod = st.ModTime()
+		s.seenSize = st.Size()
+		return
+	}
 	mergeDefaults(&next.Settings, defaultSettings())
 	s.state = next
+	s.seenRevision = next.Revision
 	s.seenMod = st.ModTime()
+	s.seenSize = st.Size()
 }
 
 // Reload re-reads the state file unconditionally.
@@ -462,9 +491,11 @@ func (s *Store) syncFromDiskLocked() {
 func (s *Store) Reload() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, err := os.Stat(s.path); err == nil {
-		s.seenMod = st.ModTime().Add(-time.Second)
-	}
+	// Force the decision rather than relying on the gate: the caller knows another
+	// process has just written.
+	s.seenRevision = 0
+	s.seenMod = time.Time{}
+	s.seenSize = -1
 	s.syncFromDiskLocked()
 	return nil
 }

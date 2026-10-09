@@ -28,6 +28,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -420,7 +421,7 @@ func (a *App) serviceStartCore(cfg []byte, mode TunMode) error {
 // It serves the authenticated channel and holds the core. It does not open a
 // window, show a tray icon or serve the interface: it exists to own one thing, and
 // everything else would be surface area on the process with the most rights.
-func RunService(rootDir, dataDir, secret string) error {
+func RunService(rootDir, dataDir, secret string, stop <-chan struct{}) error {
 	app, err := NewApp(rootDir)
 	if err != nil {
 		return err
@@ -457,7 +458,31 @@ func RunService(rootDir, dataDir, secret string) error {
 		app.saveServiceState(&serviceState{ServicePID: os.Getpid()})
 	}
 	Log("service: listening on %s (pid %d, data %s)", serviceBaseURL(), os.Getpid(), app.dataDir)
-	return srv.Serve(ln)
+
+	// Serve until the SCM asks to stop, then shut down cleanly. A service that is
+	// killed rather than asked takes its children with it, and this one owns the
+	// core.
+	if stop == nil {
+		return srv.Serve(ln)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ln) }()
+	select {
+	case err := <-done:
+		return err
+	case <-stop:
+		Log("service: stop requested; stopping the core and shutting down")
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			Log("service: shutdown reported: %v", err, "WARN")
+		}
+		// The core is stopped explicitly. Left running it would be an orphan with no
+		// owner, which is the state this whole design exists to avoid.
+		app.core.Stop()
+		app.saveServiceState(&serviceState{ServicePID: os.Getpid()})
+		return nil
+	}
 }
 
 // secretEqual compares two secrets in constant time.

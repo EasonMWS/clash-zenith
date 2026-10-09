@@ -45,14 +45,17 @@ type Server struct {
 }
 
 func NewServer(app *App, webRoot string, uiPort int) *Server {
-	// Set below from the port, so the origin check has an exact reference.
-
+	// expectHost is set here rather than left empty. It is the reference the origin
+	// check compares against, and an empty value refuses every request that carries an
+	// Origin header - including the ones from this program's own page. That is exactly
+	// what happened: the interface was locked out of its own API by its own check.
 	s := &Server{
-		app:     app,
-		uiPort:  uiPort,
-		mux:     http.NewServeMux(),
-		webRoot: webRoot,
-		token:   randomToken(),
+		app:        app,
+		uiPort:     uiPort,
+		mux:        http.NewServeMux(),
+		webRoot:    webRoot,
+		token:      randomToken(),
+		expectHost: expectHostFor(uiPort),
 	}
 	s.routes()
 	return s
