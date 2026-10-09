@@ -105,32 +105,93 @@ func loadOrCreateSecret(dataDir string) (string, error) {
 	return secret, nil
 }
 
-// restrictSecretFile narrows a file to the current user and to administrators.
+// restrictSecretFile narrows a file to the accounts that must read it, and no
+// others.
 //
 // On Windows the POSIX mode passed to OpenFile does not restrict anything, so this
-// is the actual protection. It removes inherited permissions and grants only the
-// owner, which is the account that will read it. Failure is logged rather than
-// fatal: a secret that cannot be tightened is worse than one that can be, but it
-// is not worse than no proxy at all, and the user is told.
+// is the actual protection.
+//
+// Two principals, and the second one was learned the hard way. The first version
+// granted only the interactive account, on the reasoning that it is the one that
+// reads the file. It was measured against a resident service running as
+// LocalSystem, which therefore could not read the secret its own data directory
+// held:
+//
+//	initialisation failed: 无法读取控制密码文件 ... Access is denied.
+//
+// That is the service failing to start with a message about a password file, which
+// is a long way from "the permissions are too tight". SYSTEM is granted here, and
+// SYSTEM is not a widening of the trust boundary in any meaningful sense: it can
+// already read anything on the machine. What it buys is that the service and the
+// elevated helper can read the value they are both required to share.
+//
+// Administrators are deliberately NOT granted. An interactive elevation runs as the
+// same user with a higher token, so it already matches the first principal.
+//
+// Failure is logged rather than fatal: a secret that could not be narrowed is worse
+// than one that could be, but it is not worse than no proxy at all, and the user is
+// told.
 func restrictSecretFile(path string) {
-	// /inheritance:r drops inherited entries, /grant:r replaces the grants with
-	// just this one.
+	// /inheritance:r drops inherited entries; /grant:r replaces the grants with the
+	// ones given here rather than adding to them.
+	args := []string{path, "/inheritance:r"}
+	granted := 0
+	if who := currentAccountName(); who != "" {
+		args = append(args, "/grant:r", who+":F")
+		granted++
+	}
+	// SYSTEM, for the resident service and the elevated helper.
+	args = append(args, "/grant:r", `NT AUTHORITY\SYSTEM:F`)
+	granted++
+
+	if granted == 1 {
+		// Only SYSTEM was named, which means the interactive account could not be
+		// determined. Say so, because the file would then be unreadable by the very
+		// interface that has to read it.
+		Log("could not determine the current account; %s will be readable only by "+
+			"SYSTEM, and the interface will fail to read it", path, "WARN")
+	}
+	if _, err := HiddenCommand("icacls", args...); err != nil {
+		Log("could not restrict the permissions of %s: %v", path, err, "WARN")
+	}
+}
+
+// currentAccountName is DOMAIN\user, or empty if it cannot be determined.
+func currentAccountName() string {
 	user := os.Getenv("USERNAME")
-	domain := os.Getenv("USERDOMAIN")
 	if user == "" {
-		Log("could not determine the current account; leaving %s with inherited "+
-			"permissions", path, "WARN")
-		return
+		return ""
 	}
-	who := user
-	if domain != "" {
-		who = domain + `\` + user
+	if domain := os.Getenv("USERDOMAIN"); domain != "" {
+		return domain + `\` + user
 	}
-	if _, err := HiddenCommand("icacls", path, "/inheritance:r",
-		"/grant:r", who+":F"); err != nil {
-		Log("could not restrict the permissions of %s to %s: %v",
-			path, who, err, "WARN")
+	return user
+}
+
+// secretReadableByThisProcess checks that the secret can actually be read, rather
+// than only that the file exists.
+//
+// The distinction matters: the service failed to start because a file it was
+// entitled to use had been narrowed away from it, and the failure surfaced as a
+// password error rather than as a permissions error. A check that reads the file is
+// the only one that catches that.
+func secretReadableByThisProcess(dataDir string) error {
+	p := secretPath(dataDir)
+	if _, err := os.Stat(p); err != nil {
+		return fmt.Errorf("控制密码文件 %s 不存在", p)
 	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		// The likely cause is worth naming, because "access denied" on a file the
+		// program itself created is otherwise baffling.
+		return fmt.Errorf("无法读取控制密码文件 %s：%v。"+
+			"如果 Zenith 服务以其他账户运行，该账户需要能读取这个文件"+
+			"（Zenith 授权当前账户与 SYSTEM）", p, err)
+	}
+	if len(strings.TrimSpace(string(raw))) < 32 {
+		return fmt.Errorf("控制密码文件 %s 的内容不可用", p)
+	}
+	return nil
 }
 
 // ensureSecretFileExists reports whether a secret file is present, without

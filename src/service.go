@@ -431,6 +431,14 @@ func RunService(rootDir, dataDir, secret string) error {
 	if secret == "" {
 		secret = app.secret
 	}
+	// Check that the secret can actually be read, rather than only that the file is
+	// there. The first version narrowed the file to the interactive account alone,
+	// and the service - running as LocalSystem - then failed to start with a message
+	// about a password file. Reading it here turns that into a message that names the
+	// real problem before anything else is attempted.
+	if err := secretReadableByThisProcess(app.dataDir); err != nil {
+		return fmt.Errorf("服务无法读取控制密码：%v", err)
+	}
 	app.sysproxy.SetReadOnly(true)
 	app.core.SetNoOrphanCleanup(true)
 

@@ -1912,10 +1912,20 @@ func TestVerifyTunTrafficReportsTheStageItStoppedAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The adapter name comes from the store, not from env, so it has to be changed
+	// there for this test to be deterministic. It was not, and the test failed on a
+	// machine that happened to have a real Zenith adapter left up by an activation -
+	// failing for the right reason, because the check had correctly moved on to a
+	// later stage.
+	if _, err := st.UpdateSettings(map[string]interface{}{
+		"tunDevice": "ZenithDefinitelyNotPresent",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
 	a.core = NewCore("", dir, a.configPath, "s", 7797)
 
-	env := tunEnvironment{Adapter: tunDefaultDevice, Stack: tunDefaultStack,
+	env := tunEnvironment{Adapter: "ZenithDefinitelyNotPresent", Stack: tunDefaultStack,
 		MixedPort: 7899, DNSPort: 8199, Checks: map[string]string{}}
 	rep := a.VerifyTunTraffic(TunCompat, env)
 
@@ -2037,10 +2047,52 @@ func TestControlSecretIsRestrictedToThisAccount(t *testing.T) {
 			t.Errorf("the secret file grants access to %q:\n%s", broad, out)
 		}
 	}
-	// The current account must appear, or the file was restricted to nobody.
+	// The current account must appear, or the interface cannot read its own secret.
 	user := os.Getenv("USERNAME")
 	if user != "" && !strings.Contains(out, user) {
 		t.Errorf("the secret file does not grant access to the current account %q:\n%s", user, out)
+	}
+	// And SYSTEM must appear, because the resident service runs as it. The first
+	// version granted only the interactive account, and the service then failed to
+	// start with a message about a password file - a long way from "the permissions
+	// are too tight".
+	if !strings.Contains(out, "SYSTEM") {
+		t.Errorf("the secret file does not grant access to SYSTEM, so the resident "+
+			"service cannot read it:\n%s", out)
+	}
+}
+
+func TestSecretReadabilityIsCheckedNotAssumed(t *testing.T) {
+	// A file can exist and still be unreadable, and that is exactly the state that
+	// stopped the service. The check must read the file rather than stat it.
+	dir := t.TempDir()
+	if err := secretReadableByThisProcess(dir); err == nil {
+		t.Error("a missing secret file should be reported")
+	}
+	if _, err := loadOrCreateSecret(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := secretReadableByThisProcess(dir); err != nil {
+		t.Errorf("a secret this process just wrote should be readable: %v", err)
+	}
+	// A file that exists with unusable content is also a failure.
+	if err := os.WriteFile(secretPath(dir), []byte("too short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := secretReadableByThisProcess(dir); err == nil {
+		t.Error("a secret file with unusable content should be reported")
+	}
+}
+
+func TestCurrentAccountNameIsDomainQualified(t *testing.T) {
+	// icacls needs DOMAIN\user to be unambiguous, and an account name alone can
+	// resolve to a different principal on a machine with more than one domain.
+	got := currentAccountName()
+	if got == "" {
+		t.Skip("USERNAME is not set in this environment")
+	}
+	if user := os.Getenv("USERNAME"); !strings.Contains(got, user) {
+		t.Errorf("currentAccountName() = %q, which does not contain %q", got, user)
 	}
 }
 
