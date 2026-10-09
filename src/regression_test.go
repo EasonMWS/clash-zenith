@@ -4552,3 +4552,56 @@ func TestAStaleTunModeIsClearedNotJustReported(t *testing.T) {
 		t.Error("the message does not say what the machine has been restored to")
 	}
 }
+
+func TestStartingThroughTheServiceBuildsAConfiguration(t *testing.T) {
+	// Measured, on an ordinary launch after the service started working:
+	//
+	//   core start failed: 配置没有通过校验：生成的配置是空的
+	//
+	// bootCore calls StartCoreThroughOwner to get a core running for the
+	// system-proxy path, and it has no configuration in hand - the local path ignores
+	// the argument because the config file is on disk and the core reads it. Through
+	// the service the argument IS the configuration, so passing nothing asked the
+	// service to start a core from nothing, and the launch ended with no core at all.
+	src, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Skipf("service.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "func (a *App) coreConfigBytes()") {
+		t.Fatal("nothing builds a configuration for the service path")
+	}
+	i := strings.Index(text, "case ownerService:")
+	if i < 0 {
+		t.Fatal("the service branch is missing")
+	}
+	branch := text[i:]
+	if end := strings.Index(branch, "case ownerSelf:"); end > 0 {
+		branch = branch[:end]
+	}
+	if !strings.Contains(branch, "len(cfg) == 0") {
+		t.Error("the service branch sends whatever it was given, including nothing")
+	}
+	if !strings.Contains(branch, "a.coreConfigBytes()") {
+		t.Error("the service branch does not build a configuration when it has none")
+	}
+
+	// The builder must go through the same inputs as every other path, or the service
+	// and a local core could run different configurations - the disagreement this
+	// design exists to remove.
+	j := strings.Index(text, "func (a *App) coreConfigBytes()")
+	body := text[j:]
+	if end := strings.Index(body, "\n}\n"); end > 0 {
+		body = body[:end]
+	}
+	for _, need := range []string{"a.mergedNodes()", "a.optimizedNames()", "a.secret"} {
+		if !strings.Contains(body, need) {
+			t.Errorf("the builder does not use %s, so it can produce a different "+
+				"configuration from the local path", need)
+		}
+	}
+	if !strings.Contains(body, "validateCandidateConfig(cfg)") {
+		t.Error("the built configuration is not validated before it is sent")
+	}
+}

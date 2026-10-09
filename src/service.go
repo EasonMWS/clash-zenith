@@ -286,6 +286,28 @@ func (a *App) coreOwnerNow() coreOwner {
 func (a *App) StartCoreThroughOwner(cfg []byte, mode TunMode) error {
 	switch a.coreOwnerNow() {
 	case ownerService:
+		// The service starts the core from the configuration it is given, so a caller
+		// that passes nothing asks it to start a core from nothing. Measured, on an
+		// ordinary launch:
+		//
+		//   core start failed: 配置没有通过校验：生成的配置是空的
+		//
+		// bootCore calls this to get a core running for the system-proxy path, and it
+		// has no configuration in hand at that moment - the local path ignores the
+		// argument because the config file is already on disk and the core reads it. So
+		// the argument is built here when it is absent, from the same nodes and settings
+		// every other activation uses.
+		//
+		// Building it rather than refusing: refusing would leave the system-proxy path
+		// unusable on a machine that has a service, which is the more common case now
+		// that the service starts.
+		if len(cfg) == 0 {
+			built, err := a.coreConfigBytes()
+			if err != nil {
+				return err
+			}
+			cfg = built
+		}
 		return a.serviceStartRequest(cfg, mode)
 	case ownerSelf:
 		if a.core.IsUp() {
@@ -301,6 +323,25 @@ func (a *App) StartCoreThroughOwner(cfg []byte, mode TunMode) error {
 		}
 		return nil
 	}
+}
+
+// coreConfigBytes builds the configuration the core should run with.
+//
+// The same nodes, the same settings and the same secret as every other path, through
+// one function so the service and the local core cannot be started on different
+// configurations - which is the class of disagreement this whole design exists to
+// remove.
+func (a *App) coreConfigBytes() ([]byte, error) {
+	st := a.store.Settings()
+	cfg := BuildConfig(a.mergedNodes(), a.optimizedNames(), st,
+		a.secret, a.store.Snapshot().Current, a.dnsPort)
+	if strings.TrimSpace(cfg) == "" {
+		return nil, fmt.Errorf("生成的配置是空的，无法启动内核")
+	}
+	if err := validateCandidateConfig(cfg); err != nil {
+		return nil, fmt.Errorf("生成的配置没有通过校验：%v", err)
+	}
+	return []byte(cfg), nil
 }
 
 // StopCoreThroughOwner stops the core, whichever way is correct.
