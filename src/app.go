@@ -512,7 +512,18 @@ func portHasListener(port int) bool {
 
 func (a *App) bootCore() {
 	st := a.store.Settings()
-	if err := a.core.Start(); err != nil {
+	// Ask who owns the core before starting one.
+	//
+	// This path used to start a core unconditionally. When the resident service already
+	// held one - which is the whole point of the service - that produced a second core
+	// on a rotated port, and the two then disagreed about the configuration and about
+	// which port the system proxy should point at. The user sees a window that reports
+	// a dead core while the machine is online, or the reverse, depending on which of
+	// the two answered last.
+	//
+	// StartCoreThroughOwner starts one only when nobody else holds it, and asks the
+	// service when the service is the owner.
+	if err := a.StartCoreThroughOwner(nil, ""); err != nil {
 		a.lastErr = err.Error()
 		Log("core start failed: %v", err, "ERR")
 		fmt.Fprintf(os.Stderr, "Zenith: core start failed: %v\n", err)
@@ -572,6 +583,16 @@ func (a *App) background() {
 			// it mid-download looped forever, because every restart began the
 			// same download again and the core never got to answer.
 			if time.Since(started) < coreStartGrace {
+				continue
+			}
+			// Only this process may recover a core it started. When the service owns
+			// it, a window that restarted the core itself would be creating the second
+			// core this design exists to prevent - and it would do it precisely when the
+			// service is already dealing with the same problem.
+			if a.coreOwnerNow() == ownerService {
+				if a.serviceReachable() {
+					a.lastErr = ""
+				}
 				continue
 			}
 			if a.core.Ensure() {
@@ -1765,7 +1786,11 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 	// the system proxy follows the mixed port
 	if mp, ok := patch["mixedPort"].(int); ok && mp > 0 && mp != before.MixedPort {
 		a.core = NewCore(a.core.exePath, a.core.dataDir, a.configPath, a.secret, next.ControlPort)
-		_ = a.core.Start()
+		// The new core is started through whoever owns it, so a port change cannot
+		// produce a second core either.
+		if err := a.StartCoreThroughOwner(nil, ""); err != nil {
+			Log("restarting the core on the new port failed: %v", err, "WARN")
+		}
 	}
 	// Switching auto-pick on should take effect at once, not on the next tick.
 	if v, ok := patch["autoPickOff"]; ok {
@@ -1802,7 +1827,17 @@ func (a *App) Shutdown() {
 	close(a.stopCh)
 	// core first: the "is that port still alive" check in Restore must not be
 	// answered by our own listener, or the proxy is left pointing at a dead port
-	a.core.Stop()
+	//
+	// Unless the service owns it. A resident service holding the core across window
+	// restarts is what it is for, so closing the window must not stop it - that would
+	// make every restart re-run the activation and ask for authorisation again, which
+	// is the thing the service exists to avoid. The service stops the core when the
+	// service itself stops.
+	if a.coreOwnerNow() == ownerService {
+		Log("shutdown: the core belongs to the service and is left running")
+	} else if err := a.StopCoreThroughOwner(); err != nil {
+		Log("shutdown: stopping the core reported: %v", err, "WARN")
+	}
 	a.sysproxy.Restore()
 	_ = a.store.Save()
 	Log("Zenith stopped")

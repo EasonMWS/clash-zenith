@@ -112,14 +112,30 @@ func (a *App) saveServiceState(s *serviceState) {
 // It is a real request rather than a file check: a state file can outlive the
 // process that wrote it, and acting on one would mean the window and the service
 // both start a core.
-func serviceReachable() bool {
-	c := &http.Client{Timeout: 1500 * time.Millisecond}
-	resp, err := c.Get(serviceBaseURL() + "/alive")
-	if err != nil {
+// serviceReachable reports whether our service is running and has proved it.
+//
+// It is a method so the proof uses the same secret this process will send in the
+// request that follows. A check against a different value would be a check against
+// something that is not the thing being used.
+func (a *App) serviceReachable() bool {
+	// Reachable means "ours and answering", not "something holds the port".
+	//
+	// It used to be satisfied by any 200 from a fixed port, and the next request
+	// carried the control secret - so a program that bound 7795 first would have been
+	// handed the key to the core. The proof costs one loopback round trip and removes
+	// that entirely.
+	if !serviceListening(servicePort) {
 		return false
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	if a.secret == "" {
+		return false
+	}
+	if err := verifyServiceIdentity(a.secret, servicePort, 3*time.Second); err != nil {
+		Log("service: port %d is held but the program there is not our service: %v",
+			servicePort, err, "WARN")
+		return false
+	}
+	return true
 }
 
 // serviceInstalled reports whether the service is registered with Windows.
@@ -238,7 +254,7 @@ const (
 
 // coreOwnerNow decides who owns the core, by asking rather than assuming.
 func (a *App) coreOwnerNow() coreOwner {
-	if serviceReachable() {
+	if a.serviceReachable() {
 		return ownerService
 	}
 	if a.core != nil && a.core.IsUp() {
@@ -298,12 +314,7 @@ type serviceHandler struct {
 
 func (h *serviceHandler) routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/alive", func(w http.ResponseWriter, r *http.Request) {
-		// Deliberately unauthenticated and trivial: it answers "is anything there",
-		// which is the question the window needs answered before it decides who owns
-		// the core. It reveals nothing and changes nothing.
-		writeJSON(w, 200, map[string]interface{}{"ok": true, "service": serviceName})
-	})
+	mux.HandleFunc("/alive", handleServiceAlive(h.secret, servicePort))
 	mux.HandleFunc("/core/start", h.auth(h.handleStart))
 	mux.HandleFunc("/core/stop", h.auth(h.handleStop))
 	mux.HandleFunc("/core/state", h.auth(h.handleState))
@@ -541,7 +552,7 @@ func (a *App) installService() error {
 	// step's decision - service or local core - correct rather than a race.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if serviceReachable() {
+		if a.serviceReachable() {
 			Log("service installed and answering on %s", serviceBaseURL())
 			return nil
 		}
@@ -553,7 +564,7 @@ func (a *App) installService() error {
 // uninstallService removes the service. Used by the offline repair path, so a user
 // whose machine is in a bad state can still get it back.
 func (a *App) uninstallService() error {
-	if serviceReachable() {
+	if a.serviceReachable() {
 		_ = a.serviceStopRequest()
 	}
 	if _, err := serviceControl("stop", serviceName); err != nil {
@@ -575,7 +586,7 @@ func (a *App) uninstallService() error {
 // prompting for something that does not need it is how users learn to click yes
 // without reading.
 func (a *App) ensureService() error {
-	if serviceReachable() {
+	if a.serviceReachable() {
 		return nil
 	}
 	if serviceInstalled() {
@@ -584,7 +595,7 @@ func (a *App) ensureService() error {
 		if _, err := serviceControl("start", serviceName); err == nil {
 			deadline := time.Now().Add(8 * time.Second)
 			for time.Now().Before(deadline) {
-				if serviceReachable() {
+				if a.serviceReachable() {
 					return nil
 				}
 				time.Sleep(300 * time.Millisecond)
@@ -610,13 +621,13 @@ func (a *App) ensureService() error {
 	// from our own memory of what we asked for.
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
-		if serviceReachable() {
+		if a.serviceReachable() {
 			return nil
 		}
 		if pid > 0 && !helperStillRunning(pid) {
 			// Give a moment for the endpoint to come up after the helper exits.
 			time.Sleep(1200 * time.Millisecond)
-			if serviceReachable() {
+			if a.serviceReachable() {
 				return nil
 			}
 			return fmt.Errorf("安装服务的授权进程已经退出，但服务没有回应（%s）。"+

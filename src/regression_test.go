@@ -2164,16 +2164,44 @@ func TestServiceRefusesRequestsWithoutTheSecret(t *testing.T) {
 	srv := httptest.NewServer(h.routes())
 	defer srv.Close()
 
-	// The liveness endpoint is deliberately open: it answers "is anything there",
-	// which the window needs before it can decide who owns the core, and it reveals
-	// nothing and changes nothing.
-	resp, err := http.Get(srv.URL + "/alive")
+	// The liveness endpoint answers without a secret, because the window has to ask
+	// before it has decided to trust anything. It now answers with a proof instead of
+	// a bare 200: the old shape meant any program that bound the port was believed,
+	// and the next request carried the control secret to it.
+	resp, err := http.Get(srv.URL + "/alive?nonce=abc123")
 	if err != nil {
 		t.Fatal(err)
 	}
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("/alive = %d, want 200: the window must be able to ask without a secret", resp.StatusCode)
+		t.Errorf("/alive = %d, want 200: the window must be able to ask without a secret",
+			resp.StatusCode)
+	}
+	var alive serviceAliveResponse
+	if err := json.Unmarshal(body, &alive); err != nil {
+		t.Fatalf("the liveness answer is not the agreed shape: %v (%s)", err, body)
+	}
+	if alive.Nonce != "abc123" {
+		t.Errorf("the answer echoes nonce %q, want the one we sent", alive.Nonce)
+	}
+	want := serviceProofMAC("the-real-secret", "abc123", alive.TS, alive.Port)
+	if alive.Proof != want {
+		t.Error("the service did not prove it holds the secret")
+	}
+	// And the proof is not the secret, in any encoding.
+	if strings.Contains(string(body), "the-real-secret") {
+		t.Error("the liveness answer carries the secret itself")
+	}
+	// A request with no nonce is refused rather than answered with a proof over an
+	// empty value, which would be a proof anybody could compute a use for.
+	bad, err := http.Get(srv.URL + "/alive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad.Body.Close()
+	if bad.StatusCode == http.StatusOK {
+		t.Error("/alive without a nonce should not be answered")
 	}
 
 	// Everything that acts needs the secret.
@@ -3413,7 +3441,7 @@ func TestServicePathSavesTheModeBeforeGeneratingTheConfig(t *testing.T) {
 		t.Skipf("tun.go is not readable: %v", err)
 	}
 	text := string(src)
-	start := strings.Index(text, "if serviceReachable() {")
+	start := strings.Index(text, "if a.serviceReachable() {")
 	if start < 0 {
 		t.Fatal("the service path is missing")
 	}
@@ -3443,7 +3471,7 @@ func TestServicePathVerifiesBeforeClaimingSuccess(t *testing.T) {
 		t.Skipf("tun.go is not readable: %v", err)
 	}
 	text := string(src)
-	start := strings.Index(text, "if serviceReachable() {")
+	start := strings.Index(text, "if a.serviceReachable() {")
 	end := strings.Index(text[start:], "\n\t// No service yet.")
 	if end < 0 {
 		t.Fatal("could not find the end of the service path")
@@ -3801,5 +3829,116 @@ func TestMaterialComparisonIgnoresNamesOnly(t *testing.T) {
 	}
 	if sameNodeMaterial(a, nil) {
 		t.Error("a different number of nodes is a material change")
+	}
+}
+
+// ---- the lifecycle must ask who owns the core ------------------------------
+
+func TestTheLifecycleAsksWhoOwnsTheCore(t *testing.T) {
+	// StartCoreThroughOwner and StopCoreThroughOwner were written for exactly this and
+	// were never called from the lifecycle. Ordinary start, background recovery, the
+	// port change and shutdown all reached for the core directly, so a service that
+	// owned the core could be bypassed by a window that started a second one - and the
+	// two then disagreed about the port and the configuration.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	// Every place that starts the core must go through the owner.
+	if strings.Contains(text, "if err := a.core.Start(); err != nil {") {
+		t.Error("bootCore still starts the core directly, so a service that already " +
+			"holds one gets a second")
+	}
+	if !strings.Contains(text, "StartCoreThroughOwner") {
+		t.Error("the lifecycle never asks who owns the core before starting one")
+	}
+
+	// Recovery must not fight the service for the same core.
+	if !strings.Contains(text, "a.coreOwnerNow() == ownerService") {
+		t.Error("the recovery loop does not know the service may own the core")
+	}
+
+	// Shutdown must leave a service-owned core alone, or every window restart asks
+	// for authorisation again - the thing the service exists to avoid.
+	quit := strings.Index(text, "func (a *App) Shutdown()")
+	if quit < 0 {
+		t.Fatal("Shutdown is missing")
+	}
+	tail := text[quit:]
+	end := strings.Index(tail, "\nfunc ")
+	if end > 0 {
+		tail = tail[:end]
+	}
+	if !strings.Contains(tail, "StopCoreThroughOwner") {
+		t.Error("shutdown does not stop the core through its owner")
+	}
+	if !strings.Contains(tail, "left running") {
+		t.Error("shutdown does not say that a service-owned core is left alone")
+	}
+}
+
+func TestServiceMustProveItsIdentityBeforeItIsSentTheSecret(t *testing.T) {
+	// The client decided the service existed by asking a fixed port for an
+	// unauthenticated 200. Anything that could bind 7795 could answer that, and would
+	// then be handed the control secret in the next request. Loopback is not an
+	// identity and a port number is not a program.
+	secret := "a-shared-secret"
+	const port = 7795
+
+	// A proof over a nonce, a timestamp and the port: useless anywhere else, and not
+	// reversible into the secret.
+	p := serviceProofMAC(secret, "nonce-1", 1700000000, port)
+	if p == "" {
+		t.Fatal("no proof was produced")
+	}
+	if strings.Contains(p, secret) {
+		t.Error("the proof contains the secret")
+	}
+	// Deterministic for the same inputs, so the client can check it.
+	if serviceProofMAC(secret, "nonce-1", 1700000000, port) != p {
+		t.Error("the proof is not deterministic")
+	}
+	// And different for every input that matters.
+	for _, changed := range []string{
+		serviceProofMAC("another-secret", "nonce-1", 1700000000, port),
+		serviceProofMAC(secret, "nonce-2", 1700000000, port),
+		serviceProofMAC(secret, "nonce-1", 1700000001, port),
+		serviceProofMAC(secret, "nonce-1", 1700000000, 7796),
+	} {
+		if changed == p {
+			t.Error("the proof does not depend on every input it covers")
+		}
+	}
+
+	// A service that answers with the wrong proof is not trusted.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Answers the right shape with a proof computed from a different secret, which
+		// is what an impostor that does not hold ours would produce.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(serviceAliveResponse{
+			OK: true, Nonce: r.URL.Query().Get("nonce"),
+			TS: time.Now().Unix(), Port: port, Proof: "not-the-right-proof",
+		})
+	}))
+	defer bad.Close()
+	// Point the check at it by parsing the port out of the test server's URL.
+	if err := verifyServiceIdentityAgainst(secret, bad.URL, time.Second); err == nil {
+		t.Error("a service that cannot prove itself must not be trusted")
+	}
+	// And a service that does hold the secret is trusted.
+	good := httptest.NewServer(handleServiceAlive(secret, port))
+	defer good.Close()
+	if err := verifyServiceIdentityAgainst(secret, good.URL, 2*time.Second); err != nil {
+		t.Errorf("a service that proves itself should be trusted: %v", err)
+	}
+	// A program that is not the service at all is refused, not mistaken for one.
+	notAService := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello, I am not a service"))
+	}))
+	defer notAService.Close()
+	if err := verifyServiceIdentityAgainst(secret, notAService.URL, time.Second); err == nil {
+		t.Error("something that cannot answer the protocol must not be trusted")
 	}
 }

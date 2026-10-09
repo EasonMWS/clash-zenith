@@ -705,7 +705,7 @@ func (a *App) runEnableTun(mode TunMode) {
 	// exists. The request is still authenticated and still goes through the same
 	// ownership decision, so this is not a shortcut around the checks; it is the
 	// path that does not need a prompt.
-	if serviceReachable() {
+	if a.serviceReachable() {
 		// The mode is saved BEFORE the configuration is generated, not after.
 		//
 		// The order was the other way round, and the consequence is exact: enabling
