@@ -412,6 +412,14 @@ func (a *App) background() {
 			// that takes far longer than the health check interval. Restarting
 			// it mid-download looped forever, because every restart began the
 			// same download again and the core never got to answer.
+			//
+			// The same gate covers a handover. An elevated instance must stop this
+			// core to take the ports for a TUN activation, and without a yield this
+			// loop would see "core is down" and start a second one on top of it,
+			// leaving two cores fighting for the same listener.
+			if a.activationYielded() {
+				continue
+			}
 			if time.Since(started) < coreStartGrace {
 				continue
 			}

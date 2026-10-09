@@ -540,7 +540,18 @@ func (a *App) runEnableTun(mode TunMode) {
 		a.setTunStage("等待系统授权")
 		txA.step("请求授权", "pending", "等待用户在 UAC 对话框中确认")
 		a.saveTunTxn(txA)
-		err := elevateRequest([]string{"-tun-elevated", "-datadir", a.dataDir, "-tun-mode", string(mode)})
+		// The root directory is passed explicitly rather than left to be
+		// rediscovered. resolveRoot infers it by looking for web/index.html near
+		// the executable, and an elevated process can be started with a different
+		// working directory - which made it read a different configuration than
+		// the instance that asked for the elevation, and act on ports and nodes
+		// that were not the ones in use.
+		err := elevateRequest([]string{
+			"-tun-elevated",
+			"-root", a.rootDir,
+			"-datadir", a.dataDir,
+			"-tun-mode", string(mode),
+		})
 		if err != nil {
 			txA.step("请求授权", "failed", err.Error())
 			txA.State = "failed"
@@ -821,24 +832,30 @@ func (a *App) UninstallTun() error {
 // only for the activation, performs it, reports the outcome through the
 // transaction record, and exits. No elevated process is left behind, and the UI
 // never holds administrator rights it does not need.
-func (a *App) RunElevatedActivation(mode TunMode) {
+func (a *App) RunElevatedActivation(mode TunMode) error {
 	Log("elevated instance: activating TUN in %s mode", mode)
 	env := a.checkTunEnvironment()
 	if len(env.Blockers) > 0 {
-		a.failTun(fmt.Errorf("%s", strings.Join(env.Blockers, "；")))
-		return
+		err := fmt.Errorf("%s", strings.Join(env.Blockers, "；"))
+		a.failTun(err)
+		return err
 	}
-	// The elevated copy owns the core for the duration, so the ordinary instance's
-	// core must be stopped first - otherwise two cores would fight over the port.
+	// Claim the core before stopping it. The ordinary instance restarts a core it
+	// finds down, so without the marker it would start one on top of this
+	// activation and the two would fight for the same listener.
+	a.yieldForActivation()
+	defer a.releaseActivation()
 	a.core.Stop()
 	time.Sleep(1 * time.Second)
 	a.runActivateTun(mode, env)
 	if st := a.TunRunState(); st.Error != "" {
 		Log("elevated instance: activation failed: %s", st.Error, "WARN")
-	} else {
-		Log("elevated instance: activation finished")
+		a.core.Stop()
+		return fmt.Errorf("%s", st.Error)
 	}
+	Log("elevated instance: activation finished")
 	// Hand the core back: the ordinary instance will start it again on its next
 	// tick, and this process leaves no privileged service running.
 	a.core.Stop()
+	return nil
 }

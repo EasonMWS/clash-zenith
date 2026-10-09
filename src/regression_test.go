@@ -1099,3 +1099,92 @@ func TestOptimizedCurrentIsReportedInStatus(t *testing.T) {
 		t.Error("fresh results should report current")
 	}
 }
+
+// ---- the elevated instance must not be mistaken for a second launch --------
+
+func TestElevatedDispatchComesBeforeTheSingleInstanceCheck(t *testing.T) {
+	// The ordinary instance already holds the UI port, so a check for "is
+	// something listening" matches the elevated instance too. When the elevated
+	// dispatch sat after it, approving the prompt produced a second window and no
+	// tunnel: the process decided it was a second launch and exited before doing
+	// the work it was elevated for.
+	//
+	// This is an ordering property of main, so it is checked against the source
+	// rather than by running it - the failure mode is a wrong branch, not a wrong
+	// return value.
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Skipf("main.go is not readable from the test directory: %v", err)
+	}
+	text := string(src)
+
+	elevated := strings.Index(text, "if *tunElevated {")
+	instance := strings.Index(text, "if IsPortListening(uiPort) {")
+	if elevated < 0 {
+		t.Fatal("the elevated dispatch is missing from main")
+	}
+	if instance < 0 {
+		t.Fatal("the single-instance check is missing from main")
+	}
+	if elevated > instance {
+		t.Error("the elevated dispatch sits after the single-instance check, so an " +
+			"elevated run would be treated as a second launch and never activate TUN")
+	}
+}
+
+func TestElevatedRunReturnsAnErrorRatherThanReportingThroughState(t *testing.T) {
+	// The elevated process has no window and no UI, so its only way to report is
+	// its exit status and the log. A signature that returns nothing would leave
+	// the caller unable to say whether the activation worked.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(src), "func (a *App) RunElevatedActivation(mode TunMode) error {") {
+		t.Error("RunElevatedActivation should return an error so its caller can report the outcome")
+	}
+}
+
+// ---- the activation handover must not start a second core ------------------
+
+func TestActivationYieldBlocksCoreRecovery(t *testing.T) {
+	// The ordinary instance restarts a core it finds down. An elevated activation
+	// has to stop that core to take the ports, so without a yield the background
+	// loop starts a second one on top of the activation and the two fight for the
+	// same listener.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+
+	if a.activationYielded() {
+		t.Error("a fresh instance should not report a yield")
+	}
+	a.yieldForActivation()
+	if !a.activationYielded() {
+		t.Fatal("the yield marker was not honoured")
+	}
+	a.releaseActivation()
+	if a.activationYielded() {
+		t.Error("the yield marker survived its release, which would disable core recovery")
+	}
+}
+
+func TestStaleActivationYieldIsDiscarded(t *testing.T) {
+	// An elevated instance killed mid-activation would otherwise leave a marker
+	// behind forever, and the ordinary instance would never restart its core
+	// again - a far worse failure than the conflict the marker prevents.
+	dir := t.TempDir()
+	a := &App{dataDir: dir}
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.WriteFile(a.activationYieldPath(), []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(a.activationYieldPath(), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if a.activationYielded() {
+		t.Error("a marker older than the threshold must not keep blocking recovery")
+	}
+	if _, err := os.Stat(a.activationYieldPath()); err == nil {
+		t.Error("the stale marker should have been removed")
+	}
+}

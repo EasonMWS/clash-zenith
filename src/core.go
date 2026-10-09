@@ -198,6 +198,53 @@ func (c *Core) Ensure() bool {
 	return c.Start() == nil
 }
 
+// ---- activation handover ---------------------------------------------------
+
+// activationYieldPath is the marker an elevated instance creates while it owns
+// the core.
+//
+// The ordinary instance restarts the core whenever the background loop finds it
+// down. A TUN activation has to stop that core to take the ports, so without a
+// marker the loop would start a second one on top of the activation and the two
+// would fight for the same listener. It is a file rather than an in-memory flag
+// because the two are separate processes.
+func (a *App) activationYieldPath() string {
+	return filepath.Join(a.dataDir, "activation.yield")
+}
+
+// activationYielded reports whether an elevated activation currently owns the core.
+//
+// A stale marker must not disable recovery permanently, so one older than the
+// threshold is discarded: an elevated instance killed mid-way would otherwise
+// leave this instance never restarting its core again.
+func (a *App) activationYielded() bool {
+	st, err := os.Stat(a.activationYieldPath())
+	if err != nil {
+		return false
+	}
+	if time.Since(st.ModTime()) > 3*time.Minute {
+		Log("found a stale activation marker from %s; clearing it so core recovery resumes",
+			st.ModTime().Format(time.RFC3339), "WARN")
+		_ = os.Remove(a.activationYieldPath())
+		return false
+	}
+	return true
+}
+
+// yieldForActivation claims the core for an elevated activation.
+func (a *App) yieldForActivation() {
+	_ = os.WriteFile(a.activationYieldPath(),
+		[]byte(time.Now().Format(time.RFC3339)), 0o644)
+	Log("raised the activation marker; core recovery is paused while the elevated " +
+		"instance owns the ports")
+}
+
+// releaseActivation hands the core back.
+func (a *App) releaseActivation() {
+	_ = os.Remove(a.activationYieldPath())
+	Log("cleared the activation marker; core recovery resumes")
+}
+
 func (c *Core) Pid() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

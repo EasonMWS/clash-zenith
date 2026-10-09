@@ -62,6 +62,10 @@ func main() {
 		version  = flag.Bool("version", false, "print the version and exit")
 		portFlag = flag.Int("port", 0, "UI port (default 7799)")
 		dataFlag = flag.String("datadir", "", "use a different data directory")
+		// Passed by the instance that requests elevation, so the elevated helper
+		// reads exactly the same tree. Inferring it is not reliable: the helper can
+		// be started with a different working directory.
+		rootFlag = flag.String("root", "", "internal: the program directory to use")
 		// Raised by the elevation request. The elevated instance runs the same
 		// product; it only differs in having the rights the adapter and the routes
 		// need, and it is the one that performs the activation transaction.
@@ -85,9 +89,20 @@ func main() {
 		return
 	}
 
-	rootDir, err := resolveRoot()
-	if err != nil {
-		fatal("cannot locate the program directory: %v", err)
+	var rootDir string
+	if *rootFlag != "" {
+		// An explicit root wins, so an elevated helper operates on the same tree as
+		// the instance that asked for it.
+		rootDir = *rootFlag
+		if abs, err := filepath.Abs(rootDir); err == nil {
+			rootDir = abs
+		}
+	} else {
+		var err error
+		rootDir, err = resolveRoot()
+		if err != nil {
+			fatal("cannot locate the program directory: %v", err)
+		}
 	}
 
 	if *stop {
@@ -137,6 +152,32 @@ func main() {
 
 	Log("root=%s uiPort=%d headless=%v", rootDir, uiPort, *headless)
 
+	// The elevated instance is dispatched here, before the single-instance check.
+	//
+	// It has to be: the ordinary instance already holds the UI port, so a check
+	// for "is something already listening" matches, the process decides it is a
+	// second launch, opens a window and exits - and the activation it was elevated
+	// to perform never runs. That is exactly what happened: approving the prompt
+	// produced a second window and no tunnel.
+	//
+	// This instance owns no interface and shows no window. It activates, reports
+	// through the transaction record, and exits.
+	if *tunElevated {
+		mode := TunMode(*tunModeFlag)
+		if !mode.Valid() || mode == TunOff {
+			mode = TunCompat
+		}
+		Log("elevated instance: activating TUN in %s mode", mode)
+		// No window, no tray, no second UI server: this process exists only for
+		// the activation, which needs rights the ordinary instance does not have.
+		if err := app.RunElevatedActivation(mode); err != nil {
+			Log("elevated instance: %v", err, "ERR")
+		} else {
+			Log("elevated instance: activation finished")
+		}
+		return
+	}
+
 	// One instance per data directory: a second launch just shows the window.
 	if IsPortListening(uiPort) {
 		Log("port %d already answers -> attaching to the running instance", uiPort)
@@ -162,17 +203,6 @@ func main() {
 	// disk that failed verification. The transaction record is what distinguishes
 	// that from a deliberate state.
 	app.RecoverConfigTransaction()
-	// An elevated instance continues an enable that the普通 instance started; it
-	// does not open its own window or tray icon, and it exits when the activation
-	// finishes so no elevated process is left running by default.
-	if *tunElevated {
-		mode := TunMode(*tunModeFlag)
-		if !mode.Valid() || mode == TunOff {
-			mode = TunCompat
-		}
-		app.RunElevatedActivation(mode)
-		return
-	}
 	go app.background()
 	// Liveness runs on its own timer, separate from the housekeeping tick so
 	// unrelated work can never delay noticing a dead node.
