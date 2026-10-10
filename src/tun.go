@@ -754,6 +754,34 @@ func (a *App) runEnableTun(mode TunMode) {
 		txA.step("保存设置", "done", string(mode))
 		a.saveTunTxn(txA)
 
+		// The system proxy has to be switched off here too, and it was not.
+		//
+		// The exclusion lived only in the local activation path, so it applied on a
+		// machine using the per-activation prompt and did nothing on a machine using the
+		// service - which, now that the service works, is the ordinary case. The
+		// consequence is the one the two-mode design exists to prevent: the registry
+		// says traffic goes through the proxy while the routing table sends it through
+		// the tunnel, both settings read as on, and nothing explains the difference.
+		//
+		// Done BEFORE the configuration is built, not after, so the configuration is
+		// generated from a state where the two are not both claiming the traffic.
+		proxyState := NewSystemProxy(a.dataDir).Status()
+		txA.Owned.SysProxyWasOn = proxyState.Enabled
+		txA.Owned.SysProxyServer = proxyState.Server
+		if proxyState.Enabled {
+			a.setTunStage("关闭系统代理（与 TUN 互斥）")
+			NewSystemProxy(a.dataDir).Disable()
+			if _, err := a.store.UpdateSettings(map[string]interface{}{
+				"systemProxy": false,
+			}); err != nil {
+				Log("TUN activate: could not record that the system proxy was switched "+
+					"off: %v", err, "WARN")
+			}
+			txA.step("关闭系统代理", "done",
+				"TUN 接管与系统代理互斥，已关闭系统代理；这次激活失败的话会恢复它")
+			a.saveTunTxn(txA)
+		}
+
 		a.setTunStage("生成配置")
 		cfg := BuildConfig(a.mergedNodes(), a.optimizedNames(), saved,
 			a.secret, a.store.Snapshot().Current, a.dnsPort)
@@ -819,6 +847,20 @@ func (a *App) runEnableTun(mode TunMode) {
 			txA.Failure = fmt.Sprintf("服务已启动内核，但流量没有经过隧道（%s）：%s",
 				traffic.Stage, traffic.Detail)
 			a.saveTunTxn(txA)
+			// Give back the arrangement the user started with. Switching the proxy off
+			// was part of this attempt, so a failed attempt has to undo it rather than
+			// leave them with neither the tunnel nor the proxy.
+			if txA.Owned.SysProxyWasOn && txA.Owned.SysProxyServer != "" {
+				sp := NewSystemProxy(a.dataDir)
+				if _, err := sp.Enable(saved.MixedPort, saved.ProxyBypass, false); err != nil {
+					Log("TUN activate: the tunnel failed and the system proxy could not be "+
+						"restored: %v", err, "ERR")
+					txA.RestoreFailure = "系统代理未能恢复"
+				} else {
+					_, _ = a.store.UpdateSettings(map[string]interface{}{"systemProxy": true})
+					Log("TUN activate: the tunnel failed; the system proxy has been restored")
+				}
+			}
 			a.failTun(fmt.Errorf("%s", txA.Failure))
 			return
 		}

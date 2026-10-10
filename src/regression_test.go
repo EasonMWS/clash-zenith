@@ -4605,3 +4605,57 @@ func TestStartingThroughTheServiceBuildsAConfiguration(t *testing.T) {
 		t.Error("the built configuration is not validated before it is sent")
 	}
 }
+
+// ---- both activation paths must honour the exclusion -----------------------
+
+func TestBothActivationPathsSwitchTheProxyOff(t *testing.T) {
+	// There are two ways to activate the tunnel: through the resident service, and
+	// through a per-activation elevation. The exclusion between the tunnel and the
+	// system proxy was written into the second one only.
+	//
+	// That was invisible while the service never started, because every activation took
+	// the other path. The moment the service worked, it became the ordinary case - and
+	// the exclusion silently stopped applying: the registry said traffic went through
+	// the proxy while the routing table sent it through the tunnel, both settings read
+	// as on, and nothing explained the difference.
+	//
+	// So the assertion is not "the exclusion exists" but "it exists on both paths",
+	// which is the property that was actually missing.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	marker := "关闭系统代理（与 TUN 互斥）"
+	if n := strings.Count(text, marker); n < 2 {
+		t.Errorf("the exclusion appears %d time(s), want at least 2 - one for the service "+
+			"path and one for the per-activation path. A machine using the service is the "+
+			"ordinary case now, so a rule that only covers the other one covers almost "+
+			"nobody", n)
+	}
+
+	// And both paths must record what they changed, or a failed activation cannot put
+	// the arrangement back.
+	if n := strings.Count(text, "SysProxyWasOn = proxyState.Enabled"); n < 2 {
+		t.Errorf("only %d path(s) record whether they switched the proxy off, want 2", n)
+	}
+}
+
+func TestAFailedServiceActivationGivesTheProxyBack(t *testing.T) {
+	// Switching the proxy off is part of the attempt, so a failed attempt has to undo
+	// it. Otherwise a user whose tunnel failed to come up is left with neither the
+	// tunnel nor the proxy - the worst of both, and not a state they asked for.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "the tunnel failed; the system proxy has been restored") {
+		t.Error("a failed activation does not restore the system proxy it switched off")
+	}
+	if !strings.Contains(text, `txA.RestoreFailure = "系统代理未能恢复"`) {
+		t.Error("a restore that itself fails is not reported separately, so it would read " +
+			"as a clean rollback")
+	}
+}
