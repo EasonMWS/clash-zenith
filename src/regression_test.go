@@ -4768,3 +4768,55 @@ func TestAHandPickedNodeIsNotHonouredPastThePointOfWorking(t *testing.T) {
 		t.Error("the reason is not recorded next to the condition")
 	}
 }
+
+func TestOurOwnExitingCoreIsNotMistakenForAnotherProgram(t *testing.T) {
+	// The user noticed this happening repeatedly, and it was this code. The log line
+	// each time was
+	//
+	//   mixed port 7917 is already in use by another program; moving Zenith to 7926
+	//
+	// and the other program was this one - the core that had been serving that port
+	// seconds earlier.
+	//
+	// The mistake was a gap between two checks. The wait only ran when the port had NO
+	// listener, on the reasoning that a lingering socket is not a listener. But a core
+	// still shutting down IS a listener, and that is the only case that occurs, so the
+	// wait never ran for it. By the time the ownership check asked whether the holder
+	// was ours, the holder had exited and there was nobody left to ask.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	i := strings.Index(text, "func (a *App) EnsureUsablePort()")
+	if i < 0 {
+		t.Fatal("EnsureUsablePort is missing")
+	}
+	body := text[i:]
+	if end := strings.Index(body, "\nfunc "); end > 0 {
+		body = body[:end]
+	}
+
+	// The wait must not be conditional on there being no listener: that condition is
+	// what excluded the only case that happens.
+	if strings.Contains(body, "if !portHasListener(want) {") {
+		t.Error("the wait only runs when nothing is listening, which excludes a core that " +
+			"is shutting down - the one case this exists for")
+	}
+	// It must ask whether the holder is ours inside the loop, not once afterwards.
+	if !strings.Contains(body, "heldByUs") {
+		t.Error("the loop does not ask whether the holder is ours at each step")
+	}
+	if !strings.Contains(body, "coreOwnsDataDir(pid, a.dataDir, a.rootDir)") {
+		t.Error("the loop does not use the ownership test")
+	}
+	// And the window must be long enough to outlast a shutdown.
+	if !strings.Contains(text, "portReleaseWait = 20 * time.Second") {
+		t.Error("the wait is too short to outlast a core shutting down")
+	}
+	// The rotation must still exist for a genuinely foreign holder.
+	if !strings.Contains(body, "moving Zenith to") {
+		t.Error("the rotation was removed entirely, so a real conflict is no longer handled")
+	}
+}

@@ -27,6 +27,15 @@ const (
 	// answered in this run. Long enough that a deliberate restart is not fought
 	// over, short enough that a machine is not left offline for minutes.
 	coreRestartDelay = 20 * time.Second
+
+	// portReleaseWait is how long to wait for a core that is shutting down to let go of
+	// the mixed port before concluding the holder is somebody else's.
+	//
+	// Generous on purpose. The alternative is moving the port out from under the system
+	// proxy setting and every program that stored it, and the user noticed that happening
+	// repeatedly: the log said "already in use by another program" each time, and the
+	// other program was this one.
+	portReleaseWait = 20 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -458,24 +467,92 @@ func (a *App) EnsureUsablePort() {
 		return
 	}
 
-	// PortFreeToBind can fail for reasons that are not "someone else has it":
-	// a core that just exited keeps its socket in a lingering state for a
-	// moment. Rotating the port in that case is actively harmful, because every
-	// program that stored the old port - including the system proxy setting the
-	// user's browser reads - silently loses its connection. So before giving up
-	// on the configured port, check the real listener table and wait briefly for
-	// the old owner to finish dying.
-	if !portHasListener(want) {
-		for i := 0; i < 20; i++ {
-			time.Sleep(300 * time.Millisecond)
-			if PortFreeToBind(want) {
-				Log("mixed port %d was briefly busy but is ours again; keeping it", want)
-				return
+	// Rotating the port is the last resort, and reaching it too early is actively
+	// harmful: every program that stored the old port - including the system proxy
+	// setting the user's browser reads - silently loses its connection. The user
+	// noticed this happening repeatedly, and it was this code.
+	//
+	// The shape of the mistake was a gap between two checks. The wait below only ran
+	// when the port had NO listener, on the reasoning that a lingering socket is not a
+	// listener - but a core that is still shutting down IS a listener, and the one case
+	// that actually occurs is our own core exiting. So the wait did not run for it, and
+	// by the time the ownership check further down asked whether the holder was ours,
+	// the holder had finished exiting and there was nobody left to ask. Neither check
+	// covered "our own core, on its way out", which is the only way this ever happens.
+	//
+	//     mixed port 7917 is already in use by another program; moving Zenith to 7926
+	//
+	// It was not another program. It was the core that had been serving that port
+	// seconds earlier.
+	//
+	// The loop now runs whenever the port is not free, and asks the right question at
+	// each step rather than once at the end: is the holder ours, and if so, has it gone?
+	deadline := time.Now().Add(portReleaseWait)
+	waited := false
+	for {
+		if PortFreeToBind(want) {
+			if waited {
+				Log("mixed port %d was busy a moment ago and is ours again; keeping it", want)
 			}
-			if portHasListener(want) {
-				break // a real foreign program has it after all
+			return
+		}
+		// Is the holder ours?
+		//
+		// Not by reading its command line. Measured, and this is the reason the first
+		// version of this fix changed nothing:
+		//
+		//     mihomo pid=42380  cmd=[]
+		//
+		// coreOwnsDataDir decides ownership by looking for the data directory in the
+		// command line, and the command line of a core started by the elevated helper
+		// cannot be read by this process. It came back empty, the test answered "not
+		// ours", and the port was rotated away from a core that was in the middle of
+		// shutting down.
+		//
+		// What is available without any privilege is whether the process is named like
+		// our core and is listening on the port we configured. A foreign proxy is a
+		// different program with a different name, so the distinction that matters is
+		// still made - and it is made by something that works for every holder rather
+		// than for the ones we happen to be able to inspect.
+		heldByUs := false
+		for _, pid := range ListeningPids(want) {
+			if coreOwnsDataDir(pid, a.dataDir, a.rootDir) || looksLikeOurCore(pid) {
+				heldByUs = true
+				break
 			}
 		}
+		if !heldByUs {
+			// A real foreign program holds it. Waiting will not change that, and the
+			// rotation below is the correct answer for it.
+			break
+		}
+		if time.Now().After(deadline) {
+			// Our own core is still holding it after the whole window. That is not a
+			// conflict, so this must RETURN rather than fall through.
+			//
+			// Measured, and breaking out was not enough:
+			//
+			//   mixed port 7935 is still held by this installation's own core after 20s;
+			//   not rotating
+			//   [WARN] mixed port 7935 is already in use by another program; moving
+			//          Zenith to 7944
+			//
+			// The message said it would not rotate and the next statement rotated. A
+			// break out of the wait loop is a break out of the wait, not out of the
+			// function - so the decision was made, logged, and then ignored by code that
+			// had already been written to rotate.
+			Log("mixed port %d is still held by this installation's own core after %s; "+
+				"adopting it rather than moving aside", want, portReleaseWait)
+			for _, pid := range ListeningPids(want) {
+				if coreOwnsDataDir(pid, a.dataDir, a.rootDir) || looksLikeOurCore(pid) {
+					a.adoptRunningCore(pid)
+					break
+				}
+			}
+			return
+		}
+		waited = true
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	// If the listener on the port is a core this installation owns, the correct
@@ -554,6 +631,28 @@ func (a *App) EnsureUsablePort() {
 		}
 	}
 	a.lastErr = fmt.Sprintf("端口 %d 已被其他程序占用，已自动改用 %d（旧端口上的连接会断开，重启一下浏览器即可）", want, free)
+}
+
+// looksLikeOurCore reports whether a process is a core belonging to this program,
+// without needing to read anything privileged.
+//
+// The name is the test, and it is a good one: mihomo is not installed system-wide, the
+// copy that runs is the one in this program's own core directory, and a process by that
+// name listening on the port this program configured is this program's core in every
+// case that occurs. A different proxy product has a different executable name.
+//
+// This exists because the command-line test cannot see a core started under elevation,
+// and that is exactly the core whose port must not be rotated away from - the one that
+// was serving a moment ago and is shutting down.
+func looksLikeOurCore(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	name := strings.ToLower(ProcessName(pid))
+	if name == "" {
+		return false
+	}
+	return strings.Contains(name, "mihomo")
 }
 
 // proxyOwnerIsOurs reports whether the current system proxy setting appears to be
