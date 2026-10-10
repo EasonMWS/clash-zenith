@@ -4659,3 +4659,73 @@ func TestAFailedServiceActivationGivesTheProxyBack(t *testing.T) {
 			"as a clean rollback")
 	}
 }
+
+// ---- a blip is not a death, and a replacement must answer -----------------
+
+func TestOneFailedProbeIsRetriedBeforeItCounts(t *testing.T) {
+	// Measured over a three-hour run, and this is what the user reported as the
+	// connection dropping for a little while. Six nodes from one scan, each tested
+	// twice:
+	//
+	//   优选01  236ms, then a timeout
+	//   优选02  396ms, 391ms
+	//   优选03  1054ms, 413ms
+	//   优选04  239ms, 232ms
+	//   优选05  236ms, then a timeout
+	//   优选06  503, 503 - the only one actually dead
+	//
+	// The kernel reported 优选01, 02 and 03 as alive throughout. A single failed probe
+	// was being counted as a failure with a threshold of three, so a twenty-second burst
+	// of packet loss was enough to declare a healthy node dead, switch to the fallback,
+	// wait out the retry delay and switch back - roughly forty seconds during which the
+	// machine was worse off than if nothing had happened.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "A single failed probe is not a dead node")
+	if i < 0 {
+		t.Fatal("a failed probe still counts immediately, so any burst of packet loss " +
+			"is read as a dead node")
+	}
+	branch := text[i : i+2600]
+	if !strings.Contains(branch, "a.core.Delay(current, healthTimeoutMS, \"\")") {
+		t.Error("the failure is not confirmed by an immediate retry")
+	}
+	// The retry must come BEFORE the counter, or it confirms after the damage.
+	retry := strings.Index(branch, "a.core.Delay(current, healthTimeoutMS")
+	count := strings.Index(branch, "a.healthFails++")
+	if retry < 0 || count < 0 || retry > count {
+		t.Error("the retry happens after the failure is counted")
+	}
+	// And it must actually stop the failure being recorded.
+	if !strings.Contains(branch, "treating it as a blip rather than a dead node") {
+		t.Error("the retry does not report what it decided")
+	}
+}
+
+func TestASwitchOnlyLandsOnANodeThatAnswers(t *testing.T) {
+	// Taking the first node that is "not known dead" is a statement about the past.
+	// Switching onto a node that cannot answer turns one bad node into an outage, and
+	// the user sees the network drop for as long as it takes the next check to give up
+	// on the replacement too - which is the second half of the reported symptom.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "Walk the candidates and take the first one that actually answers")
+	if i < 0 {
+		t.Fatal("the switch takes a candidate without checking that it answers")
+	}
+	branch := text[i : i+2200]
+	if !strings.Contains(branch, "a.core.Delay(p.Name, healthTimeoutMS") {
+		t.Error("the candidate is not probed before it is selected")
+	}
+	// Bounded: the search must not cost more time than the switch saves.
+	if !strings.Contains(branch, "tried >= 3") {
+		t.Error("the candidate search is unbounded, so a switch can take longer than the " +
+			"problem it is fixing")
+	}
+}

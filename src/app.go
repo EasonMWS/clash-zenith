@@ -948,6 +948,37 @@ func (a *App) healthCheck() {
 		return
 	}
 
+	// A single failed probe is not a dead node.
+	//
+	// Measured over a three-hour run, and this is the defect the user reported as the
+	// connection dropping for a little while: a healthy node alternated between
+	// answering in 236ms and timing out, and the same was true of others. Six nodes
+	// from one scan, tested twice each: four answered both times, one answered then
+	// timed out, one failed both times. Only the last was actually dead.
+	//
+	// With a threshold of three consecutive failures at ten-second intervals, a
+	// twenty-second burst of packet loss was enough to reach it. The health loop then
+	// switched to the fallback hostname node, waited out the retry delay, and switched
+	// back - about forty seconds during which the machine was worse off than if nothing
+	// had happened. That is the whole of the reported outage, and it repeats on every
+	// burst.
+	//
+	// So a failed probe is now re-tested before it counts. The confirmation runs
+	// immediately rather than a tick later, because the question is whether the node is
+	// answering right now, and a tick later is ten seconds of the user being stalled.
+	if delay2, err2 := a.core.Delay(current, healthTimeoutMS, ""); err2 == nil && delay2 > 0 {
+		// A blip, not a failure. Recorded so it is visible without being acted on: the
+		// node count is not decremented, no switch happens, and the user keeps the
+		// connection they had.
+		a.mu.Lock()
+		a.healthLastEv = fmt.Sprintf("%s flaked then answered %dms", current, delay2)
+		a.healthFails = 0
+		a.mu.Unlock()
+		Log("health: %q missed one probe but answered %dms on an immediate retry; "+
+			"treating it as a blip rather than a dead node", current, delay2)
+		return
+	}
+
 	a.mu.Lock()
 	a.healthFails++
 	fails := a.healthFails
@@ -993,9 +1024,18 @@ func (a *App) healthCheck() {
 		}
 	}
 	if next == "" {
-		// One snapshot for the whole walk; it is immutable, so the answer cannot
-		// change halfway through the loop.
+		// Walk the candidates and take the first one that actually answers.
+		//
+		// It used to take the first one that was not known-dead, which is a statement
+		// about the past. Switching onto a node that cannot answer turns a single bad
+		// node into an outage, and the user sees the network drop for as long as it takes
+		// the next check to give up on the replacement too.
+		//
+		// One snapshot for the whole walk; it is immutable, so the answer cannot change
+		// halfway through the loop. The probe is bounded and short: a candidate that
+		// needs longer than this to answer is not an improvement on what we are leaving.
 		view := a.HealthView()
+		tried := 0
 		for _, p := range optimized {
 			if p.Name == current {
 				continue
@@ -1005,8 +1045,19 @@ func (a *App) healthCheck() {
 					continue
 				}
 			}
-			next = p.Name
-			break
+			// Leave the hostname node alone here: it is the fallback of last resort and
+			// is preferred above, before this loop, so reaching it means it was either
+			// chosen already or is not usable.
+			if tried >= 3 {
+				// Three probes is enough to find an improvement; more than that and the
+				// search costs the user more time than the switch saves.
+				break
+			}
+			tried++
+			if d, err := a.core.Delay(p.Name, healthTimeoutMS, ""); err == nil && d > 0 {
+				next = p.Name
+				break
+			}
 		}
 	}
 	if next == "" {
@@ -1054,6 +1105,14 @@ func (a *App) healthCheck() {
 			a.StartOptimize()
 		}
 	}
+}
+
+// reason0 renders a delay error for a log line, or a default when there is none.
+func reason0(err error) string {
+	if err == nil {
+		return "timed out"
+	}
+	return err.Error()
 }
 
 // healthSnapshot is the immutable view of health bookkeeping.
