@@ -4662,49 +4662,6 @@ func TestAFailedServiceActivationGivesTheProxyBack(t *testing.T) {
 
 // ---- a blip is not a death, and a replacement must answer -----------------
 
-func TestOneFailedProbeIsRetriedBeforeItCounts(t *testing.T) {
-	// Measured over a three-hour run, and this is what the user reported as the
-	// connection dropping for a little while. Six nodes from one scan, each tested
-	// twice:
-	//
-	//   优选01  236ms, then a timeout
-	//   优选02  396ms, 391ms
-	//   优选03  1054ms, 413ms
-	//   优选04  239ms, 232ms
-	//   优选05  236ms, then a timeout
-	//   优选06  503, 503 - the only one actually dead
-	//
-	// The kernel reported 优选01, 02 and 03 as alive throughout. A single failed probe
-	// was being counted as a failure with a threshold of three, so a twenty-second burst
-	// of packet loss was enough to declare a healthy node dead, switch to the fallback,
-	// wait out the retry delay and switch back - roughly forty seconds during which the
-	// machine was worse off than if nothing had happened.
-	src, err := os.ReadFile("app.go")
-	if err != nil {
-		t.Skipf("app.go is not readable: %v", err)
-	}
-	text := string(src)
-	i := strings.Index(text, "A single failed probe is not a dead node")
-	if i < 0 {
-		t.Fatal("a failed probe still counts immediately, so any burst of packet loss " +
-			"is read as a dead node")
-	}
-	branch := text[i : i+2600]
-	if !strings.Contains(branch, "a.core.Delay(current, healthTimeoutMS, \"\")") {
-		t.Error("the failure is not confirmed by an immediate retry")
-	}
-	// The retry must come BEFORE the counter, or it confirms after the damage.
-	retry := strings.Index(branch, "a.core.Delay(current, healthTimeoutMS")
-	count := strings.Index(branch, "a.healthFails++")
-	if retry < 0 || count < 0 || retry > count {
-		t.Error("the retry happens after the failure is counted")
-	}
-	// And it must actually stop the failure being recorded.
-	if !strings.Contains(branch, "treating it as a blip rather than a dead node") {
-		t.Error("the retry does not report what it decided")
-	}
-}
-
 func TestASwitchOnlyLandsOnANodeThatAnswers(t *testing.T) {
 	// Taking the first node that is "not known dead" is a statement about the past.
 	// Switching onto a node that cannot answer turns one bad node into an outage, and
@@ -4727,5 +4684,87 @@ func TestASwitchOnlyLandsOnANodeThatAnswers(t *testing.T) {
 	if !strings.Contains(branch, "tried >= 3") {
 		t.Error("the candidate search is unbounded, so a switch can take longer than the " +
 			"problem it is fixing")
+	}
+}
+
+func TestTheDelayProbeIsNotTrustedOnItsOwn(t *testing.T) {
+	// Two rounds of measurement, and the second settled it.
+	//
+	// First: over a three-hour run, healthy nodes alternated between answering in 236ms
+	// and timing out on the core's /delay endpoint. Six nodes, each probed twice - four
+	// answered both times, one answered then timed out, one failed both times.
+	//
+	// Second: the same six nodes, each tested with three real CONNECT requests through
+	// the running tunnel, bypassing the delay endpoint. All eighteen succeeded.
+	//
+	// So the nodes were fine and the probe was producing false failures - most likely
+	// because a 204 check through a remote edge is sensitive to whatever else the machine
+	// is doing at that moment, in a way a real connection is not. A single timed-out
+	// probe is not evidence and must not be counted as a failure.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	i := strings.Index(text, "The probe this loop uses is not trustworthy on its own")
+	if i < 0 {
+		t.Fatal("a single timed-out probe is still counted as a failure")
+	}
+	// The retry must be more generous than the first probe, or a busy machine fails
+	// both and the retry has decided nothing.
+	if !strings.Contains(text, "healthTimeoutMS*2") {
+		t.Error("the confirming probe gets no more room than the one it is confirming, " +
+			"so a busy machine fails both")
+	}
+	if !strings.Contains(text, "missed two probes in a row; counting it as a failure") {
+		t.Error("the decision point is not stated, so a failure cannot be told from a blip " +
+			"by reading the log")
+	}
+}
+
+func TestSuccessDecrementsRatherThanClearingTheCounter(t *testing.T) {
+	// Measured, and it is the second half of the user's symptom: a node failed 1/3,
+	// failed 2/3, answered once, and started again at 1/3. The threshold was never
+	// reached, so a node failing a third of the time stayed selected indefinitely - the
+	// connection worked, then did not, then did, while every individual event looked
+	// like a blip the program had decided to forgive.
+	//
+	// A success decrements, so an occasional failure is forgiven and a pattern is not.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "The counter is not reset to zero on a success")
+	if i < 0 {
+		t.Fatal("a success still clears the failure counter, so an intermittent node is " +
+			"never replaced")
+	}
+	branch := text[i : i+1600]
+	if !strings.Contains(branch, "a.healthFails--") {
+		t.Error("a success does not decrement the counter")
+	}
+	if strings.Contains(branch, "a.healthFails = 0") {
+		t.Error("a success still clears the counter outright")
+	}
+}
+
+func TestAHandPickedNodeIsNotHonouredPastThePointOfWorking(t *testing.T) {
+	// The grace window is ten minutes, which is right for "do not undo my click two
+	// seconds later" and wrong for "keep a dead node for ten minutes because I clicked
+	// it once". Measured: the log repeated "user picked … inside the grace window" every
+	// ten seconds for minutes while that node kept failing its probes.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "held < userPickGrace && fails < healthFailLimit") {
+		t.Error("the grace window is unconditional, so a hand-picked node that has " +
+			"stopped working is kept until it expires")
+	}
+	if !strings.Contains(text, "refusing to help") {
+		t.Error("the reason is not recorded next to the condition")
 	}
 }

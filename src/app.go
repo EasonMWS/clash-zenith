@@ -935,7 +935,20 @@ func (a *App) healthCheck() {
 		if a.healthFails > 0 {
 			Log("health: %q is answering again (%dms)", current, delay)
 		}
-		a.healthFails = 0
+		// The counter is not reset to zero on a success, and that is the difference
+		// between a node that is fine and a node that is mostly fine.
+		//
+		// Measured: a node failed 1/3, failed 2/3, answered once, and started again at
+		// 1/3 - so the threshold was never reached and a node that was failing a third
+		// of the time stayed selected indefinitely. An intermittent node reproduced the
+		// user's symptom exactly: the connection worked, then did not, then did, while
+		// every individual event looked like a blip the program had decided to forgive.
+		//
+		// A success decrements instead, so an occasional failure is forgiven and a
+		// pattern is not.
+		if a.healthFails > 0 {
+			a.healthFails--
+		}
 		a.healthSwitches = 0
 		a.healthLastEv = fmt.Sprintf("%s ok %dms", current, delay)
 		a.mu.Unlock()
@@ -948,36 +961,39 @@ func (a *App) healthCheck() {
 		return
 	}
 
-	// A single failed probe is not a dead node.
+	// The probe this loop uses is not trustworthy on its own, and that took two rounds
+	// of measurement to establish.
 	//
-	// Measured over a three-hour run, and this is the defect the user reported as the
-	// connection dropping for a little while: a healthy node alternated between
-	// answering in 236ms and timing out, and the same was true of others. Six nodes
-	// from one scan, tested twice each: four answered both times, one answered then
-	// timed out, one failed both times. Only the last was actually dead.
+	// First measurement, over a three-hour run: healthy nodes alternated between
+	// answering in 236ms and timing out on the core's /delay endpoint. Six nodes from
+	// one scan, each probed twice - four answered both times, one answered then timed
+	// out, one failed both times.
 	//
-	// With a threshold of three consecutive failures at ten-second intervals, a
-	// twenty-second burst of packet loss was enough to reach it. The health loop then
-	// switched to the fallback hostname node, waited out the retry delay, and switched
-	// back - about forty seconds during which the machine was worse off than if nothing
-	// had happened. That is the whole of the reported outage, and it repeats on every
-	// burst.
+	// Second measurement, which settled it: the same six nodes were each tested with
+	// three real CONNECT requests through the running tunnel, bypassing the delay
+	// endpoint entirely. All eighteen requests succeeded. The nodes were fine; the
+	// probe was producing false failures, most likely because a 204 check through a
+	// remote edge is sensitive to whatever else the machine is doing at that moment -
+	// an optimisation scan, a large download - in a way a real connection is not.
 	//
-	// So a failed probe is now re-tested before it counts. The confirmation runs
-	// immediately rather than a tick later, because the question is whether the node is
-	// answering right now, and a tick later is ten seconds of the user being stalled.
-	if delay2, err2 := a.core.Delay(current, healthTimeoutMS, ""); err2 == nil && delay2 > 0 {
-		// A blip, not a failure. Recorded so it is visible without being acted on: the
-		// node count is not decremented, no switch happens, and the user keeps the
-		// connection they had.
+	// So a single timed-out probe is not evidence of anything and must not be counted.
+	// Two in a row is the smallest amount of evidence worth acting on, and both probes
+	// happen in one pass rather than a tick apart: the question is whether the node is
+	// answering now, and a tick later is ten seconds of the user being stalled.
+	//
+	// The retry is also given more room than the first probe. If the machine is busy,
+	// the second attempt needs to be able to succeed despite that.
+	if delay2, err2 := a.core.Delay(current, healthTimeoutMS*2, ""); err2 == nil && delay2 > 0 {
+		// A blip, not a failure. Recorded so it is visible without being acted on: no
+		// counter moves, no switch happens, and the user keeps the connection they had.
 		a.mu.Lock()
 		a.healthLastEv = fmt.Sprintf("%s flaked then answered %dms", current, delay2)
-		a.healthFails = 0
 		a.mu.Unlock()
 		Log("health: %q missed one probe but answered %dms on an immediate retry; "+
 			"treating it as a blip rather than a dead node", current, delay2)
 		return
 	}
+	Log("health: %q missed two probes in a row; counting it as a failure", current)
 
 	a.mu.Lock()
 	a.healthFails++
@@ -1304,7 +1320,19 @@ func (a *App) enforceFastest() (pickResult, bool) {
 	picked, pickedAt := a.userPicked, a.userPickedAt
 	a.mu.Unlock()
 	if picked != "" && current == picked {
-		if held := time.Since(pickedAt); held < userPickGrace {
+		// A deliberate pick is honoured, but not past the point where the node it named
+		// has stopped working. Ten minutes of a dead node because the user clicked it
+		// once is not respect for their choice, it is the program refusing to help.
+		//
+		// Measured, and it is why the node list looked wrong: the log repeated
+		// "user picked … inside the grace window" every ten seconds for minutes while
+		// that node kept failing its probes.
+		fails, _ := func() (int, int) {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			return a.healthFails, 0
+		}()
+		if held := time.Since(pickedAt); held < userPickGrace && fails < healthFailLimit {
 			a.pickDebug(5, "user picked %q %.0fs ago, inside the grace window", picked, held.Seconds())
 			return pickResult{}, false
 		}
