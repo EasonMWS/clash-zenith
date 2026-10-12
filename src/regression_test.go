@@ -4677,10 +4677,16 @@ func TestASwitchOnlyLandsOnANodeThatAnswers(t *testing.T) {
 		t.Fatal("the switch takes a candidate without checking that it answers")
 	}
 	branch := text[i : i+2200]
-	// The probe goes through healthProbe now, so that the candidate is judged by the
-	// same targets the rest of the program uses rather than the core's single default.
-	if !strings.Contains(branch, "a.healthProbe(p.Name, healthTimeoutMS, 1)") {
-		t.Error("the candidate is not probed before it is selected")
+	// The candidate is selected first and then tested with real traffic through the
+	// tunnel, because that is the only way a node can be tested for real: the tunnel
+	// carries whatever PROXY points at.
+	if !strings.Contains(branch, `a.core.Select("PROXY", p.Name)`) {
+		t.Error("the candidate is not selected before the real-traffic test, so the test " +
+			"cannot exercise it")
+	}
+	if !strings.Contains(branch, "a.healthProbeThroughTunnel(healthTimeoutMS)") {
+		t.Error("the candidate is not tested with real traffic, so a node the core reports " +
+			"dead but which works will be skipped")
 	}
 	// Bounded: the search must not cost more time than the switch saves.
 	if !strings.Contains(branch, "tried >= 3") {
@@ -4715,7 +4721,7 @@ func TestTheDelayProbeIsNotTrustedOnItsOwn(t *testing.T) {
 	}
 	// The retry must be more generous than the first probe, or a busy machine fails
 	// both and the retry has decided nothing.
-	if !strings.Contains(text, "a.healthProbe(current, healthTimeoutMS, 2)") {
+	if !strings.Contains(text, "a.healthProbeThroughTunnel(healthTimeoutMS * 2)") {
 		t.Error("the confirming probe gets no more room than the one it is confirming, " +
 			"so a busy machine fails both")
 	}
@@ -4954,15 +4960,20 @@ func TestAFirstLookDoesNotTryEveryTargetTwice(t *testing.T) {
 	if !strings.Contains(text, "if attempts < 1 {") {
 		t.Fatal("healthProbe has no attempt bound")
 	}
-	i := strings.Index(text, "func (a *App) healthProbe(")
+	// The loop lives in healthProbeWith, which healthProbe delegates to so that the sweep
+	// can use a shorter target list than the check on the current node.
+	i := strings.Index(text, "func (a *App) healthProbeWith(")
+	if i < 0 {
+		t.Fatal("healthProbeWith is missing")
+	}
 	body := text[i : i+1400]
 	if !strings.Contains(body, "for i := 0; i < attempts; i++") {
 		t.Error("the attempt count is not used, so a first look costs the same as a " +
 			"confirmation")
 	}
-	// The first probe on the current node must be a single look.
-	if !strings.Contains(text, "a.healthProbe(current, healthTimeoutMS, 1)") {
-		t.Error("the first probe on the current node is not a single look")
+	// The first probe on the current node must be the real-traffic one.
+	if !strings.Contains(text, "a.healthProbeThroughTunnel(healthTimeoutMS)") {
+		t.Error("the first probe on the current node is not a real request through the tunnel")
 	}
 }
 
@@ -5219,5 +5230,89 @@ func TestTheInterfaceSaysHowMuchOfThePoolIsUsable(t *testing.T) {
 	}
 	if !strings.Contains(js, "实测可用 ' + alive + ' 个") {
 		t.Error("the header badge does not say how much of the pool is usable")
+	}
+}
+
+// ---- the delay endpoint is not evidence that a node works -----------------
+
+func TestLivenessIsDecidedByRealTraffic(t *testing.T) {
+	// Measured, with the tunnel up and every one of six nodes answering two out of two real
+	// CONNECT requests:
+	//
+	//   优选01 · 172.66.200.1    /delay 249ms    CONNECT OK/OK
+	//   优选02 · 108.162.192.1   /delay [504]    CONNECT OK/OK
+	//   优选03 · 172.69.250.1    /delay [504]    CONNECT OK/OK
+	//   优选04 · 162.159.1.1     /delay [503]    CONNECT OK/OK
+	//   优选05 · 172.69.30.1     /delay [504]    CONNECT OK/OK
+	//   优选06 · 172.66.1.1      /delay 249ms    CONNECT OK/OK
+	//
+	// Four of six were reported dead by the endpoint while carrying traffic. The health
+	// loop used that endpoint to decide which nodes were alive, so it spent its time
+	// switching away from nodes that worked - reported by the user, exactly, as nodes that
+	// could not be used after being tested.
+	//
+	// The endpoint makes its own connection from inside the core, and its failures say as
+	// much about the core's state at that moment as about the node. A request through the
+	// mixed port is the direct question: it goes out through the node and back, the way any
+	// program on the machine uses it.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "func (a *App) healthProbeThroughTunnel(timeoutMS int) (int, error)") {
+		t.Fatal("there is no real-traffic liveness test")
+	}
+	// It must go through the mixed port, which is what makes it the same path a user's
+	// traffic takes.
+	i := strings.Index(text, "func (a *App) healthProbeThroughTunnel(")
+	body := text[i:]
+	if end := strings.Index(body, "\nfunc "); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "http.ProxyURL(proxyURL)") {
+		t.Error("the test does not go through the mixed port, so it is not the path the " +
+			"user's traffic takes")
+	}
+	if !strings.Contains(body, "MixedPort") {
+		t.Error("the test does not use the configured mixed port")
+	}
+
+	// The health loop's judgement of the current node must use it.
+	if !strings.Contains(text, "delay, derr := a.healthProbeThroughTunnel(healthTimeoutMS)") {
+		t.Error("the current node is still judged by the core's own delay endpoint")
+	}
+
+	// And the delay endpoint must be kept for ranking only, with the reason recorded
+	// where it is defined - the next person to read it will otherwise "fix" it back.
+	if !strings.Contains(text, "It is not evidence that a node works") {
+		t.Error("nothing warns that the delay endpoint is unreliable")
+	}
+}
+
+func TestANodeReportedDeadByTheCoreCanStillBeChosen(t *testing.T) {
+	// The candidate path selects a node and then tests it with real traffic, rather than
+	// asking the core whether it thinks the node is alive first. That ordering matters: the
+	// tunnel carries whatever PROXY points at, so a real test of a node is only possible by
+	// using it - and a node the core reports dead is exactly the case that has to be tested
+	// rather than trusted.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "Walk the candidates and take the first one that actually answers")
+	if i < 0 {
+		t.Fatal("the candidate walk is missing")
+	}
+	branch := text[i : i+2600]
+	sel := strings.Index(branch, `a.core.Select("PROXY", p.Name)`)
+	probe := strings.Index(branch, "a.healthProbeThroughTunnel(healthTimeoutMS)")
+	if sel < 0 || probe < 0 {
+		t.Fatal("the candidate is not selected and then tested")
+	}
+	if sel > probe {
+		t.Error("the candidate is tested before it is selected, which cannot exercise it")
 	}
 }

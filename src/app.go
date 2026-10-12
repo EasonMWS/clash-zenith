@@ -1,9 +1,11 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1110,7 +1112,10 @@ func (a *App) healthCheck() {
 	// on still working".
 	a.sweepPool(current)
 
-	delay, derr := a.healthProbe(current, healthTimeoutMS, 1)
+	// Real traffic decides this, not the core's own probe. See healthProbeThroughTunnel
+	// for the measurement that made the difference: four healthy nodes in six were
+	// reported dead by the delay endpoint while carrying two out of two real requests.
+	delay, derr := a.healthProbeThroughTunnel(healthTimeoutMS)
 	if derr == nil && delay > 0 {
 		a.mu.Lock()
 		if a.healthFails > 0 {
@@ -1164,7 +1169,7 @@ func (a *App) healthCheck() {
 	//
 	// The retry is also given more room than the first probe. If the machine is busy,
 	// the second attempt needs to be able to succeed despite that.
-	if delay2, err2 := a.healthProbe(current, healthTimeoutMS, 2); err2 == nil && delay2 > 0 {
+	if delay2, err2 := a.healthProbeThroughTunnel(healthTimeoutMS * 2); err2 == nil && delay2 > 0 {
 		// A blip, not a failure. Recorded so it is visible without being acted on: no
 		// counter moves, no switch happens, and the user keeps the connection they had.
 		a.mu.Lock()
@@ -1251,7 +1256,14 @@ func (a *App) healthCheck() {
 				break
 			}
 			tried++
-			if d, err := a.healthProbe(p.Name, healthTimeoutMS, 1); err == nil && d > 0 {
+			// Selecting it first is what makes a real request possible: the tunnel carries
+			// whatever PROXY points at, so a node can only be tested for real by using it.
+			// If it does not carry traffic it is put back immediately, and the next
+			// candidate is tried.
+			if err := a.core.Select("PROXY", p.Name); err != nil {
+				continue
+			}
+			if d, err := a.healthProbeThroughTunnel(healthTimeoutMS); err == nil && d > 0 {
 				a.noteNodeAlive(p.Name)
 				next = p.Name
 				break
@@ -1390,7 +1402,7 @@ func (a *App) sweepPool(current string) {
 	a.mu.Unlock()
 
 	for _, name := range todo {
-		if d, err := a.healthProbeWith(name, healthTimeoutMS, 1, healthSweepTargets); err == nil && d > 0 {
+		if d, err := a.coreDelay(name, healthTimeoutMS); err == nil && d > 0 {
 			a.mu.Lock()
 			a.healthAlive[name] = time.Now()
 			a.publishHealth()
@@ -1428,6 +1440,95 @@ func (a *App) sweepPool(current string) {
 // whole list tried again, which is when the extra time is worth spending.
 func (a *App) healthProbe(name string, timeoutMS int, attempts int) (int, error) {
 	return a.healthProbeWith(name, timeoutMS, attempts, healthProbeTargets)
+}
+
+// coreDelay is the core's own delay endpoint, kept only for ranking.
+//
+// It is not evidence that a node works. Measured, with the tunnel up and every one of six
+// nodes answering two out of two real CONNECT requests:
+//
+//	优选01 · 172.66.200.1    /delay 249ms    CONNECT OK/OK
+//	优选02 · 108.162.192.1   /delay [504]    CONNECT OK/OK
+//	优选03 · 172.69.250.1    /delay [504]    CONNECT OK/OK
+//	优选04 · 162.159.1.1     /delay [503]    CONNECT OK/OK
+//	优选05 · 172.69.30.1     /delay [504]    CONNECT OK/OK
+//	优选06 · 172.66.1.1      /delay 249ms    CONNECT OK/OK
+//
+// Four of six were reported dead by the endpoint while carrying traffic. The health loop
+// used that endpoint to decide which nodes were alive, so it spent its time switching away
+// from nodes that worked - which the user reported, exactly, as adding nodes that then
+// could not be used.
+//
+// The number it returns is still the best relative ranking available, so it is kept for
+// that. It is no longer an answer to "is this node working".
+func (a *App) coreDelay(name string, timeoutMS int) (int, error) {
+	return a.healthProbeWith(name, timeoutMS, 1, healthProbeTargets)
+}
+
+// healthProbeThroughTunnel asks whether traffic can actually pass, by making a real
+// request through the running tunnel.
+//
+// This is the direct question rather than a proxy for it. The core's delay endpoint makes
+// its own connection to the node from inside the core, and its failures say as much about
+// the core's own state at that moment as about the node - which is why four healthy nodes
+// in six were reported dead by it.
+//
+// The tunnel is used the way any program on the machine uses it: by sending a request
+// through the mixed port. That path goes through the proxy, out to the node, and back, and
+// if it completes then the node works, whatever the core's own probe thinks.
+//
+// TUN does not change the answer. The mixed port listens in both modes, and in TUN mode the
+// request still egresses through the selected node, so this is one test that means the same
+// thing in both.
+func (a *App) healthProbeThroughTunnel(timeoutMS int) (int, error) {
+	port := a.store.Settings().MixedPort
+	if port <= 0 {
+		return 0, fmt.Errorf("混合端口未配置")
+	}
+	proxyURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
+	if err != nil {
+		return 0, err
+	}
+	client := &http.Client{
+		Timeout: time.Duration(timeoutMS) * time.Millisecond,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			DisableKeepAlives: true,
+			// The point is whether the tunnel carries the request, so a certificate
+			// problem must not be able to masquerade as a dead node.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	defer client.CloseIdleConnections()
+
+	var lastErr error
+	for _, target := range healthProbeTargets {
+		started := time.Now()
+		req, err := http.NewRequest(http.MethodGet, target, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("User-Agent", "Zenith/"+AppVersion)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		// Any completed HTTP exchange is proof the tunnel carried it. The status is not
+		// the question - a captive portal answering 200 and a generate_204 answering 204
+		// are both evidence that bytes made the round trip.
+		if resp.StatusCode > 0 {
+			return int(time.Since(started).Milliseconds()), nil
+		}
+		lastErr = fmt.Errorf("没有收到响应")
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可用的探测目标")
+	}
+	return 0, lastErr
 }
 
 // healthProbeWith is healthProbe against a chosen target list.
