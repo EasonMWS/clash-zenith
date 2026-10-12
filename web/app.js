@@ -254,11 +254,25 @@ function renderOverview(st) {
   }
 
   const opt = $('#opt-badge');
-  opt.textContent = st.isOptimized ? '已优选 ' + (st.nodeCount || 0) + ' 个节点' : '尚未优选（当前用订阅全部节点）';
-  opt.className = st.isOptimized ? 'badge' : 'badge ghost';
+  // Say how many of the optimised nodes have actually answered, not just how many exist.
+  //
+  // A scan writes a measurement into a node's name and nothing revisits it, so "已优选 63
+  // 个节点" could be true and useless at the same time - the user asked why so many of
+  // them did not work, and the interface had no way to say. The count that matters is the
+  // one that has answered recently.
+  const alive = Number(st.aliveCount) || 0;
+  const total = Number(st.nodeCount) || 0;
+  if (st.isOptimized) {
+    opt.textContent = '已优选 ' + total + ' 个节点 · 实测可用 ' + alive + ' 个';
+    opt.className = alive > 0 ? 'badge' : 'badge warn';
+  } else {
+    opt.textContent = '尚未优选（当前用订阅全部节点）';
+    opt.className = 'badge ghost';
+  }
 
   $('#hero-node').textContent = st.current || '未选择节点';
-  const meta = ['共 ' + (st.nodeCount || 0) + ' 个节点'];
+  const meta = ['共 ' + total + ' 个节点'];
+  if (st.isOptimized) meta.push('实测可用 ' + alive + ' 个');
   if (st.autoPick && st.autoPick !== st.current) meta.push('自动测速最优：' + st.autoPick);
   if (st.lastOptimize) meta.push('上次优选 ' + prettyTime(st.lastOptimize));
   $('#hero-meta').textContent = meta.join(' · ');
@@ -354,10 +368,25 @@ function rowFor(name) {
 function nodeRowHtml(n) {
   const d = nodeDelay(n), cls = delayClass(d), busy = S.testing[n.name];
   const net = n.network && n.network !== 'tcp' ? '<span class="node-net">' + esc(n.network) + '</span>' : '';
+  // Say whether the node has answered recently.
+  //
+  // The delay in a node's name is a measurement from whenever the last scan ran, and
+  // nothing revisits it - so a list of sixty nodes could look uniformly healthy while most
+  // of them no longer carry anything. The user asked why so many did not work; the answer
+  // belongs on the row rather than in the log.
+  let live = '';
+  if (n.optimized) {
+    if (n.alive) {
+      const ago = Number(n.aliveAgo) || 0;
+      live = '<span class="node-live" title="最近一次实测通过，' + ago + ' 秒前">实测可用</span>';
+    } else {
+      live = '<span class="node-live stale" title="这一轮还没测到它应答；优选列表里的延迟是上次扫描时的数字">未实测</span>';
+    }
+  }
   return '<div class="node-row' + (n.optimized ? ' opt' : '') + (n.active ? ' active' : '') +
     (busy ? ' testing' : '') + '" data-name="' + esc(n.name) + '" title="点击切换到该节点">' +
     '<div class="node-name">' + (n.active ? '<span class="node-mark">使用中</span>' : '') +
-      '<span>' + esc(n.name) + '</span>' + net + '</div>' +
+      '<span>' + esc(n.name) + '</span>' + net + live + '</div>' +
     '<div class="node-server">' + esc((n.server || '') + (n.port ? ':' + n.port : '')) + '</div>' +
     '<div class="bar"><i class="' + (busy ? '' : cls) + '" style="width:' +
       (busy ? 100 : delayPct(d).toFixed(1)) + '%"></i></div>' +

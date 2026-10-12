@@ -317,6 +317,13 @@ func main() {
 	// once, even on a first run where the geodata files still need unpacking.
 	// background() is an endless loop, so it MUST run in its own goroutine.
 	app.Boot()
+	// How long the launch took, measured rather than felt.
+	//
+	// The user reported "a long time before anything happens" after a double-click, and
+	// there was no number anywhere to check it against - the log recorded what happened
+	// but not how long any of it took. Every wait on this path was added for a good
+	// reason and each one is invisible until it is measured.
+	launchStart := time.Now()
 	// Reconcile the remembered TUN state with what the machine actually has. A
 	// reboot or another VPN can make the stored switch wrong, and believing it
 	// would mean reporting protection that is not there.
@@ -330,6 +337,16 @@ func main() {
 	// disk that failed verification. The transaction record is what distinguishes
 	// that from a deliberate state.
 	app.RecoverConfigTransaction()
+	// A second launch of a running program should be imperceptible. The three
+	// reconciliations above are the only waits before the window, so their total is what
+	// the user experiences - and a budget turns "it feels slow" into a number that can be
+	// compared after a change.
+	if elapsed := time.Since(launchStart); elapsed > 2*time.Second {
+		Log("launch: %.1fs before the window; the reconciliations before it are the cost",
+			elapsed.Seconds(), "WARN")
+	} else {
+		Log("launch: ready in %.1fs", elapsed.Seconds())
+	}
 	go app.background()
 	// Liveness runs on its own timer, separate from the housekeeping tick so
 	// unrelated work can never delay noticing a dead node.

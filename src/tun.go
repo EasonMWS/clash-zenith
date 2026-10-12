@@ -22,10 +22,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1022,6 +1024,15 @@ func (a *App) runEnableTun(mode TunMode) {
 // rather than slow.
 const handoverTimeout = 2 * time.Minute
 
+// tunAdapterWait is how long to keep looking for the tunnel adapter before concluding it
+// is not coming back.
+//
+// A core restart removes the adapter as it exits and creates it again when it returns
+// with the tunnel configured. That gap is what this covers, and getting it wrong is how a
+// working tunnel was lost: the check ran in the gap, cleared the stored mode, and the new
+// core came up without the tunnel.
+const tunAdapterWait = 15 * time.Second
+
 // approvalGrace is how long the wait is expected to last before it is the user's turn
 // to act. Past it, the interface says the prompt is probably waiting to be answered.
 const approvalGrace = 8 * time.Second
@@ -1535,6 +1546,34 @@ func (a *App) RecoverTun() {
 			Log("TUN: mode %s is active and adapter %q is present", st.TunMode, st.TunDevice)
 			return
 		}
+		// The adapter can be absent for a reason that is not a failure: the core is being
+		// restarted, and it removes the adapter as it exits and creates it again when it
+		// comes back with the tunnel configured.
+		//
+		// Measured, and this is how a working tunnel was lost. A deploy restarts the app,
+		// the new process adopts the running core and then stops it, and the check below
+		// ran in the gap:
+		//
+		//   20:59:44  adopted a running core (pid 54688) on port 7944
+		//   20:59:44  stopping core pid 54688
+		//   20:59:45  TUN: settings say compat but adapter "Zenith" is not present
+		//   20:59:46  core is up (pid 67944)
+		//
+		// The mode was cleared because of a moment, and the new core came up without the
+		// tunnel - so the user, who had TUN working, was left with a machine whose tunnel
+		// was silently off and whose stored mode said it had failed.
+		//
+		// Waiting is the correct response to a transient, and a core restart is one.
+		// Giving up on the configured port after a momentary absence is the same mistake
+		// the port rotation made, and it is fixed the same way.
+		deadline := time.Now().Add(tunAdapterWait)
+		for time.Now().Before(deadline) {
+			if tunAdapterExists(st.TunDevice) {
+				Log("TUN: adapter %q appeared while waiting; the tunnel is up", st.TunDevice)
+				return
+			}
+			time.Sleep(400 * time.Millisecond)
+		}
 		// The stored mode is cleared, not just reported.
 		//
 		// This is the difference between a state that is described and a state that is
@@ -1566,14 +1605,72 @@ func (a *App) RecoverTun() {
 		return
 	}
 
-	// Mode is off. One of our adapters still lying around is a leftover from a
-	// crash, and it is ours to clean up.
+	// Mode is off. One of our adapters may still be lying around.
+	//
+	// It is not automatically a leftover. A restart can lose the stored mode while the
+	// tunnel it describes is still running - the adapter is created by the core, not by
+	// this process, and it outlives a restart of the interface:
+	//
+	//   tunMode=''  while  Get-NetAdapter Zenith -> Up, 198.18.0.x answers, four sites reachable
+	//
+	// Treating that as a leftover and removing it would tear down a working tunnel, and
+	// leaving it alone while the mode says off means the two halves of the program
+	// disagree about whether the user is protected. The adapter being present AND
+	// carrying traffic is the stronger evidence, so the mode is restored to match
+	// reality, which is the same rule the other direction follows.
 	if tunAdapterExists(st.TunDevice) {
+		if a.tunAdapterIsCarryingTraffic() {
+			Log("TUN: adapter %q is present and carrying traffic while the stored mode is "+
+				"off; restoring the mode to match the machine", st.TunDevice, "WARN")
+			if _, err := a.store.UpdateSettings(map[string]interface{}{
+				"tunMode": string(TunCompat),
+			}); err != nil {
+				Log("TUN: could not restore the mode: %v", err, "WARN")
+			}
+			a.mu.Lock()
+			if a.tunRun == nil {
+				a.tunRun = &tunRun{}
+			}
+			a.tunRun.Stage = "检测到 TUN 正在工作，已同步设置"
+			a.tunRun.Mode = TunCompat
+			a.mu.Unlock()
+			return
+		}
 		Log("TUN: found a leftover adapter %q with TUN switched off; removing it", st.TunDevice, "WARN")
 		if err := removeTunAdapter(st.TunDevice); err != nil {
 			Log("TUN: leftover adapter could not be removed: %v", err, "WARN")
 		}
 	}
+}
+
+// tunAdapterIsCarryingTraffic reports whether the tunnel is not merely present but
+// actually resolving names to its own addresses.
+//
+// One question, asked well: a name resolved through the tunnel comes back as a fake
+// address in 198.18.0.0/15, which is the range the core uses for the tunnel. A dead
+// tunnel resolves from the ordinary DNS and returns a real address, so the range is the
+// whole test - and it is a test of the thing being asked about rather than a proxy for it.
+//
+// Both hosts are tried because one may be blocked, and either answering is enough: this
+// is evidence that the tunnel is in the path, and one clean lookup through it is proof.
+func (a *App) tunAdapterIsCarryingTraffic() bool {
+	if !a.core.IsUp() {
+		return false
+	}
+	for _, host := range []string{"www.gstatic.com", "www.baidu.com"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if strings.HasPrefix(addr, "198.18.") || strings.HasPrefix(addr, "198.19.") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RepairTun is the offline repair path. It needs no network: it re-verifies the

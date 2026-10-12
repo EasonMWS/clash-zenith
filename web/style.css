@@ -796,3 +796,10 @@ a:hover { text-decoration: underline; }
   opacity: 0.85;
   margin-bottom: 10px;
 }
+
+/* 节点行上的"实测可用 / 未实测"标记。
+   优选列表里的延迟是上次扫描时的数字，之后没人复查过；
+   有了这个标记，哪些真能用一眼就能看出来，不用去翻日志。 */
+.node-live{font-size:10px;padding:1px 5px;margin-left:6px;border-radius:3px;
+  background:rgba(52,199,89,.16);color:#34c759;white-space:nowrap}
+.node-live.stale{background:rgba(255,159,10,.14);color:#ff9f0a}

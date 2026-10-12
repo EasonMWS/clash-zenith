@@ -4677,7 +4677,9 @@ func TestASwitchOnlyLandsOnANodeThatAnswers(t *testing.T) {
 		t.Fatal("the switch takes a candidate without checking that it answers")
 	}
 	branch := text[i : i+2200]
-	if !strings.Contains(branch, "a.core.Delay(p.Name, healthTimeoutMS") {
+	// The probe goes through healthProbe now, so that the candidate is judged by the
+	// same targets the rest of the program uses rather than the core's single default.
+	if !strings.Contains(branch, "a.healthProbe(p.Name, healthTimeoutMS, 1)") {
 		t.Error("the candidate is not probed before it is selected")
 	}
 	// Bounded: the search must not cost more time than the switch saves.
@@ -4713,7 +4715,7 @@ func TestTheDelayProbeIsNotTrustedOnItsOwn(t *testing.T) {
 	}
 	// The retry must be more generous than the first probe, or a busy machine fails
 	// both and the retry has decided nothing.
-	if !strings.Contains(text, "healthTimeoutMS*2") {
+	if !strings.Contains(text, "a.healthProbe(current, healthTimeoutMS, 2)") {
 		t.Error("the confirming probe gets no more room than the one it is confirming, " +
 			"so a busy machine fails both")
 	}
@@ -4818,5 +4820,404 @@ func TestOurOwnExitingCoreIsNotMistakenForAnotherProgram(t *testing.T) {
 	// The rotation must still exist for a genuinely foreign holder.
 	if !strings.Contains(body, "moving Zenith to") {
 		t.Error("the rotation was removed entirely, so a real conflict is no longer handled")
+	}
+}
+
+func TestTheHealthProbeTriesEveryTargetTheOptimiserDoes(t *testing.T) {
+	// Measured, with the tunnel up and working - baidu, google, github and youtube all
+	// answering through it - the current node measured 372ms while three other optimised
+	// nodes timed out at exactly 8.0 seconds:
+	//
+	//   /proxies/<node>/delay?timeout=8000&url=https://www.gstatic.com/generate_204
+	//   优选01 -> HTTP 504 Timeout   (8.0s)
+	//   优选02 -> HTTP 504 Timeout   (8.0s)
+	//   优选03 -> HTTP 504 Timeout   (8.0s)
+	//
+	// The optimiser reaches those same nodes, because before calling one dead it falls
+	// back through google and cp.cloudflare.com. The health loop used the single target
+	// above, declared them dead on its first timeout, switched away, and auto-pick
+	// returned to another node from the same scan. The user saw every optimised node
+	// failing while the network was fine.
+	//
+	// The property that was missing is agreement: one probe target in the health loop and
+	// three everywhere else is how a node is dead to one part of the program and healthy
+	// to another.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "func (a *App) healthProbe(name string, timeoutMS int, attempts int) (int, error)") {
+		t.Fatal("the health loop probes with a single target")
+	}
+	opt, err := os.ReadFile("optimizer.go")
+	if err != nil {
+		t.Skipf("optimizer.go is not readable: %v", err)
+	}
+	optText := string(opt)
+
+	// Every target the optimiser uses must appear in the health list.
+	for _, target := range []string{
+		"https://www.gstatic.com/generate_204",
+		"https://www.google.com/generate_204",
+		"http://cp.cloudflare.com/generate_204",
+	} {
+		if !strings.Contains(optText, target) {
+			continue // the optimiser no longer uses it; nothing to agree about
+		}
+		if !strings.Contains(text, target) {
+			t.Errorf("the optimiser probes %s and the health loop does not, so a node can "+
+				"be alive to one and dead to the other", target)
+		}
+	}
+
+	// And the health loop must not call the core directly with an empty target any more,
+	// which is what selected the single default.
+	if strings.Contains(text, `a.core.Delay(current, healthTimeoutMS,`) {
+		t.Error("the health loop still probes with the core's single default target")
+	}
+}
+
+// ---- the pool is re-verified, and only live nodes are chosen ---------------
+
+func TestOnlyANodeConfirmedAliveCanBeChosen(t *testing.T) {
+	// This is the fix for the reported outage. Measured: with the tunnel up and
+	// answering for baidu, google, github and youtube, the optimised pool held 66 nodes
+	// and the large majority timed out on every target - while the ranking went on
+	// treating their scan-time numbers as current.
+	//
+	// MeasuredMS and the "323ms" written into a node name are statements about the past,
+	// made once by a scan and never revisited. Ranking chose the fastest of a list of
+	// dead nodes, switched onto it, and the health loop switched away again. The user
+	// reported it as every optimised node failing at once.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "Alive map[string]time.Time") {
+		t.Fatal("the health snapshot carries no record of which nodes have answered")
+	}
+	if !strings.Contains(text, "func (a *App) noteNodeAlive(name string)") {
+		t.Fatal("nothing records a node answering")
+	}
+	if !strings.Contains(text, "func (a *App) sweepPool(current string)") {
+		t.Fatal("nothing re-verifies the pool, so 'verified' means 'verified once'")
+	}
+	// The sweep must run from the health loop, before the current node is checked so it
+	// cannot delay the answer to "is the node in use still working".
+	i := strings.Index(text, "a.sweepPool(current)")
+	if i < 0 {
+		t.Fatal("the sweep is never called")
+	}
+	if delay := strings.Index(text, "a.healthProbe(current, healthTimeoutMS, 1)"); delay >= 0 && delay < i {
+		t.Error("the sweep runs after the current node is checked, so a large pool can " +
+			"delay the check that matters")
+	}
+
+	// And the ranking must actually consult it.
+	j := strings.Index(text, "func (a *App) enforceFastest()")
+	if j < 0 {
+		t.Fatal("enforceFastest is missing")
+	}
+	body := text[j : j+4200]
+	if !strings.Contains(body, "h.Alive[p.Name]") {
+		t.Error("the ranking does not check whether a node has answered recently, so it " +
+			"still chooses from scan-time numbers")
+	}
+	if !strings.Contains(body, "time.Since(at) > aliveFor") {
+		t.Error("aliveness is checked but never expires, so a node that died an hour ago " +
+			"stays eligible")
+	}
+	// With nothing confirmed, staying put is the answer - not guessing.
+	if !strings.Contains(body, "waiting for a sweep") {
+		t.Error("with no confirmed node the ranking still picks one, which is a guess")
+	}
+}
+
+func TestAFirstLookDoesNotTryEveryTargetTwice(t *testing.T) {
+	// A health loop that spends eighteen seconds deciding is a health loop that cannot
+	// notice an outage quickly. Measured: with three targets and a confirmation, the loop
+	// ticked every 54 seconds instead of every 10, and a dead node took nearly three
+	// minutes to be replaced.
+	//
+	// The first look therefore tries each target once with a short timeout, because the
+	// common case is that the node is fine and the first target answers. Only when
+	// nothing answers is the whole list tried again, which is when the time is worth it.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "if attempts < 1 {") {
+		t.Fatal("healthProbe has no attempt bound")
+	}
+	i := strings.Index(text, "func (a *App) healthProbe(")
+	body := text[i : i+1400]
+	if !strings.Contains(body, "for i := 0; i < attempts; i++") {
+		t.Error("the attempt count is not used, so a first look costs the same as a " +
+			"confirmation")
+	}
+	// The first probe on the current node must be a single look.
+	if !strings.Contains(text, "a.healthProbe(current, healthTimeoutMS, 1)") {
+		t.Error("the first probe on the current node is not a single look")
+	}
+}
+
+func TestATransientAdapterAbsenceDoesNotClearTheMode(t *testing.T) {
+	// Measured, and this is how a working tunnel was lost. A deploy restarts the app, the
+	// new process adopts the running core and then stops it, and the TUN check ran in the
+	// gap where the adapter does not exist:
+	//
+	//   20:59:44  adopted a running core (pid 54688) on port 7944
+	//   20:59:44  stopping core pid 54688
+	//   20:59:45  TUN: settings say compat but adapter "Zenith" is not present
+	//   20:59:46  core is up (pid 67944)
+	//
+	// The mode was cleared because of a moment, and the new core came up without the
+	// tunnel - leaving a user who had TUN working with a tunnel silently off and a stored
+	// mode that said it had failed.
+	//
+	// Giving up on a momentary absence is the same mistake the port rotation made. This
+	// is the same fix: wait for the transient to pass before concluding anything.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "tunAdapterWait = 15 * time.Second") {
+		t.Fatal("there is no wait before the mode is cleared")
+	}
+	i := strings.Index(text, "The adapter can be absent for a reason that is not a failure")
+	if i < 0 {
+		t.Fatal("the recovery path does not consider that the adapter may be coming back")
+	}
+	// The wait must happen before the clearing, not after.
+	branch := text[i : i+6000]
+	wait := strings.Index(branch, "for time.Now().Before(deadline)")
+	clear := strings.Index(branch, `"tunMode": string(TunOff)`)
+	if wait < 0 {
+		t.Error("the recovery path does not wait")
+	}
+	if clear < 0 {
+		t.Fatal("the clearing disappeared")
+	}
+	if wait > clear {
+		t.Error("the mode is cleared before the adapter is waited for")
+	}
+}
+
+func TestAPresentWorkingAdapterRestoresTheMode(t *testing.T) {
+	// The two halves of the program must not disagree about whether the user is
+	// protected. A restart can lose the stored mode while the tunnel it describes is
+	// still running, because the adapter is created by the core and outlives a restart of
+	// the interface. Measured:
+	//
+	//   tunMode=''  while  Get-NetAdapter Zenith -> Up, 198.18.0.x answers, four sites
+	//                      reachable through it
+	//
+	// Removing that adapter would tear down a working tunnel; leaving it while the mode
+	// says off means the interface reports no protection while the tunnel carries the
+	// traffic. The adapter being present and resolving through the tunnel is the stronger
+	// evidence, so the mode is restored to match - the same rule the other direction
+	// follows.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "func (a *App) tunAdapterIsCarryingTraffic() bool") {
+		t.Fatal("nothing establishes whether a present adapter is actually carrying traffic")
+	}
+	if !strings.Contains(text, "restoring the mode to match the machine") {
+		t.Fatal("a working adapter with the mode off is treated as a leftover")
+	}
+	// The test must look for the tunnel's own address range, which is what distinguishes a
+	// tunnel that is in the path from one that merely exists.
+	if !strings.Contains(text, `strings.HasPrefix(addr, "198.18.")`) {
+		t.Error("the traffic test does not look for the tunnel's fake-address range, so an " +
+			"adapter that exists but is not in the path would pass")
+	}
+}
+
+func TestAPortHeldByOurRunningCoreIsAdoptedWithoutWaiting(t *testing.T) {
+	// Measured, before this branch existed:
+	//
+	//   21:13:47  root=D:\Zenith uiPort=7799        <- the process starts
+	//   21:14:07  mixed port 7944 is still held by this installation's own core after 20s
+	//   21:14:08  adopted a running core (pid 68580)
+	//   21:14:09  UI ready at http://127.0.0.1:7799 <- the window appears
+	//
+	// Twenty-two seconds of a window that had not opened yet, on every launch, reported by
+	// the user as "a long time before anything happens".
+	//
+	// The wait was added to stop the port rotating away from a core that was shutting
+	// down, and it is right for that case. It is wrong for a core that is up: the port
+	// being held by our own running core is not a conflict, it is the situation this
+	// program deliberately creates, because the service owns the core and it outlives
+	// restarts of the interface.
+	//
+	// The distinction is the whole fix, so the test asserts the distinction and not merely
+	// that a fast path exists.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "func (a *App) coreIsRunningOurs(port int) bool") {
+		t.Fatal("nothing distinguishes a running core from one that is shutting down")
+	}
+	if !strings.Contains(text, "func (a *App) adoptListeningCore(port int)") {
+		t.Fatal("nothing adopts the listening core")
+	}
+
+	i := strings.Index(text, "func (a *App) EnsureUsablePort()")
+	body := text[i:]
+	if end := strings.Index(body, "\nfunc "); end > 0 {
+		body = body[:end]
+	}
+	// The fast path must come before the wait, or it saves nothing.
+	fast := strings.Index(body, "a.coreIsRunningOurs(want)")
+	wait := strings.Index(body, "deadline := time.Now().Add(portReleaseWait)")
+	if fast < 0 {
+		t.Error("EnsureUsablePort does not adopt a running core directly")
+	}
+	if wait < 0 {
+		t.Fatal("the wait disappeared, so a shutting-down core would rotate the port again")
+	}
+	if fast > wait {
+		t.Error("the running-core check happens after the wait, so every launch still pays " +
+			"the full wait before the window opens")
+	}
+	// The core must actually be asked whether it is up, not inferred from the listener.
+	if !strings.Contains(text, "if !a.core.IsUp() {\n\t\treturn false\n\t}") {
+		t.Error("the check does not ask the core whether it is running, so a core started " +
+			"by the service - which is not this process's child - would not be recognised")
+	}
+}
+
+func TestTheLaunchReportsHowLongItTook(t *testing.T) {
+	// The complaint was "a long time before anything happens" and there was no number
+	// anywhere to check it against. Every wait on the startup path was added for a good
+	// reason and each one is invisible until it is measured.
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Skipf("main.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "launch: ready in %.1fs") {
+		t.Error("the launch does not report its own duration, so the next regression in it " +
+			"can only be noticed by feel")
+	}
+	// And a slow launch must be distinguishable from a normal one in the log.
+	if !strings.Contains(text, "before the window; the reconciliations before it are the cost") {
+		t.Error("a slow launch is not reported differently from a fast one")
+	}
+}
+
+// ---- a finished scan is evidence, and the list must say what is usable ----
+
+func TestAFinishedScanSeedsWhatItVerified(t *testing.T) {
+	// The optimiser only keeps an edge that completed a real WebSocket upgrade and carried
+	// a real response through it, seconds ago. That is a stronger statement than any health
+	// probe, and the pool sweep started from nothing and had to rediscover it three nodes
+	// at a time.
+	//
+	// Measured, in the log: "auto-pick skip #2: no node has been confirmed alive recently;
+	// waiting for a sweep" - printed while the machine sat on whatever node it had, minutes
+	// after a scan had proved 63 of them work.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	i := strings.Index(text, "A scan that just finished is evidence, and it was being thrown away")
+	if i < 0 {
+		t.Fatal("a finished scan does not record the nodes it verified")
+	}
+	branch := text[i : i+1800]
+	if !strings.Contains(branch, "a.healthAlive[n.Name] = time.Now()") {
+		t.Error("the scan's own verification is not recorded, so auto-pick is blind until " +
+			"the sweep reaches each node")
+	}
+	if !strings.Contains(branch, "a.publishHealth()") {
+		t.Error("the new aliveness is not published, so readers cannot see it")
+	}
+}
+
+func TestTheSweepVerifiesTheBestCandidatesFirst(t *testing.T) {
+	// A pool of 63 nodes covered three per pass takes about three and a half minutes to
+	// sweep, and the loop walked it in whatever order the store happened to hold. The nodes
+	// the ranking actually wanted to use could be anywhere in that queue, so "waiting for a
+	// sweep" could mean waiting minutes for the answer to a question about the node it was
+	// already going to pick.
+	//
+	// The ranking's own order is the right order to verify in, because it is the order the
+	// answer will be used in.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	i := strings.Index(text, "func (a *App) sweepPool(current string)")
+	if i < 0 {
+		t.Fatal("sweepPool is missing")
+	}
+	body := text[i:]
+	if end := strings.Index(body, "\nfunc "); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "sort.SliceStable(ranked") {
+		t.Error("the sweep walks the pool in store order, so a good node can wait minutes " +
+			"behind nodes nobody will ever choose")
+	}
+	if !strings.Contains(body, "MeasuredMS") {
+		t.Error("the sweep does not rank by the measurement the ranking itself uses")
+	}
+}
+
+func TestTheInterfaceSaysHowMuchOfThePoolIsUsable(t *testing.T) {
+	// The user asked why so many optimised addresses did not work. The interface said
+	// "已优选 63 个节点" and nothing else, which was true and useless at the same time - the
+	// delay in each name is a measurement from whenever the last scan ran, and nothing
+	// revisits it.
+	//
+	// Measured: of the six nodes sampled, three failed both probes, two alternated between
+	// answering and timing out, and one answered twice. The list looked uniformly healthy.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, `"aliveCount": aliveCount`) {
+		t.Fatal("status does not report how much of the pool has answered recently")
+	}
+	if !strings.Contains(text, `"alive":     alive`) {
+		t.Fatal("the node list does not say which nodes have answered")
+	}
+	// And the per-node flag must come from the health record, not from a scan-time number.
+	i := strings.Index(text, "aliveView.Alive[n.Name]")
+	if i < 0 {
+		t.Error("the per-node flag is not read from the health record")
+	}
+
+	web, err := os.ReadFile("../web/app.js")
+	if err != nil {
+		t.Skipf("web/app.js is not readable: %v", err)
+	}
+	js := string(web)
+	if !strings.Contains(js, "实测可用") {
+		t.Error("the node list does not mark the nodes that have answered")
+	}
+	if !strings.Contains(js, "实测可用 ' + alive + ' 个") {
+		t.Error("the header badge does not say how much of the pool is usable")
 	}
 }

@@ -7,12 +7,34 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// healthProbeTargets are tried in order; any one answering is proof the node is carrying
+// traffic.
+//
+// Kept in step with the optimiser's list (optimizer.go:1226) on purpose. Two lists that
+// disagree are how a node came to be dead to one part of the program and healthy to
+// another, and that mismatch was a reported outage: with the tunnel up and answering for
+// baidu, google, github and youtube, three optimised nodes timed out at exactly 8.0s on
+// the single target the health loop used.
+var healthProbeTargets = []string{
+	"https://www.gstatic.com/generate_204",
+	"https://www.google.com/generate_204",
+	"http://cp.cloudflare.com/generate_204",
+}
+
+// healthSweepTargets are the two targets the pool sweep uses. See healthProbeWith for why
+// the sweep is cheaper than the check on the current node.
+var healthSweepTargets = []string{
+	"https://www.gstatic.com/generate_204",
+	"https://www.google.com/generate_204",
+}
 
 const (
 	AppName    = "Zenith"
@@ -114,6 +136,11 @@ type App struct {
 	lastHealthRescan time.Time
 	// node name -> when it was last found dead
 	healthBanned map[string]time.Time
+	// healthAlive is when each node last proved it could carry traffic.
+	healthAlive map[string]time.Time
+	// healthProbed is when each node was last asked, so the pool sweep does not
+	// re-probe the same nodes every ten seconds.
+	healthProbed map[string]time.Time
 	// node name -> how often it has failed a liveness check
 	nodeFlaky map[string]int
 	// healthView is an immutable snapshot of the two maps above, swapped whole.
@@ -467,6 +494,28 @@ func (a *App) EnsureUsablePort() {
 		return
 	}
 
+	// A port held by a core that is running and ours is not a conflict - it is the
+	// situation this program deliberately creates. The core is started by the resident
+	// service and outlives restarts of the interface, so on an ordinary second launch the
+	// port is already held by our own core.
+	//
+	// Adopting it immediately rather than waiting is what makes a launch feel immediate.
+	// Measured, before this branch existed:
+	//
+	//   21:13:47  root=D:\Zenith uiPort=7799        <- the process starts
+	//   21:14:07  mixed port 7944 is still held by this installation's own core after 20s
+	//   21:14:08  adopted a running core (pid 68580)
+	//   21:14:09  UI ready at http://127.0.0.1:7799  <- the window appears
+	//
+	// Twenty-two seconds of a window that had not opened yet, every launch, reported by
+	// the user as "a long time before anything happens". The wait exists for a core that is
+	// on its way OUT; a core that is up is the answer, not the problem.
+	if a.coreIsRunningOurs(want) {
+		Log("mixed port %d is held by this installation's own running core; adopting it", want)
+		a.adoptListeningCore(want)
+		return
+	}
+
 	// Rotating the port is the last resort, and reaching it too early is actively
 	// harmful: every program that stored the old port - including the system proxy
 	// setting the user's browser reads - silently loses its connection. The user
@@ -653,6 +702,34 @@ func looksLikeOurCore(pid int) bool {
 		return false
 	}
 	return strings.Contains(name, "mihomo")
+}
+
+// coreIsRunningOurs reports whether the port is held by a core of ours that is up.
+//
+// Two questions, both cheap, and both have to be yes. The listener has to be a process
+// named like our core, and this installation has to have a core running at all - which is
+// asked of the core itself rather than inferred, because a core started by the resident
+// service is not this process's child and nothing else would know about it.
+func (a *App) coreIsRunningOurs(port int) bool {
+	if !a.core.IsUp() {
+		return false
+	}
+	for _, pid := range ListeningPids(port) {
+		if coreOwnsDataDir(pid, a.dataDir, a.rootDir) || looksLikeOurCore(pid) {
+			return true
+		}
+	}
+	return false
+}
+
+// adoptListeningCore records the running core that owns the port.
+func (a *App) adoptListeningCore(port int) {
+	for _, pid := range ListeningPids(port) {
+		if coreOwnsDataDir(pid, a.dataDir, a.rootDir) || looksLikeOurCore(pid) {
+			a.adoptRunningCore(pid)
+			return
+		}
+	}
 }
 
 // proxyOwnerIsOurs reports whether the current system proxy setting appears to be
@@ -1028,7 +1105,12 @@ func (a *App) healthCheck() {
 		return
 	}
 
-	delay, derr := a.core.Delay(current, healthTimeoutMS, "")
+	// Keep the pool honest alongside the current node. Placed before the check on the
+	// current node so that a sweep can never delay the answer to "is the node the user is
+	// on still working".
+	a.sweepPool(current)
+
+	delay, derr := a.healthProbe(current, healthTimeoutMS, 1)
 	if derr == nil && delay > 0 {
 		a.mu.Lock()
 		if a.healthFails > 0 {
@@ -1082,7 +1164,7 @@ func (a *App) healthCheck() {
 	//
 	// The retry is also given more room than the first probe. If the machine is busy,
 	// the second attempt needs to be able to succeed despite that.
-	if delay2, err2 := a.core.Delay(current, healthTimeoutMS*2, ""); err2 == nil && delay2 > 0 {
+	if delay2, err2 := a.healthProbe(current, healthTimeoutMS, 2); err2 == nil && delay2 > 0 {
 		// A blip, not a failure. Recorded so it is visible without being acted on: no
 		// counter moves, no switch happens, and the user keeps the connection they had.
 		a.mu.Lock()
@@ -1169,7 +1251,8 @@ func (a *App) healthCheck() {
 				break
 			}
 			tried++
-			if d, err := a.core.Delay(p.Name, healthTimeoutMS, ""); err == nil && d > 0 {
+			if d, err := a.healthProbe(p.Name, healthTimeoutMS, 1); err == nil && d > 0 {
+				a.noteNodeAlive(p.Name)
 				next = p.Name
 				break
 			}
@@ -1222,6 +1305,167 @@ func (a *App) healthCheck() {
 	}
 }
 
+// noteNodeAlive records that a node answered a probe just now.
+//
+// It is the only thing that makes a node eligible for auto-pick, which is what stops the
+// program choosing from a list of measurements taken hours ago.
+func (a *App) noteNodeAlive(name string) {
+	if name == "" {
+		return
+	}
+	a.mu.Lock()
+	if a.healthAlive == nil {
+		a.healthAlive = map[string]time.Time{}
+	}
+	a.healthAlive[name] = time.Now()
+	a.publishHealth()
+	a.mu.Unlock()
+}
+
+// sweepPool verifies the pool the ranking is drawn from, a few nodes per pass.
+//
+// Without this, "verified" means "verified once, possibly hours ago". Measured: with the
+// tunnel up and answering for baidu, google, github and youtube, the optimised pool held
+// 66 nodes and the large majority timed out on every target - while the ranking went on
+// treating their scan-time numbers as current, choosing the fastest of them, switching
+// onto it, and leaving the health loop to switch away again. The user reported it as
+// every optimised node failing at once.
+//
+// A few nodes per pass rather than all of them, because this shares a loop with the
+// check that keeps the current node working, and that check must not be delayed. With a
+// ten-second tick and three nodes a pass, a pool of sixty is covered in about three
+// minutes - which is the right order of magnitude for a list that changes on the scale of
+// a scan, not a second.
+func (a *App) sweepPool(current string) {
+	optimized, _ := a.nodeSet()
+	if len(optimized) == 0 {
+		return
+	}
+	const perPass = 3
+	const staleAfter = 3 * time.Minute
+
+	a.mu.Lock()
+	if a.healthProbed == nil {
+		a.healthProbed = map[string]time.Time{}
+	}
+	if a.healthAlive == nil {
+		a.healthAlive = map[string]time.Time{}
+	}
+	// Which nodes are worth asking about, decided under the lock so two passes cannot
+	// pick the same node.
+	//
+	// Best-ranked first, not in list order. Measured, and this is why the pool stayed
+	// useless for minutes after a scan: a pool of 63 nodes covered three per pass takes
+	// about three and a half minutes to sweep, and the loop walked it in whatever order
+	// the store happened to hold. The nodes the ranking actually wanted to use could be
+	// anywhere in that queue, so "waiting for a sweep" could mean waiting minutes for the
+	// answer to a question about the node it was already going to pick.
+	//
+	// The ranking's own order is the right order to verify in, because it is the order the
+	// answer will be used in.
+	ranked := make([]Proxy, len(optimized))
+	copy(ranked, optimized)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return ranked[i].MeasuredMS > 0 && (ranked[j].MeasuredMS <= 0 ||
+			ranked[i].MeasuredMS < ranked[j].MeasuredMS)
+	})
+
+	var todo []string
+	now := time.Now()
+	for _, p := range ranked {
+		if p.Name == current {
+			continue // the current node is already checked by the loop
+		}
+		if now.Sub(a.healthProbed[p.Name]) < staleAfter {
+			continue
+		}
+		todo = append(todo, p.Name)
+		if len(todo) >= perPass {
+			break
+		}
+	}
+	for _, n := range todo {
+		a.healthProbed[n] = now
+	}
+	a.mu.Unlock()
+
+	for _, name := range todo {
+		if d, err := a.healthProbeWith(name, healthTimeoutMS, 1, healthSweepTargets); err == nil && d > 0 {
+			a.mu.Lock()
+			a.healthAlive[name] = time.Now()
+			a.publishHealth()
+			a.mu.Unlock()
+		}
+	}
+}
+
+// healthProbe measures a node through the core, trying more than one target.
+//
+// The health loop used a single target and the rest of the program used three. That
+// difference is the whole of a reported outage.
+//
+// Measured, with the tunnel up and working - baidu, google, github and youtube all
+// answering through it - the current node measured 372ms while three other optimised
+// nodes timed out at exactly 8.0 seconds on the health loop's target:
+//
+//	/proxies/<node>/delay?timeout=8000&url=https://www.gstatic.com/generate_204
+//	优选01 -> HTTP 504 Timeout   (8.0s)
+//	优选02 -> HTTP 504 Timeout   (8.0s)
+//	优选03 -> HTTP 504 Timeout   (8.0s)
+//
+// The optimiser reaches those same nodes because it falls back through
+// google and cp.cloudflare.com before calling one dead (optimizer.go:1226). The health
+// loop declared them dead on the first target's timeout, switched away, auto-pick
+// returned to another node from the same scan, and the cycle repeated - which the user
+// saw as every optimised node failing at once while the network was in fact fine.
+//
+// So the health loop now asks the same question in the same way: any one of these
+// targets answering is proof of life.
+// attempts is 1 for a first look and 2 for a confirmation. The first look tries every
+// target once with a short timeout, because the common case is that the node is fine and
+// the first target answers - and a health loop that spends eighteen seconds deciding is
+// a health loop that cannot notice an outage quickly. Only when nothing answers is the
+// whole list tried again, which is when the extra time is worth spending.
+func (a *App) healthProbe(name string, timeoutMS int, attempts int) (int, error) {
+	return a.healthProbeWith(name, timeoutMS, attempts, healthProbeTargets)
+}
+
+// healthProbeWith is healthProbe against a chosen target list.
+//
+// The sweep uses a shorter list than the check on the current node, and the arithmetic is
+// why. Three targets at a six-second timeout is up to eighteen seconds for one node; three
+// nodes per pass would make a pass a minute long, and a pool of sixty-six would take
+// eleven minutes to cover - longer than a confirmed node stays eligible, so nodes would
+// expire before being re-checked and the pool would drain itself.
+//
+// The current node is worth all three targets: it is the one carrying the user's traffic,
+// and a wrong answer about it either strands them or switches them for nothing. A
+// candidate only has to be filtered, and the first two targets are the ones that answer in
+// practice.
+func (a *App) healthProbeWith(name string, timeoutMS int, attempts int, targets []string) (int, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		for _, target := range targets {
+			delay, err := a.core.Delay(name, timeoutMS, target)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if delay > 0 {
+				return delay, nil
+			}
+			lastErr = fmt.Errorf("内核报告延迟为 0")
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可用的探测目标")
+	}
+	return 0, lastErr
+}
+
 // reason0 renders a delay error for a log line, or a default when there is none.
 func reason0(err error) string {
 	if err == nil {
@@ -1239,6 +1483,19 @@ func reason0(err error) string {
 type healthSnapshot struct {
 	Banned map[string]time.Time
 	Flaky  map[string]int
+	// Alive records, per node, when it last proved it could carry traffic.
+	//
+	// This is the answer to the question the rest of the program was guessing at. A
+	// scan measures a node once and writes the number into its name and its record;
+	// nothing ever revisits that judgement. Measured: with the tunnel up and answering,
+	// the pool held 66 optimised nodes of which the large majority timed out on every
+	// target - and auto-pick ranked by the number written hours earlier, chose one,
+	// switched onto it, and the health loop switched away again. The user saw every
+	// optimised node failing at once.
+	//
+	// A node is now "alive" because it answered a probe, recently, and that is the only
+	// thing auto-pick will choose.
+	Alive map[string]time.Time
 }
 
 // publishHealth copies the current bookkeeping into a fresh snapshot and swaps
@@ -1247,12 +1504,16 @@ func (a *App) publishHealth() {
 	snap := &healthSnapshot{
 		Banned: make(map[string]time.Time, len(a.healthBanned)),
 		Flaky:  make(map[string]int, len(a.nodeFlaky)),
+		Alive:  make(map[string]time.Time, len(a.healthAlive)),
 	}
 	for k, v := range a.healthBanned {
 		snap.Banned[k] = v
 	}
 	for k, v := range a.nodeFlaky {
 		snap.Flaky[k] = v
+	}
+	for k, v := range a.healthAlive {
+		snap.Alive[k] = v
 	}
 	a.healthView.Store(snap)
 }
@@ -1320,6 +1581,19 @@ const (
 	healthTimeoutMS  = 6000
 	healthFailLimit  = 3                // consecutive failures before switching away
 	healthRetryDelay = 30 * time.Second // minimum gap between forced switches
+
+	// aliveFor is how long a successful probe keeps a node eligible for auto-pick.
+	//
+	// The number is not free: it must exceed one full pass of the sweep, or nodes expire
+	// before they are re-checked and the pool drains itself. The arithmetic is
+	//
+	//	3 nodes per pass x 2 targets x 6s worst case = 36s, plus the current node's check
+	//	66 nodes / 3 per pass                   = 22 passes, about 13 minutes worst case
+	//
+	// so this is set well above that worst case and not to a round number that happens to
+	// feel right. Shorter and the pool empties under load; much longer and a node that has
+	// died stays eligible, which is the fault this exists to fix.
+	aliveFor = 20 * time.Minute
 	// Each recent liveness failure adds this to a node's effective latency when
 	// auto-pick ranks candidates.
 	flakyPenaltyMS = 60.0
@@ -1382,9 +1656,23 @@ func (a *App) enforceFastest() (pickResult, bool) {
 		// The snapshot is loaded once per pass, not per node: it is immutable, so
 		// it stays consistent for the whole ranking even if healthLoop publishes a
 		// newer one halfway through.
+		// A node is a candidate only if it answered a probe recently.
+		//
+		// This is the fix for the reported outage. MeasuredMS and the "323ms" in the node
+		// name are written by a scan and then never revisited; the pool held 66 entries
+		// and most of them timed out on every target while the ranking went on treating
+		// their scan-time numbers as current. Ranking chose the fastest of a list of dead
+		// nodes, switched onto it, and the health loop switched away - repeatedly, which
+		// the user saw as every optimised node failing at once.
+		//
+		// A measurement is a statement about the past. Aliveness is a statement about now,
+		// and only the second one can be acted on.
 		if h := a.HealthView(); h != nil {
 			if at, bad := h.Banned[p.Name]; bad && time.Since(at) < 2*time.Minute {
 				continue // found dead moments ago, do not rank it at all
+			}
+			if at, ok := h.Alive[p.Name]; !ok || time.Since(at) > aliveFor {
+				continue // never confirmed, or not confirmed recently enough
 			}
 			ms += float64(h.Flaky[p.Name]) * flakyPenaltyMS
 		}
@@ -1393,7 +1681,15 @@ func (a *App) enforceFastest() (pickResult, bool) {
 		}
 	}
 	if bestMS == 0 {
-		a.pickDebug(2, "no node has a usable measurement")
+		// Nothing has been confirmed alive yet - which is the state of the program for the
+		// first seconds after a start, and after a subscription change before the first
+		// sweep has covered anything.
+		//
+		// Staying put is the correct answer, not guessing. The health loop is sweeping the
+		// pool and will confirm nodes within a pass or two, and until then the node in use
+		// is the one the user has, which is a better bet than one this program has no
+		// current evidence for.
+		a.pickDebug(2, "no node has been confirmed alive recently; waiting for a sweep")
 		return pickResult{}, false
 	}
 
@@ -1786,10 +2082,28 @@ func (a *App) Status() map[string]interface{} {
 	}
 
 	list := make([]map[string]interface{}, 0, len(all))
+	aliveView := a.HealthView()
+	aliveCount := 0
 	for _, n := range all {
 		delay := 0
 		if p, ok := proxies[n.Name]; ok {
 			delay = p.Delay
+		}
+		// Whether this node has proved it can carry traffic recently, and how long ago.
+		//
+		// A scan writes a number into a node's name and nothing revisits it, so the list
+		// could show sixty nodes all described by measurements taken hours earlier - and
+		// the user asked, reasonably, why so many of them did not work. The list now says
+		// which ones have answered, so that is visible instead of having to be inferred
+		// from the program repeatedly switching away from them.
+		alive := false
+		aliveAgo := 0
+		if aliveView != nil {
+			if at, ok := aliveView.Alive[n.Name]; ok && time.Since(at) <= aliveFor {
+				alive = true
+				aliveAgo = int(time.Since(at).Seconds())
+				aliveCount++
+			}
 		}
 		list = append(list, map[string]interface{}{
 			"name":      n.Name,
@@ -1800,6 +2114,8 @@ func (a *App) Status() map[string]interface{} {
 			"delay":     delay,
 			"active":    n.Name == current,
 			"optimized": optimizedNames[n.Name],
+			"alive":     alive,
+			"aliveAgo":  aliveAgo,
 		})
 	}
 
@@ -1831,6 +2147,10 @@ func (a *App) Status() map[string]interface{} {
 		"nodeCount":  len(list),
 		"optCount":   len(optimized),
 		"baseCount":  len(base),
+		// How much of the optimised pool has actually answered recently. The interface
+		// says this, because "63 optimised nodes" when four of them work is a statement
+		// that misleads more than it informs.
+		"aliveCount": aliveCount,
 		// Whether the stored optimisation still describes the current subscription.
 		// A stale list is a real condition after a subscription change, and the
 		// interface can say so instead of silently showing nodes that are gone.
@@ -1986,6 +2306,30 @@ func (a *App) StartOptimize() bool {
 		a.userPicked = ""
 		a.userPickedAt = time.Time{}
 		a.mu.Unlock()
+		// A scan that just finished is evidence, and it was being thrown away.
+		//
+		// The optimiser only keeps an edge that completed a real WebSocket upgrade and
+		// carried a real response through it, seconds ago. That is a stronger statement
+		// than any health probe, and yet the pool sweep started from nothing and had to
+		// rediscover it three nodes at a time - so for the first minutes after a scan
+		// auto-pick had nothing it was allowed to choose and reported "no node has been
+		// confirmed alive recently; waiting for a sweep" while the machine sat on
+		// whatever node it had.
+		//
+		// The nodes the scan just proved are recorded as alive. They will be re-probed by
+		// the sweep like everything else, so a stale entry cannot survive; this only
+		// removes the blind period at the start.
+		a.mu.Lock()
+		if a.healthAlive == nil {
+			a.healthAlive = map[string]time.Time{}
+		}
+		for _, n := range best {
+			a.healthAlive[n.Name] = time.Now()
+		}
+		a.publishHealth()
+		a.mu.Unlock()
+		Log("optimize: %d node(s) recorded as verified by the scan itself", len(best))
+
 		_ = a.store.SetLastOptimize(time.Now())
 		a.lastErr = ""
 		Log("optimize done: stored %d optimised nodes, showing %d, current=%s",
