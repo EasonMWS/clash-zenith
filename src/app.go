@@ -800,8 +800,27 @@ func (a *App) noteCoreCameUp() {
 // scheduled subscription refresh and scheduled optimisation.
 func (a *App) background() {
 	started := time.Now()
+	// These are deliberately local and start at now, not from the stored timestamps.
+	//
+	// A stored "last run" can be in the future after the system clock moves backwards -
+	// which is what a time-zone or date change does - and every scheduled action here is
+	// gated on time.Now().After(due). A future due never arrives, so scheduling would stop
+	// silently and stay stopped. Measured after a time-zone change: the stored lastOptimize
+	// read 2026-10-15T10:31:50 while the clock read 2026-10-15T01:17, nine hours ahead.
+	//
+	// Seeding from now costs one run of each action shortly after a launch, which is the
+	// conservative direction: a refresh happens slightly early instead of never.
 	lastSub := time.Now()
 	lastOpt := time.Now()
+	if stored := a.store.LastOptimize(); !stored.IsZero() {
+		if t, clamped := clampFutureTime(stored); clamped {
+			Log("the stored optimisation time (%s) is in the future; the system clock has "+
+				"moved backwards, so scheduling treats it as due now rather than waiting "+
+				"for a moment that may be hours away", stored.Format(time.RFC3339), "WARN")
+		} else {
+			lastOpt = t
+		}
+	}
 	// Latch on whether the proxy is ALREADY ours at startup, rather than
 	// assuming it is not. A normal shutdown hands the registry back or turns it
 	// off, so on the next launch it must be taken again - but if a previous
@@ -949,6 +968,32 @@ func (a *App) background() {
 			}
 		}
 	}
+}
+
+// clampFutureTime reports whether a stored timestamp is in the future, and returns a
+// usable replacement.
+//
+// The system clock is not monotonic. Changing the time zone, changing the date, or a
+// virtual machine being restored from a snapshot can all move it backwards, and a stored
+// "last run" timestamp then sits ahead of now. Every scheduled action is gated on
+// time.Now().After(due), which can never become true while due is in the future - so
+// scheduling stops silently and stays stopped until the clock catches up.
+//
+// Measured, after a time-zone change: lastOptimize was 2026-10-15T10:31:50 while the clock
+// read 2026-10-15T01:17, so the next optimisation was due in nine hours and the automatic
+// refresh had stopped without saying anything. Nothing in the log recorded it, because
+// nothing had failed - the check simply never passed.
+//
+// The correction is to treat a future timestamp as "this has not run recently", which is
+// the conservative reading: it allows one run now rather than suppressing runs for hours.
+func clampFutureTime(t time.Time) (time.Time, bool) {
+	if t.IsZero() {
+		return t, false
+	}
+	if t.After(time.Now()) {
+		return time.Time{}, true
+	}
+	return t, false
 }
 
 // pickDebug records why auto-pick declined to act, and keeps it in the log at a

@@ -5390,3 +5390,72 @@ func TestAFailedNodeSearchLeavesTheTunnelWhereItWas(t *testing.T) {
 		t.Error("the restore is not on the give-up path")
 	}
 }
+
+// ---- the system clock is not monotonic ------------------------------------
+
+func TestAStoredTimeInTheFutureDoesNotStopScheduling(t *testing.T) {
+	// Measured after the user changed their time zone: the stored lastOptimize read
+	// 2026-10-15T10:31:50 while the clock read 2026-10-15T01:17 - nine hours ahead.
+	//
+	// Every scheduled action is gated on time.Now().After(due), and a future due never
+	// arrives, so scheduling stops silently and stays stopped until the clock catches up.
+	// Nothing in the log recorded it, because nothing had failed: the check simply never
+	// passed, which is the hardest kind of fault to notice.
+	//
+	// A time zone, a date change, or a virtual machine restored from a snapshot can all
+	// move the clock backwards. The correction treats a future timestamp as "has not run
+	// recently", which costs one early run instead of suppressing runs for hours.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "func clampFutureTime(t time.Time) (time.Time, bool)") {
+		t.Fatal("nothing detects a stored time that is ahead of the clock")
+	}
+	// The background loop must use it, and must say so when it does.
+	if !strings.Contains(text, "if t, clamped := clampFutureTime(stored); clamped {") {
+		t.Error("the scheduling loop does not check the stored time")
+	}
+	if !strings.Contains(text, "the system clock has") || !strings.Contains(text, "moved backwards") {
+		t.Error("a backwards clock change is not reported, so it would look like the " +
+			"scheduled action silently stopped")
+	}
+
+	// The conservative reading: an unreadable value means "has not run", not "ran just now".
+	store, err := os.ReadFile("store.go")
+	if err != nil {
+		t.Skipf("store.go is not readable: %v", err)
+	}
+	st := string(store)
+	if !strings.Contains(st, "func (s *Store) LastOptimize() time.Time") {
+		t.Fatal("there is no accessor for the stored optimisation time")
+	}
+	i := strings.Index(st, "func (s *Store) LastOptimize() time.Time")
+	body := st[i:]
+	if end := strings.Index(body, "\n}\n"); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "return time.Time{}") {
+		t.Error("an unreadable stored time does not fall back to the zero time, so a " +
+			"corrupt value could suppress scheduling")
+	}
+}
+
+func TestClampFutureTime(t *testing.T) {
+	future := time.Now().Add(4 * time.Hour)
+	if _, clamped := clampFutureTime(future); !clamped {
+		t.Error("a time four hours ahead was not detected")
+	}
+	// A moment ago must be left alone: it is the normal case and clamping it would reset
+	// the interval on every launch.
+	past := time.Now().Add(-5 * time.Minute)
+	if got, clamped := clampFutureTime(past); clamped || !got.Equal(past) {
+		t.Error("a past time was clamped, which would restart the interval every launch")
+	}
+	// The zero time is "never", not "in the future".
+	if got, clamped := clampFutureTime(time.Time{}); clamped || !got.IsZero() {
+		t.Error("the zero time was treated as being in the future")
+	}
+}

@@ -732,6 +732,26 @@ func (s *Store) SetLastOptimize(t time.Time) error {
 	return s.saveLocked()
 }
 
+// LastOptimize returns when the last optimisation finished, or the zero time when it has
+// never run or the stored value cannot be read.
+//
+// The zero time is the answer for an unreadable value on purpose: callers treat "no
+// record" as "has not run", which is the safe reading when the alternative is suppressing
+// a scheduled action for hours.
+func (s *Store) LastOptimize() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	raw := s.state.LastOptimize
+	if raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // ---------------------------------------------------------------------------
 // small helpers shared by the rest of the program
 // ---------------------------------------------------------------------------
