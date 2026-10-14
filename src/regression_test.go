@@ -5316,3 +5316,77 @@ func TestANodeReportedDeadByTheCoreCanStillBeChosen(t *testing.T) {
 		t.Error("the candidate is tested before it is selected, which cannot exercise it")
 	}
 }
+
+// ---- the two questions must not share one number --------------------------
+
+func TestTheSlownessBarIsNotFedTheRealTrafficFigure(t *testing.T) {
+	// Measured on the same node, moments apart:
+	//
+	//   real traffic through the tunnel   1537, 1389, 1483, 1640, 1485, 1503, 1955, 1238 ms
+	//   the core's /delay endpoint        238, 256, 304 ms
+	//
+	// The difference is about 1200ms and it is the tunnel's own cost, not the node's speed.
+	// The slowness bar is 1200ms and was set while the endpoint's number was in use. Once
+	// liveness moved to real traffic, every measurement of a healthy node read as "too
+	// slow", so the program moved off every node in turn - reported by the user as the
+	// connection changing by itself, over and over:
+	//
+	//   21:51:18  health: "优选01" measured 1678ms which is over the 1200ms bar; switching
+	//   21:55:41  health: "兜底"  measured 1427ms which is over the 1200ms bar; switching back
+	//   21:56:30  health: "优选01" measured 2821ms which is over the 1200ms bar; switching
+	//
+	// Liveness and speed are answers to different questions and must not share one number.
+	// Liveness is real traffic, because that is what "can this node carry anything" means.
+	// Speed is the endpoint, because that is the number that isolates the node from the
+	// tunnel.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	if !strings.Contains(text, "func (a *App) nodeSpeedMS(name string, realTrafficMS int) int") {
+		t.Fatal("the slowness bar is still fed whatever the liveness probe returned")
+	}
+	// The health path must route through it.
+	if !strings.Contains(text, "a.reactToSlowness(current, float64(a.nodeSpeedMS(current, delay)))") {
+		t.Error("the health loop calls reactToSlowness with the raw real-traffic figure")
+	}
+	// And it must prefer the core's endpoint, which is the comparable number.
+	i := strings.Index(text, "func (a *App) nodeSpeedMS(")
+	body := text[i:]
+	if end := strings.Index(body, "\nfunc "); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "a.coreDelay(name, healthTimeoutMS)") {
+		t.Error("the bar is not fed the core's own measurement of the node")
+	}
+	if !strings.Contains(body, "tunnelOverheadMS") {
+		t.Error("the fallback does not account for the tunnel's own cost, so an endpoint " +
+			"failure would read as a slow node")
+	}
+	if !strings.Contains(text, "tunnelOverheadMS = 1200") {
+		t.Error("the measured overhead is not recorded")
+	}
+}
+
+func TestAFailedNodeSearchLeavesTheTunnelWhereItWas(t *testing.T) {
+	// The search tests candidates by using them - that is the only way to test a node for
+	// real - so it leaves PROXY on whichever one it tried last. If every candidate fails,
+	// the tunnel is left pointing at a node that just failed its own real-traffic test,
+	// which is worse than the node it replaced and is a change the user never asked for.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, `if err := a.core.Select("PROXY", current); err == nil {`)
+	if i < 0 {
+		t.Fatal("a failed candidate search does not put the previous node back")
+	}
+	// It must be inside the give-up branch, before the re-optimise.
+	j := strings.Index(text, "no alternative is known-good; will re-optimise")
+	if j < 0 || i > j {
+		t.Error("the restore is not on the give-up path")
+	}
+}

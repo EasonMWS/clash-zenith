@@ -966,6 +966,28 @@ func (a *App) pickDebug(code int, format string, args ...interface{}) {
 	}
 }
 
+// nodeSpeedMS returns the number the slowness bar should be compared against.
+//
+// The core's endpoint is preferred because it measures the node rather than the node plus
+// the tunnel. When it cannot answer - which it often cannot, see the notes on
+// healthProbeThroughTunnel - the real-traffic figure is used, but only scaled down by the
+// tunnel's own cost, so a bad number from a working endpoint cannot masquerade as a fast
+// node.
+func (a *App) nodeSpeedMS(name string, realTrafficMS int) int {
+	if d, err := a.coreDelay(name, healthTimeoutMS); err == nil && d > 0 {
+		return d
+	}
+	if realTrafficMS <= 0 {
+		return 0
+	}
+	// The tunnel costs roughly this much on this machine; it is subtracted so the
+	// fallback is comparable with the endpoint's number rather than with a raw round trip.
+	if realTrafficMS > tunnelOverheadMS {
+		return realTrafficMS - tunnelOverheadMS
+	}
+	return realTrafficMS
+}
+
 // reactToSlowness moves off a node whose measured round trip has degraded.
 //
 // Ranking alone cannot catch this. Auto-pick compares nodes against each other,
@@ -1143,7 +1165,23 @@ func (a *App) healthCheck() {
 		// while its real round trip degrades several times over, and ranking by
 		// numbers measured half an hour ago will not notice. This is the check
 		// that turns "delayed" into "switched".
-		a.reactToSlowness(current, float64(delay))
+		// The slowness decision uses a different measurement from the liveness one, because
+		// they are answers to different questions.
+		//
+		// Measured on the same node, moments apart:
+		//
+		//	real traffic through the tunnel   1537, 1389, 1483, 1640, 1485, 1503, 1955, 1238 ms
+		//	the core's /delay endpoint        238, 256, 304 ms
+		//
+		// The difference is about 1200ms and it is the tunnel's own cost, not the node's speed.
+		// Feeding the first number to a bar set while the second was in use meant almost every
+		// measurement read as "too slow", so the program moved off every node in turn - which
+		// the user saw as the connection changing on its own, over and over.
+		//
+		// So: liveness is decided by real traffic, because that is what "can this node carry
+		// anything" means. Slowness is decided by the endpoint, because that is the number that
+		// isolates the node from the tunnel. A node that is genuinely slow shows up in both.
+		a.reactToSlowness(current, float64(a.nodeSpeedMS(current, delay)))
 		return
 	}
 
@@ -1271,6 +1309,15 @@ func (a *App) healthCheck() {
 		}
 	}
 	if next == "" {
+		// The search tested candidates by using them, so it left PROXY on whichever one it
+		// tried last. Put it back before giving up.
+		//
+		// Measured: without this, a failed search could leave the tunnel pointing at a node
+		// that had just failed its own real-traffic test - which is worse than the node it
+		// replaced, and is a change the user never asked for and cannot explain.
+		if err := a.core.Select("PROXY", current); err == nil {
+			a.core.CloseConnections()
+		}
 		Log("health: %q is dead but no alternative is known-good; will re-optimise", current, "WARN")
 		a.mu.Lock()
 		a.healthLastEv = "current node dead, no alternative available"
@@ -1682,6 +1729,15 @@ const (
 	healthTimeoutMS  = 6000
 	healthFailLimit  = 3                // consecutive failures before switching away
 	healthRetryDelay = 30 * time.Second // minimum gap between forced switches
+
+	// tunnelOverheadMS is roughly what the tunnel itself adds to a round trip, measured
+	// rather than assumed. On the same node, moments apart: real traffic through the tunnel
+	// took 1238-1955ms while the core's own probe of that node took 238-304ms.
+	//
+	// Two questions were being answered with one number, and the bar had been set for the
+	// smaller one - so once liveness moved to real traffic, almost every measurement read as
+	// "too slow" and the program moved off every node in turn.
+	tunnelOverheadMS = 1200
 
 	// aliveFor is how long a successful probe keeps a node eligible for auto-pick.
 	//
