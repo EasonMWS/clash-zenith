@@ -71,15 +71,34 @@ dns:
   proxy-server-nameserver: [223.5.5.5, 119.29.29.29]
   # Chinese domains go to a Chinese resolver, which is correct and fast for them.
   nameserver: [223.5.5.5, 119.29.29.29]
-  # Everything else is resolved through the proxy. This is the only reliable
-  # route: Chinese resolvers return poisoned answers for foreign domains, and
-  # the public resolvers that would answer correctly are unreachable from here
-  # (1.1.1.1 times out on port 53 entirely). The bootstrap below resolves the
-  # DoH hostnames through the same clean Chinese resolvers, so the first query
-  # cannot deadlock.
+  # Everything else is resolved through the proxy, because a Chinese resolver returns
+  # poisoned answers for foreign domains and the tunnel needs the real address to reach
+  # them.
+  #
+  # The DoH endpoints must be ones the tunnel can actually reach. Measured, through the
+  # running tunnel:
+  #
+  #   cloudflare-dns.com   CONNECT 200, then SSLEOFError
+  #   1.1.1.1              CONNECT 200, then SSLEOFError
+  #   8.8.8.8              CONNECT 200, then SSLEOFError
+  #   dns.google           CONNECT 200, then SSLEOFError
+  #   dns.alidns.com       TLS 1.3, 195ms
+  #   doh.pub              TLS 1.2, 211ms
+  #
+  # The public resolvers are blocked, and the CONNECT succeeding while the handshake dies
+  # is what made this hard to see: the tunnel agrees to carry the connection and then
+  # something on the far side cuts it. With the previous pair every foreign lookup failed,
+  # and the visible symptom was not "DNS is broken" but 502 Bad Gateway from the core,
+  # because a request whose destination cannot be resolved is a request the proxy cannot
+  # make.
+  #
+  # Chinese DoH endpoints are used through the proxy rather than Chinese plain DNS for the
+  # same reason as before: the query is encrypted end to end, so what the local network can
+  # see is a TLS stream to a Cloudflare-fronted host, and what answers is a resolver the
+  # tunnel can reach.
   nameserver-policy:
     'geosite:cn,private': [223.5.5.5, 119.29.29.29]
-    'geosite:geolocation-!cn': ['https://1.1.1.1/dns-query#PROXY', 'https://8.8.8.8/dns-query#PROXY']
+    'geosite:geolocation-!cn': ['https://dns.alidns.com/dns-query#PROXY', 'https://doh.pub/dns-query#PROXY']
   fallback: [223.5.5.5, 119.29.29.29]
   fallback-filter:
     geoip: true
