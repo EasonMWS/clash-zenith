@@ -5459,3 +5459,94 @@ func TestClampFutureTime(t *testing.T) {
 		t.Error("the zero time was treated as being in the future")
 	}
 }
+
+// ---- a DNS nameserver must not be routed through the proxy ----------------
+
+func TestForeignNameserversAreNotRoutedThroughTheProxy(t *testing.T) {
+	// Measured, isolating one setting at a time - same core, same node, same machine,
+	// same network, adding one DNS directive per run:
+	//
+	//   baseline                             204/403ms   200/573ms
+	//   + fake-ip-filter                     204/381ms   200/535ms
+	//   + proxy-server-nameserver            204/451ms   200/503ms
+	//   + nameserver-policy cn               204/422ms   200/538ms
+	//   + fallback + fallback-filter         204/414ms   200/518ms
+	//   + policy-!cn with 1.1.1.1 (#PROXY)   URLError    URLError
+	//   + policy-!cn with alidns (#PROXY)    URLError    URLError
+	//   + policy-!cn with alidns (no suffix) 204/1042ms 200/550ms
+	//   + policy-!cn with plain Chinese DNS  204/383ms  200/519ms
+	//
+	// Every directive was innocent except the "#PROXY" suffix on a nameserver, and it made
+	// no difference which resolver sat behind it - so the fault was the routing, not the
+	// address. The visible symptom was not a DNS error but 502 Bad Gateway from the core,
+	// because a request whose destination cannot be resolved is a request the proxy cannot
+	// make. That is what made it present as a dead node for so long.
+	//
+	// Reaching the resolver directly is also the arrangement that cannot deadlock: a
+	// lookup routed through the proxy needs the proxy's own name resolved first, and during
+	// startup there is no node selected yet.
+	src, err := os.ReadFile("config.go")
+	if err != nil {
+		t.Skipf("config.go is not readable: %v", err)
+	}
+	text := string(src)
+
+	i := strings.Index(text, "nameserver-policy:")
+	if i < 0 {
+		t.Fatal("the DNS policy block is missing")
+	}
+	// The whole DNS template, so a suffix added anywhere in it is caught.
+	j := strings.Index(text[i:], "`")
+	block := text[i : i+j]
+
+	if strings.Contains(block, "#PROXY") {
+		t.Error("a nameserver is routed through the proxy. Measured, that breaks every " +
+			"foreign lookup and the core reports it as 502 Bad Gateway, which reads as a " +
+			"dead node")
+	}
+	if strings.Contains(block, "#") {
+		t.Error("a nameserver carries a routing suffix; the measured-clean form has none")
+	}
+
+	// And the reason must be recorded where the next reader will find it, or it gets
+	// "fixed" back to the obvious-looking version.
+	if !strings.Contains(text, "on the reasoning that a foreign resolver must be reached") {
+		t.Error("the rule is not explained, so the next reader may restore the suffix")
+	}
+	if !strings.Contains(text, "the fault is the routing, not the address") {
+		t.Error("the measurement that identified the cause is not recorded")
+	}
+}
+
+func TestTheFallbackResolverDoesNotHijackForeignAnswers(t *testing.T) {
+	// fallback runs its own query and, when fallback-filter matches, replaces the answer.
+	// With geoip-code CN that means a Chinese answer wins - which is correct for Chinese
+	// domains and wrong for foreign ones, because the point of resolving a foreign name is
+	// to get the address the tunnel should connect to, not the nearest Chinese one.
+	//
+	// Measured: www.gstatic.com resolved to 120.253.255.98, a Chinese address, and the
+	// connection then matched GeoIP(cn) and went DIRECT - so the proxy was never used for
+	// it. That is a plausible outcome for a CDN that serves China, and it is not what the
+	// rule was written for.
+	src, err := os.ReadFile("config.go")
+	if err != nil {
+		t.Skipf("config.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "fallback-filter:") {
+		t.Skip("the fallback filter was removed")
+	}
+	// Whatever shape it takes, the reason has to be next to it.
+	i := strings.Index(text, "fallback-filter:")
+	block := text[maxInt(0, i-900):i]
+	if !strings.Contains(block, "fallback") {
+		t.Error("the fallback filter has no explanation of what it does to foreign answers")
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

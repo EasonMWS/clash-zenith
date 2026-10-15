@@ -71,34 +71,38 @@ dns:
   proxy-server-nameserver: [223.5.5.5, 119.29.29.29]
   # Chinese domains go to a Chinese resolver, which is correct and fast for them.
   nameserver: [223.5.5.5, 119.29.29.29]
-  # Everything else is resolved through the proxy, because a Chinese resolver returns
-  # poisoned answers for foreign domains and the tunnel needs the real address to reach
-  # them.
+  # Foreign names are resolved by Chinese DoH endpoints, reached directly rather than
+  # through the proxy.
   #
-  # The DoH endpoints must be ones the tunnel can actually reach. Measured, through the
-  # running tunnel:
+  # The "#PROXY" suffix on a nameserver means "send this lookup through the proxy". It was
+  # there from the beginning on the reasoning that a foreign resolver must be reached
+  # through the tunnel. Measured, it is what broke everything.
   #
-  #   cloudflare-dns.com   CONNECT 200, then SSLEOFError
-  #   1.1.1.1              CONNECT 200, then SSLEOFError
-  #   8.8.8.8              CONNECT 200, then SSLEOFError
-  #   dns.google           CONNECT 200, then SSLEOFError
-  #   dns.alidns.com       TLS 1.3, 195ms
-  #   doh.pub              TLS 1.2, 211ms
+  # Isolated with one variable at a time - same core, same node, same machine, same
+  # network, adding one DNS setting per run:
   #
-  # The public resolvers are blocked, and the CONNECT succeeding while the handshake dies
-  # is what made this hard to see: the tunnel agrees to carry the connection and then
-  # something on the far side cuts it. With the previous pair every foreign lookup failed,
-  # and the visible symptom was not "DNS is broken" but 502 Bad Gateway from the core,
-  # because a request whose destination cannot be resolved is a request the proxy cannot
-  # make.
+  #   baseline                            204/403ms   200/573ms
+  #   + fake-ip-filter                    204/381ms   200/535ms
+  #   + proxy-server-nameserver           204/451ms   200/503ms
+  #   + nameserver-policy cn              204/422ms   200/538ms
+  #   + fallback + fallback-filter        204/414ms   200/518ms
+  #   + policy-!cn with 1.1.1.1 (#PROXY)  URLError    URLError
+  #   + policy-!cn with alidns (#PROXY)   URLError    URLError
+  #   + policy-!cn with alidns (no suffix) 204/1042ms 200/550ms
+  #   + policy-!cn with plain Chinese DNS  204/383ms  200/519ms
   #
-  # Chinese DoH endpoints are used through the proxy rather than Chinese plain DNS for the
-  # same reason as before: the query is encrypted end to end, so what the local network can
-  # see is a TLS stream to a Cloudflare-fronted host, and what answers is a resolver the
-  # tunnel can reach.
+  # Every setting was innocent except that one suffix, and it made no difference which
+  # resolver sat behind it - so the fault is the routing, not the address. The visible
+  # symptom was not a DNS error but 502 Bad Gateway from the core, because a request whose
+  # destination cannot be resolved is a request the proxy cannot make. That is why this
+  # took so long to find: it presents as a dead node.
+  #
+  # Reaching the resolver directly is also the better arrangement. A lookup routed through
+  # the proxy needs the proxy's own name resolved first, and during startup - before any
+  # node is selected - that is a circle with nothing to break it.
   nameserver-policy:
     'geosite:cn,private': [223.5.5.5, 119.29.29.29]
-    'geosite:geolocation-!cn': ['https://dns.alidns.com/dns-query#PROXY', 'https://doh.pub/dns-query#PROXY']
+    'geosite:geolocation-!cn': ['https://dns.alidns.com/dns-query', 'https://doh.pub/dns-query']
   fallback: [223.5.5.5, 119.29.29.29]
   fallback-filter:
     geoip: true
