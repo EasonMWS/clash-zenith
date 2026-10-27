@@ -218,6 +218,52 @@ func (a *App) serviceStartRequest(cfg []byte, mode TunMode) error {
 	return nil
 }
 
+// serviceRemoveAdapter asks the service to remove the virtual adapter.
+//
+// The service is the only process in this program that can: removing a network
+// adapter needs administrator rights, and the interface runs as an ordinary user.
+// Measured, with the tunnel up and an ordinary-user interface process:
+//
+//	pnputil /remove-device SWD\Wintun\{...}  -> Failed to remove device: Access is denied
+//	Disable-NetAdapter -Name Zenith          -> Access is denied
+//
+// so the removal has to happen here, in the process that already has the rights.
+func (a *App) serviceRemoveAdapter(name string) error {
+	body, err := json.Marshal(map[string]interface{}{"name": name})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, serviceBaseURL()+"/tun/remove", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Zenith-Secret", a.secret)
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("无法连接 Zenith 服务：%v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Zenith 服务返回 %d：%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var out struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return fmt.Errorf("Zenith 服务的回应无法解析：%v", err)
+	}
+	if !out.OK {
+		if out.Error == "" {
+			out.Error = "服务没有说明原因"
+		}
+		return fmt.Errorf("%s", out.Error)
+	}
+	return nil
+}
+
 // serviceStopRequest asks the service to stop the core it owns.
 func (a *App) serviceStopRequest() error {
 	req, err := http.NewRequest(http.MethodPost, serviceBaseURL()+"/core/stop", nil)
@@ -373,6 +419,9 @@ func (h *serviceHandler) routes() *http.ServeMux {
 	mux.HandleFunc("/core/start", h.auth(h.handleStart))
 	mux.HandleFunc("/core/stop", h.auth(h.handleStop))
 	mux.HandleFunc("/core/state", h.auth(h.handleState))
+	// Removing the virtual adapter needs administrator rights, and the process
+	// that runs the rest of the program does not have them - only this one does.
+	mux.HandleFunc("/tun/remove", h.auth(h.handleRemoveAdapter))
 	return mux
 }
 
@@ -456,6 +505,46 @@ func (h *serviceHandler) handleState(w http.ResponseWriter, r *http.Request) {
 	// and the question being asked is what is running now.
 	st.CorePID = h.app.core.Pid()
 	writeJSON(w, 200, st)
+}
+
+// handleRemoveAdapter removes the virtual adapter, which only this process can do.
+//
+// Measured, and it is why this endpoint exists: with the tunnel up, clicking
+// "关闭 TUN" failed with
+//
+//	删除网卡 "Zenith" 的命令返回成功，但网卡仍然存在
+//
+// and the underlying commands both said "Access is denied":
+//
+//	pnputil /remove-device SWD\Wintun\{...}   -> Failed to remove device
+//	Disable-NetAdapter -Name Zenith           -> Access is denied
+//
+// The removal runs in the interface's process, which is an ordinary user; creating
+// and removing a network adapter needs administrator rights. Enabling TUN worked
+// because it goes through this service, and disabling did not because it did not -
+// the two halves of the feature ran with different rights and nobody had noticed.
+//
+// So the service does the removal, since it is the process that already has the
+// rights and already owns the core that created the adapter.
+func (h *serviceHandler) handleRemoveAdapter(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{"ok": false, "error": "需要 POST"})
+		return
+	}
+	body := readBody(r)
+	name := asString(body["name"])
+	if name == "" {
+		name = h.app.store.Settings().NormalizedTunDevice()
+	}
+	// removeTunAdapter refuses any name but this program's own, so asking the
+	// service for an arbitrary adapter is not possible through this route.
+	if err := removeTunAdapter(name); err != nil {
+		Log("service: could not remove adapter %q: %v", name, err, "ERR")
+		writeJSON(w, 200, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	Log("service: adapter %q removed", name)
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "removed": name})
 }
 
 // serviceStartCore writes the configuration and starts the core, as the owner.

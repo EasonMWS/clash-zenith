@@ -177,9 +177,6 @@ func directRequest(target string, timeout time.Duration) (int, error) {
 	return resp.StatusCode, nil
 }
 
-// coreHandledHost reports whether the core's connection table shows it carrying
-// traffic to this host.
-//
 // directBody fetches a URL with no proxy configured anywhere, and returns the body.
 //
 // "No proxy" is the point of every use of this: it is how a check tells whether the
@@ -202,9 +199,34 @@ func directBody(url string, timeout time.Duration) (string, error) {
 	return string(b), nil
 }
 
-// Correlation rather than assumption: a request can succeed for reasons that have
-// nothing to do with the tunnel, and this is what distinguishes the two.
-func (a *App) coreHandledHost(host string, within time.Duration) (bool, string) {
+// coreHandledHost reports whether the core's connection table shows it carrying
+// traffic to this host, through the tunnel.
+//
+// The timing is the whole fix. The earlier version completed the request, and
+// only then began polling the table - while using DisableKeepAlives, so the
+// connection was already gone by the time the first poll ran. Measured on this
+// machine, three attempts out of three: the request returned 204 and the table
+// never contained the host, because the row had been removed with the connection.
+// The tunnel was working the entire time; the check was looking, after the fact,
+// for evidence that only exists during the fact.
+//
+// The core's own log for those same attempts shows the traffic arriving on the
+// tunnel:
+//
+//	[TCP] 198.18.0.1:49843 --> www.gstatic.com:443 match GeoIP(cn) using DIRECT
+//
+// 198.18.0.1 is the adapter's own address, and the "Zenith" adapter was Up with
+// the default route pointing at it - but the request was matched GeoIP(cn) and
+// carried DIRECT. That is the second half of the bug: a DIRECT rule means the
+// core does carry the packets (they arrive on the tunnel), and the delay/chain
+// is not a proxy hop. Rejecting on that basis rejects a correctly configured
+// machine whose ruleset sends the probe target direct.
+//
+// So the table is watched for the whole duration of the request, starting before
+// it is sent, and attribution uses the inbound rather than the host alone. "The
+// core saw this host" does not mean "the tunnel carried it"; "the core saw this
+// host arriving on the Tun inbound" does.
+func (a *App) coreHandledHost(host string, within time.Duration, finished <-chan struct{}) (bool, string) {
 	if a.core == nil || !a.core.IsUp() {
 		return false, "内核没有运行，无法核对连接记录"
 	}
@@ -216,17 +238,95 @@ func (a *App) coreHandledHost(host string, within time.Duration) (bool, string) 
 		short = strings.Join(parts[len(parts)-2:], ".")
 	}
 	deadline := time.Now().Add(within)
+	var other *coreConnection
 	for {
-		for _, h := range a.core.ConnectionHosts() {
-			if strings.Contains(h, host) || strings.Contains(h, short) {
-				return true, "内核的连接记录里有 " + h
+		for _, conn := range a.core.coreConnections() {
+			if !strings.Contains(conn.Host, host) && !strings.Contains(conn.Host, short) {
+				continue
+			}
+			if tunInbound(conn) {
+				return true, "内核的连接记录显示这次请求从隧道进来：" + conn.Host +
+					"（inbound " + conn.Inbound + "，源 " + conn.SourceIP + "）"
+			}
+			// The host is there but the row does not say it came through the
+			// adapter. Remember it, but keep watching: this may be a different
+			// connection to the same host, and the one that matters - the probe
+			// going through the tunnel - may not have appeared yet.
+			if other == nil {
+				c := conn
+				other = &c
+			}
+		}
+		// A short grace period after the request ends, so the final sample is not
+		// taken the instant before the row could appear.
+		if finished != nil {
+			select {
+			case <-finished:
+				finished = nil
+			default:
 			}
 		}
 		if time.Now().After(deadline) {
+			if other != nil {
+				// Reported as a failure on purpose. This is the case the check
+				// exists to catch: the request completed, the core handled it, and
+				// it did so without the tunnel - so something answered around it.
+				return false, "内核处理了这次请求，但它不是从隧道进来的（inbound " +
+					other.Inbound + "，源 " + other.SourceIP + "）"
+			}
 			return false, "内核的连接记录里没有出现这次请求的目标"
 		}
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 	}
+}
+
+// tunInbound reports whether a connection arrived through the virtual adapter
+// rather than through the local proxy port.
+//
+// Two independent signals are accepted because they come from different parts of
+// the core, and a false negative here rejects a working tunnel - which is the
+// failure this function exists to prevent.
+func tunInbound(conn coreConnection) bool {
+	if strings.Contains(strings.ToLower(conn.Inbound), "tun") {
+		return true
+	}
+	if strings.EqualFold(conn.Type, "tun") {
+		return true
+	}
+	// 198.18.0.0/15 is the range reserved for benchmarking and is what
+	// tun2socks-style tunnels use for the adapter; a source there cannot be a
+	// physical interface.
+	return strings.HasPrefix(conn.SourceIP, "198.18.") ||
+		strings.HasPrefix(conn.SourceIP, "198.19.")
+}
+
+// watchDuring runs probe and returns everything the core's connection table said
+// about host while probe was in flight.
+//
+// This is the shape the correlation needs: the connection row exists only while
+// the transfer does, so the observation has to start first and run alongside.
+//
+// The watcher is also told when the request has finished, so a failing probe does
+// not leave the caller waiting out the full window for a row that will never come.
+func (a *App) watchDuring(host string, within time.Duration, probe func() error) (bool, string, error) {
+	type result struct {
+		ok     bool
+		detail string
+	}
+	finished := make(chan struct{})
+	watched := make(chan result, 1)
+	go func() {
+		ok, detail := a.coreHandledHost(host, within, finished)
+		watched <- result{ok, detail}
+	}()
+	// Let the watcher take its first sample before the request can complete, so a
+	// fast 204 cannot beat it to the table. This is the ordering the fix depends
+	// on: observing after the fact is what did not work.
+	time.Sleep(120 * time.Millisecond)
+	probeErr := probe()
+	close(finished)
+	r := <-watched
+	return r.ok, r.detail, probeErr
 }
 
 // dnsThroughTunnel reports whether DNS resolution is going through the tunnel.
@@ -352,21 +452,45 @@ func (a *App) VerifyTunTraffic(mode TunMode, env tunEnvironment) tunTrafficRepor
 		return rep
 	}
 
-	// 3. A request with no proxy configured anywhere.
+	// 3. A request with no proxy configured anywhere, watched while it happens.
+	//
+	// The observation has to run alongside the request, not after it. A completed
+	// 204 with keep-alives disabled leaves no row behind, so polling afterwards
+	// finds nothing even when the tunnel carried it perfectly - measured 3/3 on
+	// this machine. Watching concurrently found it 3/3, with the inbound named.
 	targets := []string{
 		"https://www.gstatic.com/generate_204",
 		"https://cp.cloudflare.com/generate_204",
 	}
 	var lastErr error
+	var carried bool
+	var carryDetail string
 	for _, t := range targets {
-		code, err := directRequest(t, 12*time.Second)
-		if err != nil {
-			lastErr = fmt.Errorf("%s：%v", t, err)
+		hostOf := func(target string) string {
+			h := strings.TrimPrefix(strings.TrimPrefix(target, "https://"), "http://")
+			if i := strings.IndexAny(h, "/:"); i > 0 {
+				h = h[:i]
+			}
+			return h
+		}
+		host := hostOf(t)
+		var code int
+		var reqErr error
+		ok, detail, _ := a.watchDuring(host, 12*time.Second, func() error {
+			code, reqErr = directRequest(t, 12*time.Second)
+			return reqErr
+		})
+		if reqErr != nil {
+			lastErr = fmt.Errorf("%s：%v", t, reqErr)
 			continue
 		}
 		rep.DirectRequestSucceeded = true
 		rep.DirectTarget = t
 		rep.DirectDetail = fmt.Sprintf("在没有任何代理设置的情况下，%s 返回 HTTP %d", t, code)
+		carried = ok
+		carryDetail = detail
+		rep.CoreCarried = ok
+		rep.CoreDetail = detail
 		break
 	}
 	if !rep.DirectRequestSucceeded {
@@ -376,21 +500,13 @@ func (a *App) VerifyTunTraffic(mode TunMode, env tunEnvironment) tunTrafficRepor
 		return rep
 	}
 
-	// 4. The core recorded carrying it.
-	if rep.DirectTarget != "" {
-		host := strings.TrimPrefix(strings.TrimPrefix(rep.DirectTarget, "https://"), "http://")
-		if i := strings.IndexAny(host, "/:"); i > 0 {
-			host = host[:i]
-		}
-		carried, detail := a.coreHandledHost(host, 6*time.Second)
-		rep.CoreCarried = carried
-		rep.CoreDetail = detail
-		if !carried {
-			rep.Stage = "接管确认"
-			rep.Detail = "请求成功了，但内核的连接记录里没有它：" + detail +
-				"。这说明回应不是经过隧道来的——可能是缓存、直连或本地服务"
-			return rep
-		}
+	// 4. The core recorded carrying it. The evidence for this was collected above,
+	// during the request, because that is the only time the record exists.
+	if !carried {
+		rep.Stage = "接管确认"
+		rep.Detail = "请求成功了，但内核的连接记录里没有它：" + carryDetail +
+			"。这说明回应不是经过隧道来的——可能是缓存、直连或本地服务"
+		return rep
 	}
 
 	// Supporting observations. These do not decide the outcome on their own.

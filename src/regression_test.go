@@ -3853,18 +3853,80 @@ func TestSystemProxyRefusesWhileTunIsUsing(t *testing.T) {
 	// carries the traffic and the proxy setting has no effect on it - so allowing both
 	// produces a machine where the checkbox says one thing, the routing table says
 	// another, and nothing explains the difference.
-	src, err := os.ReadFile("server.go")
+	//
+	// The rule used to be written down in the interface's handler, and only there.
+	// Measured on this machine with the adapter Up and the default route on it, the
+	// registry proxy was enabled at the same time anyway, because the background loop
+	// and the settings path called Enable without asking. So the decision moved to
+	// enableSystemProxy, and this test now checks two things: that the refusal exists,
+	// and that no other path can reach Enable directly and walk past it.
+	handler, err := os.ReadFile("server.go")
 	if err != nil {
 		t.Skipf("server.go is not readable: %v", err)
 	}
-	text := string(src)
-	if !strings.Contains(text, `"conflict": "tun"`) {
+	hs := string(handler)
+	if !strings.Contains(hs, `"conflict": "tun"`) {
 		t.Error("enabling the system proxy while TUN is on is not refused with a reason " +
 			"the interface can act on")
 	}
-	if !strings.Contains(text, "两者互斥") {
+	// The explanation lives with the decision, so the refusal and the sentence that
+	// explains it cannot drift apart.
+	gate, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	gs := string(gate)
+	if !strings.Contains(gs, "两者互斥") {
 		t.Error("the refusal does not explain the relationship, so a user turning one on " +
 			"is not told what to do about the other")
+	}
+	if !strings.Contains(gs, "func (a *App) enableSystemProxy(") {
+		t.Fatal("there is no single gate for enabling the system proxy, so the rule can " +
+			"be bypassed by whichever caller forgets it")
+	}
+	// The gate has to be the one that decides, not a helper consulted by some
+	// callers: every caller of sysproxy.Enable outside the gate is a hole in the
+	// exclusion. The gate's own body is the one place the call belongs.
+	gateStart := strings.Index(gs, "func (a *App) enableSystemProxy(")
+	gateEnd := len(gs)
+	if gateStart >= 0 {
+		if next := strings.Index(gs[gateStart+1:], "\nfunc "); next > 0 {
+			gateEnd = gateStart + 1 + next
+		}
+	}
+	outside := func(body string) bool {
+		idx := 0
+		for {
+			i := strings.Index(body[idx:], "sysproxy.Enable(")
+			if i < 0 {
+				return false
+			}
+			at := idx + i
+			if at < gateStart || at > gateEnd {
+				return true
+			}
+			idx = at + 1
+		}
+	}
+	for _, f := range []string{"app.go", "server.go", "main.go", "startup.go", "tun.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		body := string(src)
+		if f != "app.go" && strings.Contains(body, "sysproxy.Enable(") {
+			t.Errorf("%s turns the system proxy on without going through "+
+				"enableSystemProxy, so it can produce the both-on state the exclusion "+
+				"forbids", f)
+		}
+		if f == "app.go" && outside(body) {
+			t.Errorf("%s turns the system proxy on outside enableSystemProxy, so it can "+
+				"produce the both-on state the exclusion forbids", f)
+		}
+		if strings.Contains(body, "NewSystemProxy(a.dataDir).Enable(") {
+			t.Errorf("%s turns the system proxy on through a fresh SystemProxy, which "+
+				"never consults the exclusion at all", f)
+		}
 	}
 }
 
@@ -5544,9 +5606,407 @@ func TestTheFallbackResolverDoesNotHijackForeignAnswers(t *testing.T) {
 	}
 }
 
+func TestSettingsRefusesAPortThatCannotBeServed(t *testing.T) {
+	// Measured while testing the interface: a patch of {"mixedPort":99999} was
+	// accepted, answered ok:true, and the value was persisted. The core cannot bind
+	// it - the range ends at 65535 - so the mixed listener did not exist while the
+	// saved configuration said that was the port. With the system proxy enabled that
+	// is a registry entry pointing at nothing: no internet, no explanation.
+	//
+	// The damage is not hypothetical; it was produced here, on purpose, and had to
+	// be undone by hand.
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{dataDir: dir, store: st, configPath: filepath.Join(dir, "config.yaml")}
+	before := st.Settings().MixedPort
+
+	for _, bad := range []interface{}{99999, 0, -1, 70000} {
+		if _, err := a.ApplySettings(map[string]interface{}{"mixedPort": bad}); err == nil {
+			t.Errorf("mixedPort %v was accepted; the core cannot bind it and the system "+
+				"proxy would point at a port nobody serves", bad)
+		}
+		if got := st.Settings().MixedPort; got != before {
+			t.Fatalf("mixedPort changed to %d after a rejected patch; a refused setting "+
+				"must not be written", got)
+		}
+	}
+	// The DNS port is derived, so a port that is itself valid but makes the derived
+	// one invalid has to be refused too.
+	if _, err := a.ApplySettings(map[string]interface{}{"mixedPort": 65400}); err == nil {
+		t.Error("mixedPort 65400 was accepted, but the DNS port is mixedPort+300 and " +
+			"65700 cannot be listened on")
+	}
+	// A usable port still goes through, or the validation would be its own outage.
+	//
+	// This arm touches the configuration transaction, which asks the core whether it
+	// is up - so the core has to exist, as it does in every other settings test.
+	a.core = NewCore("", dir, a.configPath, "s", 7797)
+	if a.sysproxy == nil {
+		a.sysproxy = NewSystemProxy(dir)
+	}
+	// Read-only: this test must not touch the registry of the machine it runs on.
+	a.sysproxy.SetReadOnly(true)
+	if _, err := a.ApplySettings(map[string]interface{}{"mixedPort": 7945}); err != nil {
+		t.Errorf("a valid port was refused: %v", err)
+	}
+}
+
+func TestDisablingTunDoesNotClearTheModeBeforeTheAdapterIsGone(t *testing.T) {
+	// Measured on this machine, and it produced the both-on state the whole design
+	// exists to prevent:
+	//
+	//	[WARN] TUN disable: adapter "Zenith" could not be removed:
+	//	       删除网卡 "Zenith" 的命令返回成功，但网卡仍然存在
+	//	TUN disabled                                   <- reported as success
+	//
+	// The mode was cleared FIRST, so the mutual-exclusion gate then read "TUN is
+	// off", allowed the system proxy, and the machine carried traffic twice: the
+	// adapter was Up, the default route still pointed into it, and the registry
+	// proxy was on. Every individual step looked right; the combination is the
+	// failure, and it was invisible because the interface said TUN was off.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) DisableTun() error {")
+	if i < 0 {
+		t.Fatal("DisableTun is missing")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+
+	// A failed removal must not be swallowed.
+	if !strings.Contains(body, "关闭 TUN 失败") {
+		t.Error("a failed adapter removal is not reported as a failure, so the caller " +
+			"believes the tunnel is off while it is still holding the routes")
+	}
+	if !strings.Contains(body, "return fmt.Errorf") {
+		t.Error("DisableTun cannot report a failed teardown")
+	}
+	// The removal has to happen before the mode is cleared, so a failure leaves the
+	// mode set and the gate keeps refusing the system proxy.
+	removeAt := strings.Index(body, "removeAdapterWithRights(")
+	clearAt := strings.LastIndex(body, `"tunMode": string(TunOff)`)
+	if removeAt < 0 {
+		t.Fatal("the adapter is never removed")
+	}
+	if clearAt >= 0 && clearAt < removeAt {
+		t.Error("the mode is cleared before the adapter is removed; if the removal " +
+			"then fails the gate allows the system proxy on top of a live tunnel")
+	}
+}
+
+func TestTheGateBelievesTheRouteNotTheStoredMode(t *testing.T) {
+	// The gate used to start with "if the stored mode is off, nothing is carrying"
+	// and return early. That is the assumption the disable bug exploited: the mode
+	// read off while the adapter was Up and routed, so the proxy was allowed on
+	// top. The route is the fact; the mode is a record of what was attempted.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) tunActuallyCarrying(")
+	if i < 0 {
+		t.Fatal("the gate is missing")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	if !strings.Contains(body, "adapterState(") || !strings.Contains(body, "defaultRouteUsesAdapter(") {
+		t.Fatal("the gate does not look at the adapter and the route")
+	}
+	// It must not bail out on the stored mode before looking.
+	guard := strings.Index(body, "st.TunMode == TunOff")
+	adapter := strings.Index(body, "adapterState(")
+	if guard >= 0 && guard < adapter {
+		t.Error("the gate returns early on the stored mode, so a stale or wrong mode " +
+			"decides whether a live tunnel is carrying traffic")
+	}
+}
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a
 	}
 	return b
+}
+
+func TestDisablingTunAsksTheProcessThatHasTheRights(t *testing.T) {
+	// TUN could not be turned off at all, and the reason was a rights mismatch that
+	// nobody had noticed: enabling goes through the resident service (LocalSystem),
+	// disabling ran the adapter removal in the interface's own process (an ordinary
+	// user). Removing a network adapter needs administrator rights, so the removal
+	// could never succeed from there. Measured with the tunnel up:
+	//
+	//	pnputil /remove-device SWD\Wintun\{...}  -> Failed to remove device: Access is denied
+	//	Disable-NetAdapter -Name Zenith          -> Access is denied
+	//	[ERR] TUN disable: adapter "Zenith" could not be removed ... but it still exists
+	//
+	// The fix is to delegate the removal to the service, which already has the rights
+	// and already owns the core that created the adapter.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) removeAdapterWithRights(")
+	if i < 0 {
+		t.Fatal("nothing removes the adapter through the process that can: the interface " +
+			"is an ordinary user and the removal needs administrator rights")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	if !strings.Contains(body, "serviceRemoveAdapter(") {
+		t.Error("the adapter removal does not go through the resident service, so it runs " +
+			"with rights that cannot remove a network adapter")
+	}
+	// And the disable path must use it, rather than calling the local removal.
+	di := strings.Index(text, "func (a *App) DisableTun() error {")
+	if di < 0 {
+		t.Fatal("DisableTun is missing")
+	}
+	dend := strings.Index(text[di:], "\n}\n")
+	dbody := text[di : di+dend]
+	if !strings.Contains(dbody, "removeAdapterWithRights(") {
+		t.Error("DisableTun removes the adapter locally, which fails with access denied " +
+			"when the program was not started elevated")
+	}
+}
+
+func TestGlobalModeActuallyProxies(t *testing.T) {
+	// Setting the mode to global and stopping there made it mean "everything
+	// direct". Global mode routes through the core's GLOBAL selector, and that
+	// selector starts at DIRECT because that is mihomo's default for it. Measured
+	// with global selected:
+	//
+	//	GLOBAL  type=Selector  now=[DIRECT]
+	//
+	// and the traffic log showed foreign sites matching GLOBAL and timing out - the
+	// switch promised "everything through the tunnel" and delivered "nothing through
+	// it". Nothing in this program had ever written to that selector.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) SetMode(mode string) error {")
+	if i < 0 {
+		t.Fatal("SetMode is missing")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	if !strings.Contains(body, `Select("GLOBAL"`) {
+		t.Error("switching to global mode never points the GLOBAL selector anywhere, so it " +
+			"keeps mihomo's default of DIRECT and every site is reached directly")
+	}
+	if !strings.Contains(body, "PROXY") {
+		t.Error("the GLOBAL selector is not pointed at PROXY, which is the group this " +
+			"program keeps on the chosen node")
+	}
+	// Rule and direct modes do not consult GLOBAL, so this must not be done
+	// unconditionally in a way that changes what the user selected elsewhere.
+	if !strings.Contains(body, `mode == "global"`) {
+		t.Error("the GLOBAL selector is repointed for every mode, but only global mode " +
+			"routes through it")
+	}
+}
+
+func TestDisablingTunGivesTheTrafficSomewhereToGo(t *testing.T) {
+	// Turning the tunnel off leaves the machine with no takeover at all: the routes
+	// are gone, and the system proxy was turned off when the tunnel was enabled
+	// because the two are mutually exclusive. Measured immediately after a
+	// successful disable:
+	//
+	//	TUN disabled: adapter "Zenith" removed, mode cleared
+	//	direct request -> timed out, because nothing was carrying anything
+	//
+	// The user asked to stop using the tunnel, not to stop having a connection. The
+	// system proxy is the arrangement this program leaves a machine in, so a disable
+	// that reports success restores it - through the same gate as every other
+	// caller, so it cannot put both takeovers on.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) DisableTun() error {")
+	if i < 0 {
+		t.Fatal("DisableTun is missing")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	if !strings.Contains(body, `a.enableSystemProxy("tun disabled")`) {
+		t.Error("disabling the tunnel leaves the machine with no working takeover: the " +
+			"routes are removed and the system proxy was already off, so nothing " +
+			"carries the traffic afterwards")
+	}
+	// And it must be the gate, not a direct Enable, or the exclusion could be
+	// bypassed by the very path that just tore the tunnel down.
+	if strings.Contains(body, "sysproxy.Enable(") {
+		t.Error("the disable path turns the system proxy on directly, bypassing the " +
+			"exclusion gate")
+	}
+	// The decision has to come from the activation record, not from the current
+	// setting. Enabling TUN stores systemProxy=false as part of switching the proxy
+	// off, so by the time this runs the stored flag can never say "the user had it
+	// on". Measured: the first version checked a.store.Settings().SystemProxy and
+	// the restore never fired once - the machine was left with no takeover after a
+	// successful disable.
+	if !strings.Contains(body, "loadTunTxn()") {
+		t.Error("the disable path decides whether to restore the system proxy from the " +
+			"current setting, which enabling TUN already set to false, so it never " +
+			"restores it")
+	}
+	// The condition itself must be the record, not the setting. Comments in this
+	// file quote the old code on purpose, so only the executable line is examined.
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		if strings.Contains(trimmed, "a.store.Settings().SystemProxy") {
+			t.Error("the disable path reads the current setting to decide the restore; " +
+				"that value was cleared when TUN was enabled and cannot describe what " +
+				"the user had before")
+		}
+	}
+}
+
+// ---- the tunnel was working; the check was looking at the wrong time --------
+
+func TestTunCarryIsWatchedWhileTheRequestRuns(t *testing.T) {
+	// The verification completed the request and only then began polling the core's
+	// connection table - while using DisableKeepAlives, so the row was removed with
+	// the connection before the first poll ran.
+	//
+	// Measured on this machine, three attempts out of three: the direct request
+	// returned 204 and the table never contained the host, so TUN was reported as
+	// "not carrying traffic" and the activation was rolled back. The tunnel was
+	// carrying it the whole time - the core's own log for those attempts shows the
+	// traffic arriving on the adapter:
+	//
+	//	[TCP] 198.18.0.1:49843 --> www.gstatic.com:443 match GeoIP(cn) using DIRECT
+	//
+	// The same three attempts, with the table watched concurrently from before the
+	// request was sent, were found 3/3, each with the inbound named.
+	//
+	// The fix is the ordering, so the ordering is what this test guards.
+	src, err := os.ReadFile("tunverify.go")
+	if err != nil {
+		t.Skipf("tunverify.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "func (a *App) watchDuring(") {
+		t.Fatal("nothing observes the connection table during the request, so a fast 204 " +
+			"that matches a DIRECT rule leaves no evidence behind")
+	}
+	// The watcher has to be started before the probe, not after it. Both live in
+	// watchDuring, and the probe must not run until the goroutine is up.
+	i := strings.Index(text, "func (a *App) watchDuring(")
+	end := strings.Index(text[i:], "\n}")
+	body := text[i : i+end]
+	start := strings.Index(body, "go func()")
+	probe := strings.Index(body, "probeErr := probe()")
+	if start < 0 || probe < 0 {
+		t.Fatal("watchDuring does not both start a watcher and run the probe")
+	}
+	if start > probe {
+		t.Error("the probe runs before the watcher starts, which is the original defect: " +
+			"by the time the table is read the connection is already gone")
+	}
+	// And the probe must actually go through the gate, or nothing uses it.
+	if !strings.Contains(text, "a.watchDuring(") {
+		t.Error("watchDuring exists but the verification does not use it")
+	}
+}
+
+func TestTunCarryIsAttributedToTheTunInbound(t *testing.T) {
+	// "The core saw this host" is not the claim being made; "the core saw this host
+	// arriving on the tunnel" is. The probe target resolves to a Chinese address on
+	// this machine, matches GeoIP(cn), and is carried DIRECT - so a check that
+	// required a proxy chain would reject a correct configuration, and a check that
+	// accepted any row would pass traffic that never entered the tunnel.
+	cases := []struct {
+		name string
+		conn coreConnection
+		want bool
+	}{
+		{"the tun inbound, named", coreConnection{Inbound: "DEFAULT-TUN", SourceIP: "198.18.0.1"}, true},
+		{"the tun inbound, lower case", coreConnection{Inbound: "default-tun"}, true},
+		{"the metadata type alone", coreConnection{Type: "Tun"}, true},
+		{"the adapter address alone", coreConnection{SourceIP: "198.18.0.1"}, true},
+		{"the second half of the reserved range", coreConnection{SourceIP: "198.19.4.7"}, true},
+		{"the local proxy port", coreConnection{Inbound: "Mixed", SourceIP: "127.0.0.1"}, false},
+		{"nothing said", coreConnection{}, false},
+		{"a physical address", coreConnection{SourceIP: "192.168.1.20"}, false},
+	}
+	for _, c := range cases {
+		if got := tunInbound(c.conn); got != c.want {
+			t.Errorf("tunInbound(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestOurOwnAdapterIsNotReportedAsAnotherTunnel(t *testing.T) {
+	// Zenith names its adapter but does not control the description - the driver
+	// supplies it, and mihomo's wintun interface describes itself as "Meta Tunnel".
+	// The foreign-adapter check filtered DESCRIPTIONS for the word "zenith", so on
+	// every machine Zenith created a tunnel on, its own adapter failed the test:
+	//
+	//	[WARN] TUN 提示：检测到其他隧道/虚拟网卡：Meta Tunnel
+	//
+	// Measured here with exactly one tunnel adapter present - ours - so the warning
+	// named Zenith's own adapter and warned that it might compete with itself.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "foreignTunAdaptersExcept(") {
+		t.Fatal("the foreign-adapter check does not take our own adapter into account")
+	}
+	// It must compare names. Comparing descriptions is what broke: ours is
+	// "Meta Tunnel" and contains none of the words that would identify it.
+	i := strings.Index(text, "func foreignTunAdaptersExcept(")
+	end := strings.Index(text[i:], "\n}")
+	body := text[i : i+end]
+	if !strings.Contains(body, "a.Name") {
+		t.Error("our own adapter is not recognised by its name, so its description is " +
+			"what decides - and that description is the driver's, not ours")
+	}
+	if strings.Contains(body, "strings.Contains(d, \"zenith\")") {
+		t.Error("the check is back to matching descriptions for the word \"zenith\", " +
+			"which can never match the description we actually get")
+	}
+}
+
+func TestTheSystemProxyGateCountsAsCarryingOnlyWhenTheRouteIsReal(t *testing.T) {
+	// Refusing the system proxy on the STORED mode alone produces a machine with no
+	// tunnel and no proxy: the adapter is gone, the setting still says compat, so
+	// every attempt to turn the proxy on is refused for a tunnel that is not there.
+	// That exact state is in this program's own history - "settings say compat but
+	// adapter Zenith is not present" - and the mode-clearing logic exists to repair
+	// it. The gate must not recreate it from the other side.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) tunActuallyCarrying(")
+	if i < 0 {
+		t.Fatal("the gate decides on the stored mode alone, which refuses the proxy for " +
+			"a tunnel that is not running")
+	}
+	end := strings.Index(text[i:], "\n}")
+	body := text[i : i+end]
+	for _, need := range []string{"adapterState(", "defaultRouteUsesAdapter("} {
+		if !strings.Contains(body, need) {
+			t.Errorf("the gate does not check %s, so a stale record or a decoration "+
+				"adapter is enough to block the working proxy", need)
+		}
+	}
 }

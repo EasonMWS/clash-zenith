@@ -415,13 +415,28 @@ func (c *Core) Connections() Connections {
 	}
 }
 
-// ConnectionHosts lists the destinations the core is currently carrying.
+// coreConnection is one row of the core's connection table, reduced to the parts
+// that answer "did the tunnel carry this".
 //
-// The count-only view is enough for the interface, but not for proving a tunnel
-// works: "did the core carry this request" needs the destinations, and that
-// question is the difference between a request succeeding and a request
-// succeeding through the tunnel.
-func (c *Core) ConnectionHosts() []string {
+// The host alone is not enough to answer that. A connection through the mixed
+// port and a connection arriving on the tunnel both have a host; only the inbound
+// distinguishes them. Reporting the host alone meant the check could not tell
+// "the tunnel carried this" from "something else did", which is the whole
+// question being asked.
+type coreConnection struct {
+	Host        string
+	Destination string
+	SourceIP    string
+	// Inbound is "Tun" for traffic that arrived through the virtual adapter,
+	// "Mixed" for the local proxy port, and empty when the core did not say.
+	Inbound string
+	Type    string
+	Chains  string
+}
+
+// coreConnections reads the core's connection table with the fields needed to
+// attribute a connection to an inbound.
+func (c *Core) coreConnections() []coreConnection {
 	data, err := c.api(http.MethodGet, "/connections", nil, 6*time.Second)
 	if err != nil {
 		return nil
@@ -430,7 +445,7 @@ func (c *Core) ConnectionHosts() []string {
 	if !ok {
 		return nil
 	}
-	out := make([]string, 0, len(raw))
+	out := make([]coreConnection, 0, len(raw))
 	for _, item := range raw {
 		m, ok := item.(map[string]interface{})
 		if !ok {
@@ -440,12 +455,44 @@ func (c *Core) ConnectionHosts() []string {
 		if !ok {
 			continue
 		}
-		host, _ := meta["host"].(string)
-		if host == "" {
-			host, _ = meta["destinationIP"].(string)
+		conn := coreConnection{
+			Destination: asString(meta["destinationIP"]),
+			SourceIP:    asString(meta["sourceIP"]),
+			Inbound:     asString(meta["inboundName"]),
+			Type:        asString(meta["type"]),
 		}
-		if host != "" {
-			out = append(out, host)
+		conn.Host = asString(meta["host"])
+		if conn.Host == "" {
+			conn.Host = conn.Destination
+		}
+		if chains, ok := m["chains"].([]interface{}); ok {
+			parts := make([]string, 0, len(chains))
+			for _, ch := range chains {
+				if s, ok := ch.(string); ok {
+					parts = append(parts, s)
+				}
+			}
+			conn.Chains = strings.Join(parts, ">")
+		}
+		if conn.Host != "" {
+			out = append(out, conn)
+		}
+	}
+	return out
+}
+
+// ConnectionHosts lists the destinations the core is currently carrying.
+//
+// The count-only view is enough for the interface, but not for proving a tunnel
+// works: "did the core carry this request" needs the destinations, and that
+// question is the difference between a request succeeding and a request
+// succeeding through the tunnel.
+func (c *Core) ConnectionHosts() []string {
+	conns := c.coreConnections()
+	out := make([]string, 0, len(conns))
+	for _, conn := range conns {
+		if conn.Host != "" {
+			out = append(out, conn.Host)
 		}
 	}
 	return out

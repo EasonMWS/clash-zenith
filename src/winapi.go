@@ -107,6 +107,51 @@ func adapterDescriptions() []string {
 	return res
 }
 
+// networkAdapter is one row of the adapter table: the name the user sees and the
+// description the driver reports.
+//
+// Both are needed, and mixing them up is a bug this program already had. Zenith's
+// own adapter is named "Zenith" and described "Meta Tunnel", because the
+// description comes from the driver (mihomo's wintun interface), not from Zenith.
+// The foreign-adapter check compared descriptions against the word "zenith", so
+// it never recognised its own adapter and reported it as somebody else's tunnel:
+//
+//	[WARN] TUN 提示：检测到其他隧道/虚拟网卡：Meta Tunnel
+//
+// Measured on this machine with exactly one tunnel adapter present - Zenith's own
+// - so the warning was about Zenith, printed while advising the user that another
+// product might fight over the routes.
+type networkAdapter struct {
+	Name        string
+	Description string
+}
+
+// networkAdapters reads the adapter table once, as name/description pairs.
+func networkAdapters() []networkAdapter {
+	out, err := HiddenCommand("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		`Get-NetAdapter -ErrorAction SilentlyContinue | `+
+			`ForEach-Object { $_.Name + "|" + $_.InterfaceDescription }`)
+	if err != nil {
+		return nil
+	}
+	var res []networkAdapter
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 2)
+		a := networkAdapter{Name: strings.TrimSpace(parts[0])}
+		if len(parts) > 1 {
+			a.Description = strings.TrimSpace(parts[1])
+		}
+		if a.Name != "" {
+			res = append(res, a)
+		}
+	}
+	return res
+}
+
 // tunAdapterExists reports whether Zenith's own adapter is present, matched by
 // the name Zenith gave it rather than by a generic pattern, so another product's
 // adapter is never mistaken for ours.

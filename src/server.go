@@ -641,7 +641,6 @@ func (s *Server) handleSystemProxy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]interface{}{"ok": false, "error": "缺少 enabled"})
 		return
 	}
-	st := s.app.store.Settings()
 	if want {
 		// The two ways of taking traffic are mutually exclusive, and the answer says
 		// so rather than quietly doing both.
@@ -655,19 +654,20 @@ func (s *Server) handleSystemProxy(w http.ResponseWriter, r *http.Request) {
 		// on, and every application that honours it is offline for as long as that
 		// takes.
 		//
-		// Refused with an instruction, not with an error code: the user turned one on
-		// and wants to know what to do about the other.
-		if st.TunMode != TunOff {
+		// The decision itself is made by enableSystemProxy, which is where the rule
+		// lives, so this handler and the background loop cannot disagree about it.
+		// This used to be the only place the rule was written down, and the other
+		// callers walked past it.
+		res, err := s.app.enableSystemProxy("ui")
+		if res.Refused == sysProxyRefusedByTun {
 			writeJSON(w, 200, map[string]interface{}{
-				"ok": false,
-				"error": "TUN 接管正在使用中。两者互斥：TUN 通过路由表接管流量，" +
-					"系统代理对已经被接管的流量不起作用。请先关闭 TUN 接管，" +
-					"再打开系统代理",
+				"ok":       false,
+				"error":    res.Detail,
 				"conflict": "tun",
 			})
 			return
 		}
-		if _, err := s.app.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
+		if err != nil {
 			writeJSON(w, 200, map[string]interface{}{"ok": false, "error": err.Error()})
 			return
 		}

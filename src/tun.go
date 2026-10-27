@@ -187,18 +187,47 @@ type tunEnvironment struct {
 // refuses to touch them, and mentions them so the user knows why the picture
 // might differ from expectations.
 func foreignTunAdapters() []string {
-	names := adapterDescriptions()
+	return foreignTunAdaptersExcept("")
+}
+
+// foreignTunAdaptersExcept lists tunnel-looking adapters that are not ours.
+//
+// "Ours" has to be decided by the adapter's NAME, not by its description. Zenith
+// names its adapter (default "Zenith") but does not control the description: the
+// driver supplies that, and mihomo's wintun interface describes itself as "Meta
+// Tunnel". The earlier version filtered descriptions containing "zenith", so on
+// every machine the program created a tunnel on, its own adapter failed the test
+// and was announced as another product's:
+//
+//	[WARN] TUN 提示：检测到其他隧道/虚拟网卡：Meta Tunnel
+//
+// Measured here with exactly one tunnel adapter present - ours - so the warning
+// named Zenith's own adapter and told the user that it and itself might compete
+// for routes.
+func foreignTunAdaptersExcept(ownName string) []string {
+	adapters := networkAdapters()
+	own := strings.TrimSpace(ownName)
+	if own == "" {
+		own = "Zenith"
+	}
 	var out []string
-	for _, d := range names {
-		l := strings.ToLower(d)
-		if strings.Contains(l, "zenith") {
+	for _, a := range adapters {
+		// Ours, by the name this program gave it.
+		if strings.EqualFold(a.Name, own) {
 			continue
 		}
+		// Defensive: a machine where the adapter was created under the default
+		// name but the setting now says something else must not have its own
+		// adapter reported as foreign.
+		if strings.EqualFold(a.Name, "Zenith") {
+			continue
+		}
+		l := strings.ToLower(a.Description)
 		if strings.Contains(l, "wintun") || strings.Contains(l, "tap-windows") ||
 			strings.Contains(l, "wireguard") || strings.Contains(l, "openvpn") ||
 			strings.Contains(l, "tailscale") || strings.Contains(l, "clash") ||
 			strings.Contains(l, "sing-tun") || strings.Contains(l, "tunnel") {
-			out = append(out, d)
+			out = append(out, a.Description+"（"+a.Name+"）")
 		}
 	}
 	return out
@@ -302,7 +331,12 @@ func (a *App) checkTunEnvironment() tunEnvironment {
 	}
 
 	// Other tunnels are reported, never touched.
-	if others := foreignTunAdapters(); len(others) > 0 {
+	//
+	// The comparison uses our own adapter's name, so the adapter this program
+	// created is not reported back to the user as somebody else's. Passing the
+	// configured name rather than relying on the default also covers a machine
+	// where the user renamed it.
+	if others := foreignTunAdaptersExcept(st.NormalizedTunDevice()); len(others) > 0 {
 		env.Others = others
 		env.Warnings = append(env.Warnings,
 			"检测到其他隧道/虚拟网卡："+strings.Join(others, "、")+
@@ -1474,24 +1508,141 @@ func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 // user to confirm before its block was lifted. That mode is gone: the block it
 // installed blocked the tunnel along with everything else, so it is removed from the
 // program rather than repaired.
+//
+// It returns an error when the adapter is still there afterwards, and that is a
+// correction rather than a nicety. Measured on this machine:
+//
+//	[WARN] TUN disable: adapter "Zenith" could not be removed:
+//	       删除网卡 "Zenith" 的命令返回成功，但网卡仍然存在
+//	TUN disabled                                    <- reported as success
+//
+// The mode had been cleared first, so the mutual-exclusion gate saw "TUN is off",
+// let the system proxy be enabled, and the machine was left with the adapter Up,
+// the default route still pointing into it, AND the registry proxy on - the exact
+// both-on state the exclusion exists to prevent. It looked fine: the interface
+// said TUN was off, the proxy worked, and traffic was being carried twice.
+//
+// Clearing the stored mode before the teardown is what made that state reachable,
+// so the mode is now only cleared once the adapter is really gone. If the teardown
+// fails the mode stays set, the gate keeps refusing the system proxy, and the user
+// is told the tunnel is still holding the traffic instead of being told it is off.
 func (a *App) DisableTun() error {
 	st := a.store.Settings()
 	if st.TunMode == TunOff {
+		// The mode says off, but the adapter may still be holding the routes: a
+		// previous disable that failed, or a core that outlived its setting.
+		// Reporting success here without checking is how the both-on state
+		// started, so the check is unconditional.
+		if tunAdapterExists(st.NormalizedTunDevice()) {
+			return fmt.Errorf("TUN 模式已关闭，但网卡 %q 仍然存在。"+
+				"它可能仍在接管流量——请重试关闭，或重启后删除该网卡",
+				st.NormalizedTunDevice())
+		}
 		return nil
+	}
+
+	// Order matters. The core is restarted against a configuration WITHOUT the tun
+	// block first, so the adapter is released by the process that created it -
+	// removing an adapter a running core still owns is what made the removal
+	// "succeed" while the adapter stayed.
+	a.core.Stop()
+	time.Sleep(1200 * time.Millisecond)
+	if err := a.core.Start(); err != nil {
+		// The old core is gone and the new one did not start: the adapter was
+		// released with the old core, but there is no tunnel and no proxy now.
+		// Clearing the mode is correct here, and the error says the core is down.
+		_, _ = a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)})
+		return err
+	}
+	if err := a.removeAdapterWithRights(st.NormalizedTunDevice()); err != nil {
+		// The adapter survived. The mode is deliberately NOT cleared: leaving it
+		// set means the gate keeps the system proxy off, which is the safe half of
+		// the failure, and the message says what to do.
+		Log("TUN disable: adapter %q could not be removed: %v", st.NormalizedTunDevice(), err, "ERR")
+		return fmt.Errorf("关闭 TUN 失败：网卡 %q 仍然存在（%v）。"+
+			"它可能还在接管流量，所以没有把模式标记为已关闭——"+
+			"否则系统代理会被允许同时开启，流量会被两套规则同时接管", st.NormalizedTunDevice(), err)
 	}
 	if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
 		return err
 	}
-	a.core.Stop()
-	time.Sleep(1200 * time.Millisecond)
-	if err := a.core.Start(); err != nil {
-		return err
+	Log("TUN disabled: adapter %q removed, mode cleared", st.NormalizedTunDevice())
+
+	// Give the traffic somewhere to go on the way out.
+	//
+	// Turning the tunnel off leaves the machine with NO takeover at all: the routes
+	// are gone and the system proxy was switched off when the tunnel was enabled,
+	// because the two are mutually exclusive. Measured immediately after a
+	// successful disable:
+	//
+	//	TUN disabled: adapter "Zenith" removed, mode cleared
+	//	direct request -> timed out, because nothing was carrying anything
+	//
+	// The user asked for "stop using the tunnel", not "stop having a working
+	// connection". The system proxy is the arrangement this program leaves a
+	// machine in, so it is restored here rather than left for the user to discover.
+	//
+	// What decides is whether the proxy was on BEFORE the tunnel was enabled, read
+	// from the activation record. It is NOT the current setting: enabling TUN
+	// stores systemProxy=false as part of switching it off, so by the time this runs
+	// the stored flag can never say "the user had it on". Measured: the first
+	// version of this restoration checked a.store.Settings().SystemProxy, which the
+	// activation had already set to false, so the restore never fired once.
+	if txn := a.loadTunTxn(); txn != nil && txn.Owned.SysProxyWasOn {
+		if res, err := a.enableSystemProxy("tun disabled"); err != nil {
+			Log("TUN disable: the system proxy could not be restored: %v", err, "WARN")
+		} else if res.Refused != "" {
+			Log("TUN disable: the system proxy was not restored: %s", res.Detail, "WARN")
+		}
 	}
-	if err := removeTunAdapter(st.TunDevice); err != nil {
-		Log("TUN disable: adapter %q could not be removed: %v", st.TunDevice, err, "WARN")
-	}
-	Log("TUN disabled")
 	return nil
+}
+
+// removeAdapterWithRights removes the virtual adapter using whatever rights this
+// process has, and says so when it has none.
+//
+// Removing a network adapter needs administrator rights. The interface is an
+// ordinary user, so when a resident service exists the removal is delegated to it -
+// that process runs as LocalSystem and is the one that owns the core which created
+// the adapter. Without the service there is no delegated path, and the local
+// attempt is all that is left; it succeeds when the whole program was started
+// elevated and fails otherwise.
+//
+// Measured with the tunnel up and an ordinary-user interface, before this existed:
+//
+//	pnputil /remove-device SWD\Wintun\{...}  -> Failed to remove device: Access is denied
+//	Disable-NetAdapter -Name Zenith          -> Access is denied
+//
+// so the adapter could never be removed by the button the user was pressing, and TUN
+// could not be turned off at all.
+func (a *App) removeAdapterWithRights(name string) error {
+	if name == "" {
+		return fmt.Errorf("没有网卡名")
+	}
+	if !tunAdapterExists(name) {
+		return nil
+	}
+	// The service first: it has the rights and it is the process that owns the core.
+	if a.serviceReachable() {
+		if err := a.serviceRemoveAdapter(name); err == nil {
+			if !tunAdapterExists(name) {
+				return nil
+			}
+			return fmt.Errorf("服务报告已删除网卡 %q，但它仍然存在", name)
+		} else {
+			Log("TUN disable: the service could not remove %q (%v); trying locally",
+				name, err, "WARN")
+		}
+	}
+	// Local attempt. Succeeds when this process happens to be elevated.
+	if err := removeTunAdapter(name); err == nil {
+		return nil
+	}
+	if isElevated() {
+		return fmt.Errorf("已以管理员权限删除网卡 %q，但它仍然存在", name)
+	}
+	return fmt.Errorf("删除网卡 %q 需要管理员权限，当前进程没有，"+
+		"而常驻服务也不可用。请以管理员身份运行 Zenith，或重启电脑后网卡会消失", name)
 }
 
 // ---- verification ---------------------------------------------------------

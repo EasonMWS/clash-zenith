@@ -303,6 +303,136 @@ func (a *App) ensureNotOfflineBecauseOfUs() {
 	a.lastErr = fmt.Sprintf("内核没有起来，已暂时关闭系统代理以免断网（端口 %d 没有响应）", port)
 }
 
+// ---- the mutual exclusion between the two ways of taking traffic -----------
+//
+// TUN and the system proxy are not two switches that happen to coexist. They are
+// two different claims on the same traffic, and only one of them can be true:
+//
+//   - TUN takes traffic by installing a default route into the virtual adapter.
+//     Everything is carried, whether the application reads the system proxy or
+//     not, and the registry setting has no effect on that traffic at all.
+//   - The system proxy takes traffic by telling applications to dial a local
+//     port. Only applications that honour the setting are affected, and the
+//     routing table is untouched.
+//
+// With both on, the machine is in a state nothing describes: the checkbox says
+// the proxy carries it, the routing table says the tunnel does, and the proxy
+// setting points at a port that a TUN activation is about to restart the core
+// on - so every application honouring it is briefly offline.
+//
+// The check already existed in the interface's handler, and that was the gap.
+// Measured on this machine, with the adapter Up and the default route on it:
+//
+//	TUN adapter "Zenith" Up (ifIndex 41, 198.18.0.1)
+//	0.0.0.0/0 -> 198.18.0.2 on ifIndex 41
+//	and the registry proxy was enabled at the same time
+//
+// Nothing on the background path could have refused it: the handler was the only
+// place the rule lived, and the background loop, the settings path and the
+// startup path all called Enable without asking. So the rule now lives here, and
+// every caller goes through it. A rule enforced in one of four places is not a
+// rule; it is a habit that the fifth caller breaks.
+
+// tunModeActive reports whether the store believes TUN holds the traffic.
+func (a *App) tunModeActive() bool {
+	if a.store == nil {
+		return false
+	}
+	return a.store.Settings().TunMode != TunOff
+}
+
+// tunActuallyCarrying reports whether the tunnel is not just configured but
+// really holding the traffic: the adapter is up and the default route goes
+// through it.
+//
+// The check is on the ROUTE, not on the stored mode, and that distinction is what
+// makes the exclusion safe. Measured here: a disable cleared the mode and then
+// failed to remove the adapter
+//
+//	[WARN] TUN disable: adapter "Zenith" could not be removed ... but it still exists
+//	TUN disabled                                        <- reported as success
+//
+// so the stored mode read "off" while the adapter was Up and the default route
+// still went into it. A gate that believed the mode then allowed the system proxy,
+// and the machine carried traffic twice - TUN by route and the proxy by registry -
+// with the interface showing one switch on. The route is the fact; the mode is a
+// record of what was attempted, and the two had come apart.
+//
+// The stored mode is still consulted, because an adapter that exists but is not
+// routed carries nothing and must not block the working proxy.
+func (a *App) tunActuallyCarrying() (bool, string) {
+	if a.store == nil {
+		return false, ""
+	}
+	st := a.store.Settings()
+	name := st.NormalizedTunDevice()
+
+	exists, up, index := adapterState(name)
+	if !exists {
+		return false, ""
+	}
+	if up {
+		if onRoute, detail := defaultRouteUsesAdapter(index); onRoute {
+			// Routed traffic is the tunnel carrying it, whatever the mode says.
+			// Saying so also repairs the record: the adapter is up and holding the
+			// default route, which is a tunnel, so the stored mode is stale if it
+			// disagrees.
+			if st.TunMode == TunOff {
+				Log("TUN: adapter %q is up and holds the default route while the stored "+
+					"mode says off; treating the tunnel as carrying traffic and keeping "+
+					"the system proxy off", name, "WARN")
+			}
+			return true, detail
+		}
+	}
+	return false, ""
+}
+
+// enableSystemProxy is the only way the system proxy is turned on.
+//
+// Every path that wants it - the interface's button, the settings patch, the
+// startup reconciliation and the background loop - calls this, so the exclusion
+// is decided in one place instead of being remembered in four.
+//
+// It returns what happened rather than a bare error, because the callers need to
+// tell "refused because TUN owns the traffic" (a normal, explainable state) from
+// "the registry write failed" (a fault).
+func (a *App) enableSystemProxy(reason string) (sysProxyOutcome, error) {
+	out := sysProxyOutcome{}
+	if a.store == nil || a.sysproxy == nil {
+		return out, nil
+	}
+	if carrying, detail := a.tunActuallyCarrying(); carrying {
+		out.Refused = sysProxyRefusedByTun
+		out.Detail = "TUN 接管正在承载流量（" + detail + "），两者互斥，" +
+			"系统代理不会同时生效。请先关闭 TUN 接管"
+		Log("system proxy NOT enabled (%s): %s", reason, out.Detail)
+		return out, nil
+	}
+	st := a.store.Settings()
+	took, err := a.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false)
+	if err != nil {
+		return out, err
+	}
+	out.Took = took
+	if took {
+		Log("system proxy enabled (%s) -> 127.0.0.1:%d", reason, st.MixedPort)
+	}
+	return out, nil
+}
+
+// sysProxyOutcome is what enableSystemProxy decided.
+type sysProxyOutcome struct {
+	// Took is true when the registry was actually changed by this call.
+	Took bool
+	// Refused names the reason the request was not carried out, if it was not.
+	Refused string
+	// Detail explains a refusal in terms the user can act on.
+	Detail string
+}
+
+const sysProxyRefusedByTun = "tun"
+
 // ---- geodata bootstrap ----------------------------------------------------
 
 // geodataFiles are the rule databases mihomo needs for GEOSITE / GEOIP rules.
@@ -779,8 +909,12 @@ func (a *App) bootCore() {
 	}
 	a.lastErr = ""
 	if a.store.Settings().SystemProxy {
-		if _, err := a.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
+		// Same gate. A machine that boots with TUN already configured must not
+		// take the system proxy as well just because the saved setting says so.
+		if res, err := a.enableSystemProxy("startup"); err != nil {
 			Log("system proxy not enabled: %v", err, "WARN")
+		} else if res.Refused != "" {
+			Log("startup: leaving the system proxy off; %s", res.Detail)
 		}
 	}
 	if st.OptimizeOnStart && len(a.store.Snapshot().Optimized) == 0 {
@@ -826,6 +960,11 @@ func (a *App) background() {
 	// off, so on the next launch it must be taken again - but if a previous
 	// instance is somehow still holding it, re-arming would fight over it.
 	proxyArmed := a.sysproxy.Status().Owner == "zenith"
+	// Rate limit for attempting to take the system proxy when TUN is holding the
+	// traffic. The answer only changes when the tunnel is switched off, so a
+	// per-tick retry would cost two PowerShell spawns every ten seconds to learn
+	// nothing. See the attempt site for the reasoning.
+	lastProxyAttempt := time.Now().Add(-30 * time.Second)
 	if proxyArmed {
 		Log("system proxy is already Zenith's; leaving it in place")
 	}
@@ -920,11 +1059,30 @@ func (a *App) background() {
 		// take the system proxy once, as soon as the core is really listening.
 		// Enable returns early when the proxy is already ours, so the flag is set
 		// only on success - otherwise this line repeated every 10 seconds.
+		//
+		// This goes through enableSystemProxy like every other caller, so a loop
+		// that ticks every ten seconds cannot re-take a setting that TUN is
+		// holding. It did before: the exclusion lived in the interface handler
+		// only, and this path turned the proxy back on underneath a running
+		// tunnel, which is exactly the both-on state the design forbids.
 		if !proxyArmed && st.SystemProxy && a.core.IsUp() {
-			if took, err := a.sysproxy.Enable(st.MixedPort, st.ProxyBypass, false); err != nil {
-				Log("system proxy not enabled: %v", err, "WARN")
-			} else if took {
-				proxyArmed = true
+			// A refusal is not retried on every tick.
+			//
+			// Deciding "is TUN really carrying this" costs two PowerShell spawns
+			// (adapter state and the route table), and the loop runs every ten
+			// seconds. Retrying a refusal at that rate would spend more time
+			// asking than the question is worth, on the one path that must stay
+			// cheap. One attempt per half minute is enough to notice that the
+			// tunnel was switched off, which is the only thing that can change
+			// the answer.
+			if time.Since(lastProxyAttempt) >= 30*time.Second {
+				lastProxyAttempt = time.Now()
+				res, err := a.enableSystemProxy("background")
+				if err != nil {
+					Log("system proxy not enabled: %v", err, "WARN")
+				} else if res.Took {
+					proxyArmed = true
+				}
 			}
 		}
 		// re-arm when the user flips the switch back on in the UI
@@ -2431,6 +2589,27 @@ func (a *App) SetMode(mode string) error {
 	if err := a.core.SetMode(mode); err != nil {
 		return err
 	}
+	// Global mode routes everything through the GLOBAL selector, and that selector
+	// starts at DIRECT because that is mihomo's default for it. Setting the mode
+	// alone therefore made "global" mean "everything direct": measured with global
+	// selected, the core's own table showed
+	//
+	//	GLOBAL  type=Selector  now=[DIRECT]
+	//
+	// and the traffic log was full of "using GLOBAL" for foreign sites while every
+	// one of them timed out - the opposite of what the switch promises.
+	//
+	// So the selector is pointed at PROXY, which is the group this program keeps on
+	// the chosen node. Rule mode does not consult GLOBAL at all, so leaving it set
+	// is harmless there and means switching back to global works immediately.
+	if mode == "global" {
+		if err := a.core.Select("GLOBAL", "PROXY"); err != nil {
+			Log("could not point GLOBAL at PROXY: %v", err, "WARN")
+			return fmt.Errorf("已切换为全局模式，但未能把 GLOBAL 指向 PROXY（%v）："+
+				"全局模式会把所有流量都按 GLOBAL 组的当前选择处理，而它默认是 DIRECT，"+
+				"那等于让所有网站都直连", err)
+		}
+	}
 	_, err := a.store.UpdateSettings(map[string]interface{}{"mode": mode})
 	if err == nil {
 		Log("proxy mode -> %s", mode)
@@ -2699,6 +2878,52 @@ func (a *App) SelectSubscription(id string) (int, error) {
 
 // ---- settings -------------------------------------------------------------
 
+// validatePortPatch rejects a settings patch whose ports cannot work.
+//
+// The bound is the TCP port range, and 0 is refused too: zero means "let the OS
+// choose" to a listener, but every other part of this program treats a stored
+// port as the port it serves - the generated configuration, the system proxy it
+// points at, and the DNS port derived as MixedPort+300. A stored 0 is therefore a
+// port that no component can agree on.
+//
+// The upper end is checked against the DNS derivation as well, so a port that is
+// itself valid but whose DNS port is not cannot be stored either.
+func validatePortPatch(patch map[string]interface{}) error {
+	check := func(key string, v interface{}, allowZero bool) error {
+		n, ok := v.(int)
+		if !ok {
+			return fmt.Errorf("%s 必须是整数端口号", key)
+		}
+		if n == 0 && allowZero {
+			return nil
+		}
+		if n < 1 || n > 65535 {
+			return fmt.Errorf("%s 必须是 1-65535 之间的端口号，收到 %d。"+
+				"超出范围的端口无法监听，系统代理会指向一个没人服务的端口，"+
+				"那会让这台机器没有网络", key, n)
+		}
+		return nil
+	}
+	if v, ok := patch["mixedPort"]; ok {
+		if err := check("mixedPort", v, false); err != nil {
+			return err
+		}
+		// The DNS listener is derived as MixedPort+300 and must also be valid.
+		if n, isInt := v.(int); isInt && n+300 > 65535 {
+			return fmt.Errorf("mixedPort 不能大于 65235：DNS 监听端口按 mixedPort+300 "+
+				"推导，%d 会得到 %d，超出端口范围", n, n+300)
+		}
+	}
+	for _, key := range []string{"uiPort", "controlPort", "apiPort"} {
+		if v, ok := patch[key]; ok {
+			if err := check(key, v, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 	// The interface toggles "autoPick", but the stored field is the inverse
 	// ("autoPickOff") so that older settings files default to ON.
@@ -2710,6 +2935,21 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 		}
 	}
 	before := a.store.Settings()
+	// Ports are validated before anything is written, because a bad one takes the
+	// machine offline and does it silently.
+	//
+	// Measured while testing this interface: a patch of {"mixedPort":99999} was
+	// accepted, ok:true, and the value was persisted. The core cannot bind 99999
+	// (the maximum is 65535), so the mixed listener did not exist - and the system
+	// proxy, if it is enabled, points at a port nobody serves, which is exactly the
+	// "no internet and no explanation" state this program has spent versions
+	// avoiding. The startup guard repairs it only on the NEXT launch.
+	//
+	// Rejecting the patch is the only place that can refuse before the damage:
+	// after the write, the port is already the saved configuration.
+	if err := validatePortPatch(patch); err != nil {
+		return before, err
+	}
 	next, err := a.store.UpdateSettings(patch)
 	if err != nil {
 		return next, err
@@ -2766,8 +3006,13 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 	}
 	if sp, ok := patch["systemProxy"].(bool); ok {
 		if sp {
-			if _, err := a.sysproxy.Enable(next.MixedPort, next.ProxyBypass, false); err != nil {
+			// Through the same gate as every other caller: a settings patch must
+			// not be able to put both takeovers on at once.
+			res, err := a.enableSystemProxy("settings")
+			if err != nil {
 				Log("could not enable system proxy: %v", err, "WARN")
+			} else if res.Refused != "" {
+				Log("settings asked for the system proxy but %s", res.Detail, "WARN")
 			}
 		} else {
 			a.sysproxy.Disable()
