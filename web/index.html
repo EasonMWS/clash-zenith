@@ -233,6 +233,11 @@
           <h3>TUN 接管</h3>
           <span class="pill" id="tun-state-pill">未启用</span>
         </div>
+        <!-- The resident service decides whether TUN can be switched on without asking
+             for authorisation, and whether "退出" really stopped everything. It used to
+             be invisible, and the user asked "服务结束了为啥还有 mihomo" about a part of
+             the program the interface never mentioned. -->
+        <p class="hint" id="service-line">常驻服务：<span id="service-state">检测中…</span></p>
         <p class="hint" id="tun-scope">
           当前是<strong>系统代理兼容模式</strong>：只有遵循系统代理的应用走 Zenith，
           游戏、原始 UDP 和自带网络栈的程序会直连。

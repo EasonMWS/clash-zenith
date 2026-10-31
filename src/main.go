@@ -599,7 +599,25 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 	// reaches for without opening the window.
 	tray.On(idTun, func() { trayToggleTun(app, bringUp) })
 	tray.On(idQuit, func() {
-		if !Confirm(AppName, "退出 Zenith？\n\n会同时停止代理并还原系统代理设置。") {
+		// "Quit" means quit, and that is a correction.
+		//
+		// The old wording promised only "stop the proxy and restore the system proxy
+		// setting", and that is literally what happened: the window closed, the
+		// resident service kept running, and the core it owned kept listening. Measured
+		// from the user's side:
+		//
+		//   quit Zenith -> the window is gone
+		//   mihomo.exe still running as a child of the service, holding 7797/7944/8244
+		//
+		// Two rounds of that reached me as "服务结束了为啥还有 mihomo" and, earlier, as
+		// "zenith 关了但内核还在跑". A program whose exit does not stop it is a program
+		// the user has to kill by hand, and the service is not obvious enough for that
+		// to be a fair expectation.
+		if !Confirm(AppName, "退出 Zenith？\n\n会同时：\n"+
+			"  · 停止代理内核\n"+
+			"  · 停止常驻服务（下次用 TUN 需要再授权一次）\n"+
+			"  · 还原系统代理设置\n"+
+			"  · 移除 TUN 接管（如果开着）") {
 			return
 		}
 		// tear the tray down first so no ghost icon is left in the notification area
@@ -608,7 +626,7 @@ func wireTray(tray *Tray, app *App, srv *Server, uiPort int) {
 		case <-tray.closed:
 		case <-time.After(2 * time.Second):
 		}
-		app.Shutdown()
+		app.ShutdownCompletely()
 	})
 
 	// The menu is rebuilt every time it opens, so the ticks and the labels can

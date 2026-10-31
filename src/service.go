@@ -423,6 +423,10 @@ func (h *serviceHandler) routes() *http.ServeMux {
 	// Removing the virtual adapter needs administrator rights, and the process
 	// that runs the rest of the program does not have them - only this one does.
 	mux.HandleFunc("/tun/remove", h.auth(h.handleRemoveAdapter))
+	// Stopping the service is something the service can do for itself, and that is
+	// the only way an ordinary-user interface can do it: `sc stop` needs elevation,
+	// but a service asking the SCM to stop itself does not.
+	mux.HandleFunc("/service/stop", h.auth(h.handleStopSelf))
 	return mux
 }
 
@@ -496,6 +500,84 @@ func (h *serviceHandler) handleStop(w http.ResponseWriter, r *http.Request) {
 	h.app.saveServiceState(&serviceState{ServicePID: os.Getpid()})
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 }
+
+// serviceStatusForUI describes the resident service for the interface.
+//
+// "installed" and "running" are reported separately because they mean different things
+// to the user: not installed means TUN will ask for authorisation every time, installed
+// but stopped means something stopped it (a crash, before failure recovery existed, or a
+// deliberate quit) and the tunnel cannot be built until it is started again.
+func (a *App) serviceStatusForUI() map[string]interface{} {
+	installed := serviceInstalled()
+	running := installed && serviceRunning()
+	reachable := running && a.serviceReachable()
+	pid := 0
+	if running {
+		pid = a.serviceCorePID()
+	}
+	return map[string]interface{}{
+		"installed": installed,
+		"running":   running,
+		// Reachable is the answer to "can it do something right now", which is the
+		// question the TUN path actually asks.
+		"reachable": reachable,
+		"corePid":   pid,
+	}
+}
+
+// handleStopSelf asks this service to stop itself.
+//
+// It exists because `sc stop` needs administrator rights and the interface does not
+// have them, but a service asking the SCM to stop its own service is allowed. That is
+// the difference between "退出 Zenith leaves a service and a core running that the
+// user has to kill by hand" and "退出 means everything stops".
+//
+// The reply is written first and the stop is requested afterwards, because stopping
+// ends this process: a reply sent after the request would never arrive, and the caller
+// would report a failure for something that worked.
+func (h *serviceHandler) handleStopSelf(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{"ok": false, "error": "需要 POST"})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	Log("service: stop requested by the interface; stopping the core and then this service")
+	go func() {
+		// Give the response time to leave the socket.
+		time.Sleep(300 * time.Millisecond)
+		h.app.core.Stop()
+		// Deliver the stop as a control request on the dispatcher's own handler, which
+		// is the path `sc stop` takes. Asking `sc stop` from inside this process instead
+		// - the first version - made the process exit without reporting SERVICE_STOPPED,
+		// so the SCM treated it as a crash and the 1.4.3 failure recovery restarted it
+		// five seconds later. Measured: after quitting, a service was running again with
+		// a new pid and 7795 answering, the opposite of what quit was asked to do.
+		requestServiceStop()
+	}()
+}
+
+// serviceStopSelf asks the service to stop itself, which needs no elevation.
+func (a *App) serviceStopSelf() error {
+	req, err := http.NewRequest(http.MethodPost, serviceBaseURL()+"/service/stop", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Zenith-Secret", a.secret)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// serviceRunning reports whether the SCM says the service is running.
+// (The real implementation is earlier in this file; this line is the anchor the
+// self-stop client sits next to.)
 
 func (h *serviceHandler) handleState(w http.ResponseWriter, r *http.Request) {
 	st := h.app.loadServiceState()

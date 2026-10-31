@@ -130,6 +130,39 @@ func (d *scmDispatcher) requestStop() {
 // Stopped reports the channel the service body waits on.
 func (d *scmDispatcher) Stopped() <-chan struct{} { return d.stopCh }
 
+// activeDispatcher is the dispatcher serving this process, if any.
+//
+// Kept so the service's own HTTP surface can ask for a clean stop from a different
+// goroutine. Without it the only way out was `sc stop` from inside the service, which
+// exits without reporting SERVICE_STOPPED and is therefore treated as a crash - and the
+// failure recovery restarts it seconds later.
+var (
+	activeDispatcherMu sync.Mutex
+	activeDispatcher   *scmDispatcher
+)
+
+func setActiveDispatcher(d *scmDispatcher) {
+	activeDispatcherMu.Lock()
+	activeDispatcher = d
+	activeDispatcherMu.Unlock()
+}
+
+// requestServiceStop asks this process's SCM dispatcher to stop the service the way
+// `sc stop` would, so the SCM sees a clean STOPPED and the failure recovery stays idle.
+// It returns false when there is no dispatcher, which is the ordinary case for a
+// process that was not started by the SCM.
+func requestServiceStop() bool {
+	activeDispatcherMu.Lock()
+	d := activeDispatcher
+	activeDispatcherMu.Unlock()
+	if d == nil {
+		return false
+	}
+	d.report(svcStateStopPending, 0, 30000)
+	d.requestStop()
+	return true
+}
+
 // svcEntryCalled is closed the first time the service entry point runs.
 //
 // A channel and a sync.Once rather than a package variable, because it is written on the
@@ -309,6 +342,9 @@ func serviceMainTrampoline(argcRaw, argvRaw uintptr) uintptr {
 	d := &scmDispatcher{stopCh: make(chan struct{})}
 
 	svcInstance = d
+	// Published so the service's own HTTP surface can request a clean stop from
+	// another goroutine, on the same path `sc stop` takes.
+	setActiveDispatcher(d)
 	// The handler pointer is created and kept before the call, and the call is made
 	// through a variable so the exact arguments can be logged.
 	//

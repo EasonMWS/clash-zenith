@@ -741,7 +741,10 @@ func (s *Server) handleQuit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"ok": true})
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		s.app.Shutdown()
+		// The same exit the tray uses: stop the tunnel, the core, the service and the
+		// system proxy. A quit that leaves a service and a core behind is what made the
+		// user have to kill things by hand.
+		s.app.ShutdownCompletely()
 	}()
 }
 

@@ -5728,6 +5728,206 @@ func TestTheGateBelievesTheRouteNotTheStoredMode(t *testing.T) {
 	}
 }
 
+// ---- quitting must stop everything, and a scan must not move the traffic -----
+
+func TestQuitStopsTheServiceAndTheCoreToo(t *testing.T) {
+	// Two separate reports, in the user's own words: "zenith 关了但内核还在跑" and
+	// "服务结束了为啥还有 mihomo". Both times the answer was that the button does not do
+	// what its name says - the window closed, the resident service kept running, and the
+	// core it owned kept listening on 7797/7944/8244.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) ShutdownCompletely() {")
+	if i < 0 {
+		t.Fatal("there is no exit that stops the service, so quitting leaves a resident " +
+			"service and a core running that the user has to kill by hand")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	for _, need := range []string{
+		"DisableTun()",           // the tunnel
+		"removeAdapterWithRights", // a leftover adapter
+		"StopCoreThroughOwner()", // the core, via its owner
+		"sysproxy.Restore()",     // the registry proxy
+		"serviceStopSelf()",      // the service, by asking it
+	} {
+		if !strings.Contains(body, need) {
+			t.Errorf("the complete exit does not do %s, so part of the program keeps "+
+				"running after the user quits", need)
+		}
+	}
+	// The order that matters: the adapter removal needs the service alive, and the
+	// proxy must be restored before the things that serve it go away.
+	tun := strings.Index(body, "DisableTun()")
+	svc := strings.Index(body, "serviceStopSelf()")
+	if tun >= 0 && svc >= 0 && tun > svc {
+		t.Error("the service is stopped before the tunnel is torn down, so the adapter " +
+			"removal loses the only process that can do it")
+	}
+	restore := strings.Index(body, "sysproxy.Restore()")
+	if restore >= 0 && svc >= 0 && restore > svc {
+		t.Error("the system proxy is restored after the service stops, so the registry is " +
+			"left pointing at a port that has already gone")
+	}
+}
+
+func TestBothExitPathsStopEverything(t *testing.T) {
+	// The tray is not the only way out: /api/quit is what the window and `-stop` use.
+	// A second exit path that calls the old Shutdown would bring the whole problem back
+	// for anyone who quits that way.
+	for _, f := range []string{"main.go", "server.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Skipf("%s is not readable: %v", f, err)
+		}
+		body := string(src)
+		if !strings.Contains(body, "ShutdownCompletely()") {
+			t.Errorf("%s still exits through the old shutdown, so that route leaves the "+
+				"service and the core running", f)
+		}
+	}
+}
+
+func TestTheServiceCanStopItselfWithoutElevation(t *testing.T) {
+	// `sc stop` needs administrator rights and the interface does not have them, so an
+	// ordinary-user quit could never stop the service it started. A service asking the
+	// SCM to stop itself is allowed, which is what makes the complete exit possible.
+	src, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Skipf("service.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, `"/service/stop"`) {
+		t.Fatal("the service has no self-stop route, so only an elevated process can " +
+			"stop it")
+	}
+	if !strings.Contains(text, "func (h *serviceHandler) handleStopSelf(") {
+		t.Fatal("the self-stop route has no handler")
+	}
+	handler := strings.Index(text, "func (h *serviceHandler) handleStopSelf(")
+	body := text[handler : handler+1600]
+	// The reply must be written before the stop is requested, or the caller never hears
+	// a success and reports a failure for something that worked.
+	reply := strings.Index(body, "writeJSON(w, 200")
+	stop := strings.Index(body, "requestServiceStop()")
+	if reply < 0 || stop < 0 || reply > stop {
+		t.Error("the handler stops the service before replying, so the caller always sees " +
+			"a failure for a stop that worked")
+	}
+	// And it must stop through the dispatcher, not by running `sc stop` on itself.
+	//
+	// Measured: asking `sc stop` from inside the service makes the process exit without
+	// reporting SERVICE_STOPPED, the SCM treats that as a crash, and the failure
+	// recovery registered in 1.4.3 starts it again five seconds later. Observed exactly
+	// that after quitting: a service back up with a new pid and 7795 answering.
+	if strings.Contains(body, `serviceControl("stop"`) {
+		t.Error("the service stops itself with `sc stop`, which exits without reporting " +
+			"SERVICE_STOPPED and is treated as a crash - so the failure recovery restarts " +
+			"the service the user just quit")
+	}
+	if !strings.Contains(body, "requestServiceStop()") {
+		t.Error("the handler never requests the clean stop")
+	}
+	scm, err := os.ReadFile("scm.go")
+	if err != nil {
+		t.Skipf("scm.go is not readable: %v", err)
+	}
+	sbody := string(scm)
+	if !strings.Contains(sbody, "func requestServiceStop() bool") {
+		t.Error("there is no way to deliver a stop on the dispatcher's own path")
+	}
+	if !strings.Contains(sbody, "setActiveDispatcher(d)") {
+		t.Error("the dispatcher is never published, so nothing can ask for a clean stop")
+	}
+	// The clean-stop helper has to go through the dispatcher, and report STOP_PENDING
+	// first so the SCM sees a service that is stopping rather than one that vanished.
+	di := strings.Index(sbody, "func requestServiceStop() bool")
+	dbody := sbody[di : di+900]
+	for _, need := range []string{"svcStateStopPending", "requestStop()"} {
+		if !strings.Contains(dbody, need) {
+			t.Errorf("the clean-stop helper does not do %s, so the SCM sees a crash rather "+
+				"than a stop", need)
+		}
+	}
+}
+
+func TestOptimizeDoesNotMoveTheConnectionItJustMeasured(t *testing.T) {
+	// A scan is a measurement, not a decision to move. It used to call switchTo
+	// unconditionally, and switchTo drops every live connection - so enabling the
+	// 30-minute scan turned a stable connection into one that was torn down on a
+	// schedule. That is why the feature was left off, and it is the reason given for "it
+	// always messes up my otherwise stable network".
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	marker := "optimize: keeping the node in use"
+	if !strings.Contains(text, marker) {
+		t.Fatal("nothing keeps the current node after a scan")
+	}
+	i := strings.Index(text, marker)
+	// Find the enclosing branch: the switchTo must be inside an if, not on every path.
+	before := text[:i]
+	lastIf := strings.LastIndex(before, "if switched {")
+	if lastIf < 0 || i-lastIf > 400 {
+		t.Error("switchTo is not guarded by the switched flag, so a scan still moves the " +
+			"connection even when the node survived")
+	}
+}
+
+func TestOptimizedNodeNamesAreStableAcrossScans(t *testing.T) {
+	// The name carried the measured latency, so every scan produced different names for
+	// the same edge. To the core a renamed proxy is a new proxy: its latency history is
+	// gone (the node list showed a column of dashes right after each scan), and the node
+	// in use stopped existing under its old name.
+	src, err := os.ReadFile("optimizer.go")
+	if err != nil {
+		t.Skipf("optimizer.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, `"优选%02d · %s"`)
+	legacy := strings.Index(text, `"优选%02d · %s · %.0fms"`)
+	if legacy >= 0 {
+		t.Error("the node name still embeds the latency, so every scan renames the nodes " +
+			"and the core loses their history")
+	}
+	if i < 0 {
+		t.Error("the node name is not the stable IP-only form")
+	}
+}
+
+func TestTheServiceStateIsPublishedToTheInterface(t *testing.T) {
+	// Its state decides whether TUN can be switched on without a prompt, and whether a
+	// quit really stopped everything. It was invisible, which is why "服务结束了为啥还有
+	// mihomo" was a fair question.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(src), `"service": a.serviceStatusForUI()`) {
+		t.Error("the status payload does not carry the service state, so the interface " +
+			"cannot tell the user whether it is running")
+	}
+	svc, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Skipf("service.go is not readable: %v", err)
+	}
+	stext := string(svc)
+	if !strings.Contains(stext, "func (a *App) serviceStatusForUI()") {
+		t.Fatal("there is no service state to publish")
+	}
+	for _, need := range []string{`"installed"`, `"running"`, `"reachable"`} {
+		if !strings.Contains(stext, need) {
+			t.Errorf("the published service state lacks %s, which is one of the three "+
+				"things the user needs told apart", need)
+		}
+	}
+}
+
 // ---- self-healing: a missing parent must not leave an orphan -----------------
 
 func TestTheServiceRegistersFailureRecovery(t *testing.T) {

@@ -178,6 +178,12 @@ a:hover { text-decoration: underline; }
 .card-head .hint { margin: 0 0 0 auto; text-align: right; }
 
 .hint { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+
+/* The resident service line. Three states that mean different things to the user, so
+   three colours: running, not running (TUN cannot be built without it), and starting. */
+.svc-on   { color: #35d07f; }
+.svc-off  { color: #ff7b72; }
+.svc-warn { color: #ffb020; }
 .spacer { flex: 1 1 auto; }
 .top-gap { margin-top: 14px; }
 .right { text-align: right; }

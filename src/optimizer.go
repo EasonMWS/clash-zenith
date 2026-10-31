@@ -714,12 +714,28 @@ func (o *Optimizer) ScanEdges(nodes []Proxy, st Settings, minWanted int) ([]Prox
 			if p.OriginHost == "" {
 				p.OriginHost = oc.group.ep.SNI
 			}
-			// The IP already identifies the winner; the tunnel suffix only has to
-			// disambiguate when more than one relay is in play.
+			// The name is a STABLE identity, not a snapshot of the measurement.
+			//
+			// It used to carry the measured latency ("优选01 · 1.2.3.4 · 256ms"),
+			// which meant every scan produced different names for the same edge: the
+			// ranking reshuffles and the number always changes. To the core a renamed
+			// proxy is a NEW proxy - its latency history is gone (the interface showed
+			// a list of dashes right after every scan) and, worse, the node in use
+			// stopped existing under its old name, so the completion path switched
+			// away from it and dropped every live connection.
+			//
+			// Measured consequence, reported by the user: enabling the 30-minute scan
+			// turned a stable connection into one that broke and re-routed routinely,
+			// which is why the feature was left off.
+			//
+			// So the name is now just the edge address (plus the relay index when more
+			// than one relay is in play). The latency is still shown - it lives in
+			// MeasuredMS and reaches the interface as a field, which is where a number
+			// that changes belongs.
 			if len(groups) > 1 {
-				p.Name = fmt.Sprintf("优选T%d-%02d · %s · %.0fms", oc.group.index, i+1, r.IP, r.Median*1000)
+				p.Name = fmt.Sprintf("优选T%d-%02d · %s", oc.group.index, i+1, r.IP)
 			} else {
-				p.Name = fmt.Sprintf("优选%02d · %s · %.0fms", i+1, r.IP, r.Median*1000)
+				p.Name = fmt.Sprintf("优选%02d · %s", i+1, r.IP)
 			}
 			out = append(out, p)
 		}

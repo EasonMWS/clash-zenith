@@ -40,7 +40,7 @@ var healthSweepTargets = []string{
 
 const (
 	AppName    = "Zenith"
-	AppVersion = "1.4.3"
+	AppVersion = "1.4.4"
 
 	// coreStartGrace is how long the watchdog waits before it decides the core
 	// is broken. A first run against an empty data directory downloads the rule
@@ -2635,6 +2635,14 @@ func (a *App) Status() map[string]interface{} {
 		// switch it is offering is worse than no menu item.
 		"tunMode":      st.TunMode,
 		"tunRun":       a.TunRunState(),
+		// Whether the resident service exists and is running.
+		//
+		// Added because its state was invisible: the user reported "服务结束了为啥还有
+		// mihomo", which is a question about a thing the interface never showed. The
+		// service is what makes TUN work without asking for authorisation every time, so
+		// whether it is running decides what the TUN switch can even do - and a program
+		// that hides which of its parts are running invites exactly that confusion.
+		"service": a.serviceStatusForUI(),
 		"optimizing":   a.opt.Running(),
 		"progress":     a.opt.Progress(),
 		"optSummary":   a.opt.LastSummary(),
@@ -2782,14 +2790,33 @@ func (a *App) StartOptimize() bool {
 		// selected must NOT be replaced just because it is absent from the
 		// optimised list.
 		cur := a.store.Snapshot().Current
+		switched := false
 		if !a.nodeExists(cur) {
 			cur = best[0].Name
 			_ = a.store.SetCurrent(cur)
+			switched = true
 		}
 		if err := a.applyConfig(); err != nil {
 			Log("hot reload after optimize failed: %v", err, "WARN")
 		}
-		_ = a.switchTo(cur, false)
+		// Only move the traffic when the node in use is genuinely gone.
+		//
+		// This used to call switchTo unconditionally, and switchTo drops every live
+		// connection so a bad route is not kept alive. For a scan that is the wrong
+		// trade: the node in use is usually still there and still fine, so the scan
+		// was interrupting a working connection on a schedule - every thirty minutes
+		// the browser and everything else lost their sockets and reconnected.
+		//
+		// A scan is a measurement, not a decision to move. When the node survives the
+		// scan the core keeps serving it and nothing is torn down; what moves traffic
+		// is auto-pick, and it moves it when a node actually fails rather than when a
+		// measurement was taken.
+		if switched {
+			Log("optimize: the node in use no longer exists after the scan; moving to %q", cur)
+			_ = a.switchTo(cur, false)
+		} else {
+			Log("optimize: keeping the node in use (%q); the scan only refreshed the pool", cur)
+		}
 		// fresh measurements exist now, so auto-pick is in charge again
 		a.mu.Lock()
 		a.userPicked = ""
@@ -3130,6 +3157,93 @@ func (a *App) ApplySettings(patch map[string]interface{}) (Settings, error) {
 }
 
 // ---- shutdown -------------------------------------------------------------
+
+// ShutdownCompletely stops everything: the tunnel, the core, the resident service and
+// the system proxy.
+//
+// It is what the tray's "退出" now does, because "退出" that leaves a service and a core
+// running is not an exit - it is a window closing while the program keeps going. Two
+// separate reports reached me in exactly those words ("zenith 关了但内核还在跑",
+// "服务结束了为啥还有 mihomo"), and both times the honest answer was "because the
+// button does not do what its name says".
+//
+// The order matters and each step is here for a measured reason:
+//
+//  1. TUN off first. Removing the adapter needs the service to still be alive (it is
+//     the process with the rights), so it cannot happen after the service stops.
+//  2. The core stopped through its owner, so a service-owned core is stopped by the
+//     service rather than taskkilled from here.
+//  3. The system proxy restored while this process is still running, so the registry
+//     never points at a port that has already died.
+//  4. The service stopped last, by asking it to stop itself - `sc stop` needs
+//     elevation and this process does not have it, but a service may stop itself.
+//
+// Every step is best-effort and logged: a user who asked to quit should not be left
+// with the program still running because one step failed.
+func (a *App) ShutdownCompletely() {
+	a.mu.Lock()
+	if a.quitting {
+		a.mu.Unlock()
+		return
+	}
+	a.quitting = true
+	a.mu.Unlock()
+
+	Log("shutting down completely (tunnel, core, service, system proxy)")
+	close(a.stopCh)
+
+	// 1. The tunnel, while the service can still remove the adapter.
+	if a.store != nil && a.store.Settings().TunMode != TunOff {
+		if err := a.DisableTun(); err != nil {
+			Log("shutdown: TUN could not be turned off: %v", err, "WARN")
+		}
+	}
+	// An adapter can also be left over with the mode already cleared.
+	if a.store != nil {
+		if name := a.store.Settings().NormalizedTunDevice(); tunAdapterExists(name) {
+			if err := a.removeAdapterWithRights(name); err != nil {
+				Log("shutdown: leftover adapter %q could not be removed: %v", name, err, "WARN")
+			}
+		}
+	}
+
+	// 2. The core, through whoever owns it.
+	if err := a.StopCoreThroughOwner(); err != nil {
+		Log("shutdown: stopping the core reported: %v", err, "WARN")
+	}
+
+	// 3. The system proxy, before anything that serves it goes away.
+	a.sysproxy.Restore()
+	_ = a.store.Save()
+
+	// 4. The service, last, by asking it to stop itself.
+	if a.serviceReachable() {
+		if err := a.serviceStopSelf(); err != nil {
+			Log("shutdown: the service could not be asked to stop: %v", err, "WARN")
+		} else {
+			// Wait for it to actually go, so the log says what happened rather than
+			// what was requested.
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) {
+				if !serviceRunning() && !a.serviceReachable() {
+					break
+				}
+				time.Sleep(300 * time.Millisecond)
+			}
+			if serviceRunning() {
+				Log("shutdown: the service is still running after being asked to stop", "WARN")
+			} else {
+				Log("shutdown: service stopped")
+			}
+		}
+	}
+
+	Log("Zenith stopped (service, core, tunnel and system proxy all stopped)")
+	if a.onQuit != nil {
+		a.onQuit()
+	}
+	os.Exit(0)
+}
 
 func (a *App) Shutdown() {
 	a.mu.Lock()

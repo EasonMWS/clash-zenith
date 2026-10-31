@@ -677,6 +677,7 @@ function renderStatus(st) {
   $('#brand-sub').textContent = 'v' + (st.version || '1.0.0');
   $('#side-dot').className = 'dot ' + (st.coreUp ? 'on' : 'off');
   $('#side-core').textContent = st.coreUp ? '内核运行中' : '内核已停止';
+  renderServiceState(st.service);
 
   const meta = [];
   if (st.coreVersion) meta.push(st.coreVersion);
@@ -1091,6 +1092,31 @@ async function loadTun() {
   }
   renderTunEnv(r.env, r.run, r.mode);
   return r;
+}
+
+// renderServiceState says whether the resident service is installed and running.
+//
+// It is shown because its state decides two things the user could not see: whether TUN
+// can be switched on without an authorisation prompt, and whether "退出" really stopped
+// everything. The absence of this line is why "服务结束了为啥还有 mihomo" was a fair
+// question - the interface never mentioned the service at all.
+function renderServiceState(svc) {
+  const el = $('#service-state');
+  if (!el) return;
+  if (!svc) { el.textContent = '未知'; return; }
+  if (!svc.installed) {
+    el.textContent = '未安装（启用 TUN 时需要授权一次）';
+    el.className = 'svc-off';
+  } else if (!svc.running) {
+    el.textContent = '已安装但未运行（TUN 现在无法启用；点“启用 TUN”会重新启动它）';
+    el.className = 'svc-off';
+  } else if (svc.reachable) {
+    el.textContent = svc.corePid ? `运行中，内核 PID ${svc.corePid}` : '运行中，当前未持有内核';
+    el.className = 'svc-on';
+  } else {
+    el.textContent = '运行中但还没有响应（可能正在启动）';
+    el.className = 'svc-warn';
+  }
 }
 
 function startTunPoll() {
