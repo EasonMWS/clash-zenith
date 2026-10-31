@@ -5728,6 +5728,246 @@ func TestTheGateBelievesTheRouteNotTheStoredMode(t *testing.T) {
 	}
 }
 
+// ---- self-healing: a missing parent must not leave an orphan -----------------
+
+func TestTheServiceRegistersFailureRecovery(t *testing.T) {
+	// Measured on this machine: the resident service died twice with the SCM's 7034
+	// "terminated unexpectedly" (exit 1067), and because no recovery actions had ever
+	// been registered, Windows did nothing. The service stayed dead for twenty-three
+	// hours, until a reboot.
+	//
+	// What that costs: the core it had started kept running as an orphan, holding the
+	// TUN adapter and the default route. The tunnel still worked, so the machine looked
+	// healthy, while the only process able to remove the adapter was gone. "关闭 TUN"
+	// then failed with "需要管理员权限，而常驻服务也不可用", and the advice was to
+	// reboot the computer.
+	src, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Skipf("service.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func configureServiceRecovery() {")
+	if i < 0 {
+		t.Fatal("the service is installed with no failure recovery, so one crash leaves " +
+			"it dead until a reboot and takes the program's privileges with it")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	for _, need := range []string{`"failure"`, "restart/", `"failureflag"`} {
+		if !strings.Contains(body, need) {
+			t.Errorf("failure recovery does not register %s, so Windows treats a crashed "+
+				"service as deliberately stopped", need)
+		}
+	}
+	// It has to be reached from both places: a fresh install, and an installation that
+	// was made by a build without any recovery at all - the second is the case the
+	// user actually hit, so a fix that only applies to new installs would not have
+	// helped them.
+	if !strings.Contains(text, "configureServiceRecovery()\n") {
+		t.Error("installService never registers failure recovery")
+	}
+	elevated, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	if !strings.Contains(string(elevated), "configureServiceRecovery()") {
+		t.Error("the elevated helper does not register failure recovery, so a service " +
+			"installed by an older build keeps its missing recovery forever")
+	}
+}
+
+func TestTheServiceBindsItsCoreToAKillOnCloseJob(t *testing.T) {
+	// The property that no exit handler can provide: a hard kill of the service.
+	//
+	// Measured shape of the failure: the service crashed, its core kept running because
+	// nothing tied the two lifetimes together, and the orphan held the TUN adapter and
+	// the default route. A core that outlives its owner is the dangerous state.
+	src, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Skipf("service.go is not readable: %v", err)
+	}
+	text := string(src)
+	if !strings.Contains(text, "createKillOnCloseJob()") {
+		t.Fatal("the service never creates a kill-on-close job, so its core survives a " +
+			"hard kill and becomes the orphan that holds the adapter and the routes")
+	}
+	if !strings.Contains(text, "assignProcessToJob(serviceCoreJob") {
+		t.Error("the job is created but no core is put into it, so it guarantees nothing")
+	}
+	win, err := os.ReadFile("winapi.go")
+	if err != nil {
+		t.Skipf("winapi.go is not readable: %v", err)
+	}
+	wtext := string(win)
+	if !strings.Contains(wtext, "0x2000") {
+		t.Error("the job is created without JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000), " +
+			"so closing the handle kills nothing")
+	}
+}
+
+func TestStartupHealsACoreWhoseOwnerIsGone(t *testing.T) {
+	// The recorded failure: service pid gone, core pid still running, adapter and
+	// default route still in place. The old startup adopted that core, which preserved
+	// exactly the state that cannot be repaired.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) healOrphanedCore() {")
+	if i < 0 {
+		t.Fatal("startup does not look for a core whose owner is gone, so an orphan " +
+			"holds the TUN adapter and the routes indefinitely")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	// It must decide from this installation's own record, not from a process scan.
+	if !strings.Contains(body, "loadServiceState()") {
+		t.Error("the orphan check does not use this installation's record, so it cannot " +
+			"tell our core from another product's mihomo")
+	}
+	for _, need := range []string{"serviceRunning()", "processRunning(", "ProcessName("} {
+		if !strings.Contains(body, need) {
+			t.Errorf("the orphan check does not verify %s, so it could kill the wrong "+
+				"process", need)
+		}
+	}
+	// And it has to run before the core is started, or the new core competes with it.
+	boot := strings.Index(text, "func (a *App) Boot() {")
+	if boot >= 0 {
+		bootBody := text[boot : boot+700]
+		if !strings.Contains(bootBody, "healOrphanedCore()") {
+			t.Error("the orphan heal does not run during boot")
+		}
+		if strings.Index(bootBody, "healOrphanedCore()") > strings.Index(bootBody, "EnsureUsablePort()") {
+			t.Error("the orphan heal runs after the port is claimed, so the orphan is " +
+				"adopted before it can be cleaned up")
+		}
+	}
+}
+
+func TestTunFallsBackToTheSystemProxyWhenItCannotBeBuilt(t *testing.T) {
+	// Creating a TUN adapter needs administrator rights, and there are exactly two ways
+	// to have them: the resident service, or an elevated instance. After the service had
+	// crashed, a launch with tunMode=compat left the machine with a remembered tunnel,
+	// no adapter, no system proxy (the two are mutually exclusive) and therefore no
+	// working takeover at all. The user asked for "recover to a normal usable state
+	// without the service", and this is that state.
+	src, err := os.ReadFile("app.go")
+	if err != nil {
+		t.Skipf("app.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) ensureTakeoverFeasible() {")
+	if i < 0 {
+		t.Fatal("nothing checks whether the remembered tunnel can actually be built, so " +
+			"a machine can end up with no tunnel and no proxy")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	for _, need := range []string{"isElevated()", "serviceReachable()", `"systemProxy": true`} {
+		if !strings.Contains(body, need) {
+			t.Errorf("the fallback does not consider %s, so it either overwrites a working "+
+				"setup or leaves the user with no takeover", need)
+		}
+	}
+	// It must run before the configuration is written, or the core starts against a tun
+	// block it has no rights to create.
+	boot := strings.Index(text, "func (a *App) Boot() {")
+	if boot >= 0 {
+		bootBody := text[boot : boot+800]
+		fb := strings.Index(bootBody, "ensureTakeoverFeasible()")
+		wc := strings.Index(bootBody, "writeConfig(")
+		if fb < 0 || wc < 0 || fb > wc {
+			t.Error("the fallback does not run before the configuration is written, so the " +
+				"core is started against a tun block that cannot be honoured")
+		}
+	}
+}
+
+func TestTunLivenessRequiresACoreAndChecksItFirst(t *testing.T) {
+	// "Adapter present" was treated as "tunnel working", and that is the bug the user
+	// lived through: a dead tunnel with a live adapter and a default route reads as
+	// healthy while every packet is dropped.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) tunnelIsAlive(")
+	if i < 0 {
+		t.Fatal("liveness is decided from the adapter alone")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	core := strings.Index(body, "a.core.IsUp()")
+	adapter := strings.Index(body, "adapterState(")
+	route := strings.Index(body, "defaultRouteUsesAdapter(")
+	if core < 0 || adapter < 0 || route < 0 {
+		t.Fatal("liveness does not require adapter, route and core together")
+	}
+	if core > adapter || core > route {
+		t.Error("the core is not checked first; the other two each start a PowerShell " +
+			"process, so polling this while no core exists would be expensive")
+	}
+	// And the decision must not block startup: the core's own start allows 150s.
+	if !strings.Contains(text, "func (a *App) healDeadTunnelWhenSettled(") {
+		t.Error("the dead-tunnel decision is made on the startup path, where a core that " +
+			"is still starting looks identical to a dead tunnel")
+	}
+}
+
+func TestTheRepairWarningReachesTheInterface(t *testing.T) {
+	// The interface renders the stage only when a run is active or an error is present,
+	// and otherwise shows a pill derived from the stored mode. A warning that sets only
+	// the stage therefore never reaches the user - and the mode-on case is exactly when
+	// it matters.
+	src, err := os.ReadFile("tun.go")
+	if err != nil {
+		t.Skipf("tun.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func (a *App) recordTunnelNeedsRepair(")
+	if i < 0 {
+		t.Fatal("there is no way to record a tunnel that needs repair")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	if !strings.Contains(body, "a.tunRun.Error =") {
+		t.Error("the repair state sets no error, so the interface never shows it")
+	}
+	if !strings.Contains(body, "} else {") {
+		t.Error("the error is only set when a cause is given, so the no-cause case stays " +
+			"invisible")
+	}
+}
+
+func TestAdapterRemovalIsIdentifiedByDeviceNotByName(t *testing.T) {
+	// The guard used to require the literal default name, which made removal impossible
+	// for anyone who had configured a different tunDevice - the setting preserves a
+	// custom name, so every disable, uninstall and rollback failed permanently while the
+	// adapter kept holding the default route.
+	src, err := os.ReadFile("winapi.go")
+	if err != nil {
+		t.Skipf("winapi.go is not readable: %v", err)
+	}
+	text := string(src)
+	i := strings.Index(text, "func removeTunAdapter(")
+	if i < 0 {
+		t.Fatal("removeTunAdapter is missing")
+	}
+	end := strings.Index(text[i:], "\n}\n")
+	body := text[i : i+end]
+	if strings.Contains(body, "name != defaultTunDevice") {
+		t.Error("removal still requires the literal default name, so a configured adapter " +
+			"name can never be removed")
+	}
+	if !strings.Contains(body, "SWD\\WINTUN") && !strings.Contains(body, "SWD\\\\WINTUN") {
+		t.Error("removal does not verify that the device is a wintun adapter, so a laxer " +
+			"name check would be able to target the wrong interface")
+	}
+}
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a

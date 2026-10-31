@@ -38,6 +38,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -561,6 +562,27 @@ func (a *App) serviceStartCore(cfg []byte, mode TunMode) error {
 	if err := a.core.Start(); err != nil {
 		return fmt.Errorf("内核未能启动：%v", err)
 	}
+	// Bind the core to this service process, so it cannot outlive it.
+	//
+	// Measured: the service crashed and the core it had started kept running as an
+	// orphan, holding the TUN adapter and the default route. The tunnel still worked,
+	// which made the machine look healthy, while the only process able to remove the
+	// adapter was gone - so "关闭 TUN" failed and the advice was to reboot.
+	//
+	// With this job in place the kernel does what the design intended and what no
+	// exit handler could guarantee: a hard kill of the service takes the core with it,
+	// the adapter's session ends, and the routes through it stop being used. The next
+	// launch then finds a normal machine instead of an orphan holding the network.
+	if serviceCoreJob != 0 {
+		if pid := a.core.Pid(); pid > 0 {
+			if err := assignProcessToJob(serviceCoreJob, pid); err != nil {
+				Log("service: could not bind the core (pid %d) to the service job: %v",
+					pid, err, "WARN")
+			} else {
+				Log("service: core pid %d bound to the service job; it cannot outlive the service", pid)
+			}
+		}
+	}
 	a.saveServiceState(&serviceState{
 		CorePID:       a.core.Pid(),
 		CoreStartedAt: time.Now().Format(time.RFC3339Nano),
@@ -570,6 +592,11 @@ func (a *App) serviceStartCore(cfg []byte, mode TunMode) error {
 	})
 	return nil
 }
+
+// serviceCoreJob is the kill-on-close job the service puts its core into, so the core
+// cannot survive the service. Zero means no job was created, which is not fatal: the
+// service still works, it just loses the orphan guarantee.
+var serviceCoreJob syscall.Handle
 
 // RunService is the service process's main loop.
 //
@@ -597,6 +624,17 @@ func RunService(rootDir, dataDir, secret string, stop <-chan struct{}) error {
 	}
 	app.sysproxy.SetReadOnly(true)
 	app.core.SetNoOrphanCleanup(true)
+
+	// Create the job before anything can start a core, so every core this service
+	// starts is bound to it. Failure is logged and tolerated: a service without the
+	// orphan guarantee still works, and refusing to start would be worse.
+	if job, err := createKillOnCloseJob(); err != nil {
+		Log("service: could not create the kill-on-close job (%v); a core could outlive "+
+			"this service if it is killed", err, "WARN")
+	} else {
+		serviceCoreJob = job
+		Log("service: kill-on-close job ready; cores started by this service die with it")
+	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", servicePort))
 	if err != nil {
@@ -659,6 +697,36 @@ func serviceControl(args ...string) (string, error) {
 }
 
 // ---- installing the service ------------------------------------------------
+
+// configureServiceRecovery registers what Windows should do when the service dies.
+//
+// Three restarts at 5s, 15s and 60s, with the failure counter reset daily. If it is
+// crashing in a loop the restarts stop being useful and Windows gives up, which is
+// the right behaviour; the log and the interface still say what happened.
+//
+// The flag matters as much as the actions. Without it the actions fire only on a
+// crash Windows recognises as one; a service that exits without reporting a state
+// is treated as a deliberate stop and left alone. This service has already died in
+// exactly that shape - exit 1067, no crash dump, nothing in the event log beyond
+// "terminated unexpectedly" - and stayed dead for twenty-three hours.
+//
+// Needs elevation, so it runs at install time and from the elevated helper. It is
+// not fatal when it fails: a service without recovery is worse than one with it,
+// but it is not worse than no service at all.
+func configureServiceRecovery() {
+	if out, err := serviceControl("failure", serviceName,
+		"reset=", "86400",
+		"actions=", "restart/5000/restart/15000/restart/60000"); err != nil {
+		Log("could not register service failure recovery: %v (%s)",
+			err, strings.TrimSpace(out), "WARN")
+	} else {
+		Log("service: failure recovery registered (restart at 5s, 15s, 60s)")
+	}
+	if out, err := serviceControl("failureflag", serviceName, "1"); err != nil {
+		Log("could not enable service failure actions on non-crash exits: %v (%s)",
+			err, strings.TrimSpace(out), "WARN")
+	}
+}
 
 // installService registers the service with Windows. It needs elevation, and it is
 // the one authorisation the design depends on.
@@ -733,6 +801,19 @@ func (a *App) installService() error {
 		// Not fatal: a missing description does not stop the service working.
 		Log("could not set the service description: %v (%s)", err, strings.TrimSpace(out), "WARN")
 	}
+	// Failure recovery, because a dead service takes the program's privileges with it.
+	//
+	// Measured on this machine: the service was registered and started, then died
+	// twice with the SCM's 7034 "terminated unexpectedly" (exit 1067) - and because
+	// no recovery actions had ever been registered, Windows did nothing. The service
+	// stayed dead until the machine was rebooted or somebody started it by hand.
+	//
+	// What that costs is not just the service. The core it started kept running as an
+	// orphan, holding the TUN adapter and its default route, so the tunnel carried
+	// traffic while the only process able to remove the adapter was gone. The user's
+	// "关闭 TUN" then failed with "需要管理员权限，而常驻服务也不可用" and the advice
+	// was to reboot.
+	configureServiceRecovery()
 	// If it fails to start, say why rather than reporting a successful install of
 	// something that is not running.
 	if out, err := serviceControl("start", serviceName); err != nil {

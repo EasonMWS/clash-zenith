@@ -87,6 +87,120 @@ func isUserCancel(err error) bool {
 	return err == errUserDeclined || strings.Contains(err.Error(), "declined")
 }
 
+// stopProcess force-terminates one specific pid.
+//
+// Only used on a pid this program itself recorded, and always after checking that the
+// process name is still the one expected - a pid can be reused, and terminating a
+// stranger's process would be far worse than leaving an orphan.
+func stopProcess(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+	cmd := exec.Command("taskkill", "/PID", fmt.Sprint(pid), "/F", "/T")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	out, _ := cmd.CombinedOutput()
+	// The exit code of taskkill is not a reliable verdict either way, so the answer is
+	// read back from the process table.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if alive, err := processRunning(pid); err == nil && !alive {
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("进程 %d 仍在运行（%s）", pid, strings.TrimSpace(string(out)))
+}
+
+// ---- job objects -----------------------------------------------------------
+
+// createKillOnCloseJob creates a job object whose members are killed when the handle
+// closes - that is, when this process dies, whatever the reason including a hard kill.
+//
+// It exists because a core that outlives its owner is dangerous, and that was
+// measured: the resident service crashed (SCM 7034, exit 1067) and the mihomo it had
+// started kept running as an orphan. The orphan held the TUN adapter and the default
+// route, so the tunnel still worked while the only process with the rights to remove
+// the adapter was gone. Clicking "关闭 TUN" then failed with "需要管理员权限，而常驻
+// 服务也不可用", and the only advice was to reboot the machine.
+//
+// A hard kill gives a process no chance to clean up after itself, so no amount of exit
+// handling can fix this. What can fix it is the kernel: a kill-on-close job makes the
+// children die with the parent, which is the property that was missing.
+func createKillOnCloseJob() (syscall.Handle, error) {
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	createJob := kernel32.NewProc("CreateJobObjectW")
+	setInfo := kernel32.NewProc("SetInformationJobObject")
+
+	h, _, err := createJob.Call(0, 0)
+	if h == 0 {
+		return 0, fmt.Errorf("CreateJobObjectW 失败：%v", err)
+	}
+	// JOBOBJECT_EXTENDED_LIMIT_INFORMATION (class 9). Only LimitFlags is set, and only
+	// to JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000); everything else stays zero, so no
+	// quota is imposed on the core.
+	type basicLimit struct {
+		PerProcessUserTimeLimit int64
+		PerJobUserTimeLimit     int64
+		LimitFlags              uint32
+		MinimumWorkingSetSize   uintptr
+		MaximumWorkingSetSize   uintptr
+		ActiveProcessLimit      uint32
+		Affinity                uintptr
+		PriorityClass           uint32
+		SchedulingClass         uint32
+	}
+	type ioCounters struct {
+		ReadOperationCount  uint64
+		WriteOperationCount uint64
+		OtherOperationCount uint64
+		ReadTransferCount   uint64
+		WriteTransferCount  uint64
+		OtherTransferCount  uint64
+	}
+	type extendedLimit struct {
+		Basic          basicLimit
+		Io             ioCounters
+		ProcessMemory  uintptr
+		JobMemory      uintptr
+		PeakProcessMem uintptr
+		PeakJobMem     uintptr
+	}
+	var info extendedLimit
+	info.Basic.LimitFlags = 0x2000
+	if r, _, serr := setInfo.Call(uintptr(h), 9, uintptr(unsafe.Pointer(&info)),
+		unsafe.Sizeof(info)); r == 0 {
+		syscall.CloseHandle(syscall.Handle(h))
+		return 0, fmt.Errorf("SetInformationJobObject 失败：%v", serr)
+	}
+	return syscall.Handle(h), nil
+}
+
+// assignProcessToJob puts an already-running process into a job.
+//
+// The handle is opened by pid rather than taken from the spawn, because the core is
+// started through Core.Start and the pid is the only handle this package can reach.
+// PROCESS_SET_QUOTA and PROCESS_TERMINATE are the rights AssignProcessToJobObject needs.
+func assignProcessToJob(job syscall.Handle, pid int) error {
+	if job == 0 || pid <= 0 {
+		return nil
+	}
+	// PROCESS_TERMINATE (0x0001) and PROCESS_SET_QUOTA (0x0100) are the rights
+	// AssignProcessToJobObject needs; the syscall package does not export the second.
+	const processSetQuota = 0x0100
+	const processTerminate = 0x0001
+	h, err := syscall.OpenProcess(processSetQuota|processTerminate, false, uint32(pid))
+	if err != nil {
+		return fmt.Errorf("打开进程 %d 以加入作业失败：%v", pid, err)
+	}
+	defer syscall.CloseHandle(h)
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	assign := kernel32.NewProc("AssignProcessToJobObject")
+	if r, _, aerr := assign.Call(uintptr(job), uintptr(h)); r == 0 {
+		return fmt.Errorf("AssignProcessToJobObject 失败：%v", aerr)
+	}
+	return nil
+}
+
 // ---- adapters -------------------------------------------------------------
 
 // adapterDescriptions lists the description of every network adapter, obtained
@@ -198,25 +312,51 @@ func tunAdapterExists(name string) bool {
 //
 // The verification at the end is the part that matters most: the previous version
 // returned whatever the command said, and the command said nothing useful.
-func removeTunAdapter(name string) error {
-	if name == "" || name != defaultTunDevice {
-		return fmt.Errorf("拒绝删除非 Zenith 自己的网卡（%q）", name)
+// approvedTunDevice is the only adapter name this process may remove.
+//
+// It defaults to the name Zenith gives its adapter and is replaced by the configured
+// name at startup (see approveTunDevice). Two checks are combined rather than traded:
+// the name must be the one this installation configured, AND the device must prove it
+// is a wintun adapter. The name check keeps a call with an arbitrary name from doing
+// anything at all; the device check keeps a configured-but-wrong name from reaching a
+// physical interface.
+var approvedTunDevice = defaultTunDevice
+
+// approveTunDevice records the adapter name this installation configured.
+//
+// Needed because the setting preserves a custom name, and a removal guard that compared
+// against the built-in default made every disable, uninstall and rollback fail
+// permanently for such a configuration - while the adapter kept holding the default
+// route.
+func approveTunDevice(name string) {
+	if n := strings.TrimSpace(name); n != "" && validAdapterName(n) {
+		approvedTunDevice = n
 	}
-	// The name is fixed by the check above, so this cannot fire today. It is here
-	// because this function runs inside the elevated helper and interpolates into
-	// PowerShell: if the fixed name is ever relaxed, the check stays.
+}
+
+func removeTunAdapter(name string) error {
+	if name == "" {
+		return fmt.Errorf("没有给出要删除的网卡名")
+	}
+	if !strings.EqualFold(name, approvedTunDevice) {
+		return fmt.Errorf("拒绝删除不是本程序配置的网卡（%q，本程序的是 %q）", name, approvedTunDevice)
+	}
 	if !validAdapterName(name) {
 		return fmt.Errorf("网卡名 %q 不可用作命令参数", truncateForMessage(name, 40))
 	}
 	if !tunAdapterExists(name) {
 		return nil
 	}
-	// Read the instance id from the adapter itself rather than constructing one, so
-	// the removal cannot be pointed at anything but the interface we are looking at.
 	inst, err := adapterInstanceID(name)
 	if err != nil {
 		return err
 	}
+	if !strings.HasPrefix(strings.ToUpper(inst), `SWD\WINTUN\`) {
+		return fmt.Errorf("拒绝删除不是 wintun 虚拟网卡的设备（%q 的实例 ID 是 %s）", name, inst)
+	}
+	// The instance id was read from the adapter itself (above) rather than
+	// constructed, so the removal cannot be pointed at anything but the interface
+	// that was just identified as a wintun device.
 	out, runErr := HiddenCommand("pnputil", "/remove-device", inst)
 	if runErr != nil {
 		// Fall back to disabling it. A disabled adapter carries no traffic, which is

@@ -1528,45 +1528,72 @@ func (a *App) rollbackActivate(txB *tunTxn, mode TunMode) {
 // is told the tunnel is still holding the traffic instead of being told it is off.
 func (a *App) DisableTun() error {
 	st := a.store.Settings()
+	name := st.NormalizedTunDevice()
+
 	if st.TunMode == TunOff {
-		// The mode says off, but the adapter may still be holding the routes: a
-		// previous disable that failed, or a core that outlived its setting.
-		// Reporting success here without checking is how the both-on state
-		// started, so the check is unconditional.
-		if tunAdapterExists(st.NormalizedTunDevice()) {
-			return fmt.Errorf("TUN 模式已关闭，但网卡 %q 仍然存在。"+
-				"它可能仍在接管流量——请重试关闭，或重启后删除该网卡",
-				st.NormalizedTunDevice())
+		// Repair a leftover: the mode is off but an adapter of ours is still there.
+		//
+		// This used to return an error and remove nothing, which made the "repair"
+		// path unable to repair the one state it exists for. The mode being off is
+		// not evidence that the adapter is gone.
+		if !tunAdapterExists(name) {
+			return nil
 		}
+		Log("TUN: mode is off but adapter %q is still present; removing it", name, "WARN")
+		if err := a.removeAdapterWithRights(name); err != nil {
+			return fmt.Errorf("网卡 %q 仍然存在：%v", name, err)
+		}
+		Log("TUN: leftover adapter %q removed", name)
 		return nil
 	}
 
-	// Order matters. The core is restarted against a configuration WITHOUT the tun
-	// block first, so the adapter is released by the process that created it -
-	// removing an adapter a running core still owns is what made the removal
-	// "succeed" while the adapter stayed.
-	a.core.Stop()
-	time.Sleep(1200 * time.Millisecond)
-	if err := a.core.Start(); err != nil {
-		// The old core is gone and the new one did not start: the adapter was
-		// released with the old core, but there is no tunnel and no proxy now.
-		// Clearing the mode is correct here, and the error says the core is down.
-		_, _ = a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)})
-		return err
-	}
-	if err := a.removeAdapterWithRights(st.NormalizedTunDevice()); err != nil {
-		// The adapter survived. The mode is deliberately NOT cleared: leaving it
-		// set means the gate keeps the system proxy off, which is the safe half of
-		// the failure, and the message says what to do.
-		Log("TUN disable: adapter %q could not be removed: %v", st.NormalizedTunDevice(), err, "ERR")
-		return fmt.Errorf("关闭 TUN 失败：网卡 %q 仍然存在（%v）。"+
-			"它可能还在接管流量，所以没有把模式标记为已关闭——"+
-			"否则系统代理会被允许同时开启，流量会被两套规则同时接管", st.NormalizedTunDevice(), err)
-	}
+	// Turn the mode off BEFORE the core is restarted, so the configuration generated
+	// for that restart has no tun block and the new core cannot recreate the adapter
+	// that is about to be removed.
+	//
+	// The old order (restart first, then clear the mode) had the restarted core come
+	// up against a configuration that still said `tun: enable: true`, recreate the
+	// adapter, and then have it removed underneath itself. Measured description of
+	// that hazard is in the removal helper: removing an adapter a live core still owns
+	// is what makes the removal report success while the adapter stays.
+	//
+	// Doing it in this order is safe for the exclusion, because the gate decides from
+	// the route rather than from the stored mode: an adapter still holding the default
+	// route keeps the system proxy refused even while the mode reads off.
 	if _, err := a.store.UpdateSettings(map[string]interface{}{"tunMode": string(TunOff)}); err != nil {
 		return err
 	}
-	Log("TUN disabled: adapter %q removed, mode cleared", st.NormalizedTunDevice())
+	if err := a.applyConfig(); err != nil {
+		Log("TUN disable: could not write the tun-off configuration: %v", err, "WARN")
+	}
+
+	// Restart the core through whoever owns it. The service-owned core has to be
+	// stopped through the service: the local Core.Stop runs an orphan sweep that
+	// taskkills it, and the restart then races that kill.
+	if err := a.StopCoreThroughOwner(); err != nil {
+		Log("TUN disable: stopping the core reported: %v", err, "WARN")
+	}
+	time.Sleep(1200 * time.Millisecond)
+	startErr := a.StartCoreThroughOwner(nil, "")
+	if startErr != nil {
+		Log("TUN disable: the core did not restart: %v", startErr, "ERR")
+	}
+
+	if err := a.removeAdapterWithRights(name); err != nil {
+		// The adapter survived. The mode already reads off, which is safe for the
+		// exclusion (that is decided by the route), but it is not safe for the user:
+		// an adapter holding the routes with no tunnel behind it is how the machine
+		// ends up with no network. So it is said plainly, and the mode is put back so
+		// the interface does not claim the switch worked.
+		Log("TUN disable: adapter %q could not be removed: %v", name, err, "ERR")
+		_, _ = a.store.UpdateSettings(map[string]interface{}{"tunMode": string(st.TunMode)})
+		return fmt.Errorf("关闭 TUN 失败：网卡 %q 仍然存在（%v）。"+
+			"它可能还在接管流量，所以模式已恢复为「开启」以免界面显示错误的状态", name, err)
+	}
+	Log("TUN disabled: adapter %q removed, mode cleared", name)
+	if startErr != nil {
+		return fmt.Errorf("TUN 已关闭、网卡已移除，但内核没有重启：%v", startErr)
+	}
 
 	// Give the traffic somewhere to go on the way out.
 	//
@@ -1641,8 +1668,40 @@ func (a *App) removeAdapterWithRights(name string) error {
 	if isElevated() {
 		return fmt.Errorf("已以管理员权限删除网卡 %q，但它仍然存在", name)
 	}
-	return fmt.Errorf("删除网卡 %q 需要管理员权限，当前进程没有，"+
-		"而常驻服务也不可用。请以管理员身份运行 Zenith，或重启电脑后网卡会消失", name)
+	// Last path: ask Windows for the rights for exactly this one operation.
+	//
+	// Measured state this covers: the resident service had crashed and stayed dead
+	// (no recovery actions were registered), its core survived as an orphan holding
+	// the adapter and the default route, and the interface - an ordinary user - had
+	// no way to remove either. The only advice was "restart the computer".
+	//
+	// The elevated instance is a one-shot: it removes the adapter and exits. There is
+	// no verdict to read back because ShellExecute gives no exit status, so success
+	// is judged by the adapter actually being gone.
+	Log("TUN disable: no elevation available locally; requesting it for the adapter removal")
+	if _, err := elevateRequest([]string{
+		"-tun-remove-adapter",
+		"-root", a.rootDir,
+		"-datadir", a.dataDir,
+	}); err != nil {
+		if isUserCancel(err) {
+			return fmt.Errorf("删除网卡 %q 需要管理员授权，你取消了授权；"+
+				"TUN 仍然开着，可以稍后再试", name)
+		}
+		return fmt.Errorf("删除网卡 %q 需要管理员权限，而请求授权失败：%v", name, err)
+	}
+	// The elevated process is asynchronous. Wait for the adapter to go away rather
+	// than assuming the request worked, for the same reason every other removal in
+	// this file is verified: a removal that reports success and does nothing has
+	// already happened once.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if !tunAdapterExists(name) {
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("已请求管理员权限删除网卡 %q，但它仍然存在（可能被其他程序占用或驱动拒绝）", name)
 }
 
 // ---- verification ---------------------------------------------------------
@@ -1694,7 +1753,28 @@ func (a *App) RecoverTun() {
 	// remembered state wrong.
 	if st.TunMode != TunOff {
 		if tunAdapterExists(st.TunDevice) {
-			Log("TUN: mode %s is active and adapter %q is present", st.TunMode, st.TunDevice)
+			// A present adapter is not the same thing as a working tunnel.
+			//
+			// The state this check exists for was measured on this machine: the
+			// resident service crashed (SCM 7034, exit 1067) and, because no failure
+			// recovery had been registered, stayed dead. The core it had started
+			// survived as an orphan and kept the adapter and the default route, so
+			// the tunnel still carried traffic while nothing could remove it. Once
+			// that orphan is gone the routes point at nothing and every request is
+			// black-holed - no tunnel, no proxy, no way back without a reboot.
+			//
+			// So the mode is not trusted on its own: what makes a tunnel real is an
+			// adapter that is up, a default route through it, and a core answering.
+			if a.tunnelIsAlive(st.TunDevice) {
+				Log("TUN: mode %s is active and adapter %q is present", st.TunMode, st.TunDevice)
+				return
+			}
+			// Not decided here. A core that is on its way up looks exactly like a dead
+			// tunnel for a moment, and Core.Start allows up to 150s for a first run
+			// that still has to fetch geodata - waiting that out before the window
+			// opens, or deleting the adapter from under a starting core, are both
+			// wrong. A background watcher decides once the answer is knowable.
+			go a.healDeadTunnelWhenSettled(st.TunDevice, st.TunMode)
 			return
 		}
 		// The adapter can be absent for a reason that is not a failure: the core is being
@@ -1788,10 +1868,141 @@ func (a *App) RecoverTun() {
 			return
 		}
 		Log("TUN: found a leftover adapter %q with TUN switched off; removing it", st.TunDevice, "WARN")
-		if err := removeTunAdapter(st.TunDevice); err != nil {
-			Log("TUN: leftover adapter could not be removed: %v", err, "WARN")
+		// Only try the silent paths here. This branch runs during startup, and the
+		// rights-aware helper falls back to a permission prompt when the service is
+		// gone - a UAC dialog appearing by itself, before the window is even up, is
+		// not something to do to somebody. The state is recorded instead and the
+		// button that is allowed to ask is the one that fixes it.
+		if a.serviceReachable() || isElevated() {
+			if err := a.removeAdapterWithRights(st.TunDevice); err != nil {
+				Log("TUN: leftover adapter could not be removed: %v", err, "WARN")
+				a.recordTunnelNeedsRepair("TUN 已关闭，但上次留下的网卡还在，可能接管流量", err)
+			}
+		} else {
+			a.recordTunnelNeedsRepair("TUN 已关闭，但上次留下的网卡仍在系统里。"+
+				"它可能接管流量——请点「移除 Zenith 网卡」清理", nil)
 		}
 	}
+}
+
+// tunnelIsAlive reports whether the tunnel is really carrying: the adapter is up, the
+// default route goes through it, and a core is answering.
+//
+// All three are needed and the third is the one that was missing. The adapter can be
+// up with the route installed while no core exists to serve it - that is what a
+// crashed service leaves behind - and in that state the interface would happily say
+// "TUN is on" while every packet is dropped.
+//
+// The core is checked first on purpose, and it is the cheap check: it is one loopback
+// HTTP call, while the other two each start a PowerShell process. A caller polling this
+// while no core exists therefore costs nothing, which matters because the poll runs
+// during startup.
+func (a *App) tunnelIsAlive(name string) bool {
+	if a.core == nil || !a.core.IsUp() {
+		return false
+	}
+	exists, up, index := adapterState(name)
+	if !exists || !up {
+		return false
+	}
+	onRoute, _ := defaultRouteUsesAdapter(index)
+	return onRoute
+}
+
+// healDeadTunnelWhenSettled decides, off the startup path, whether a present adapter is
+// a working tunnel or a dead one left behind.
+//
+// It exists because the answer is not knowable at startup: a core that is on its way up
+// looks exactly like a dead tunnel, and Core.Start allows up to 150 seconds for a first
+// run that has to fetch geodata. Deciding immediately would either block the window or
+// delete an adapter a starting core is about to use - and removing an adapter a live
+// core still owns is the mistake this file already documents once.
+//
+// So it waits for the core, cheaply (one loopback call per poll, no PowerShell), and
+// only once a core has answered does it ask the expensive questions and act.
+func (a *App) healDeadTunnelWhenSettled(name string, mode TunMode) {
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		if a.core != nil && a.core.IsUp() {
+			// A core is answering. Give the adapter a moment to appear - a core that
+			// just started creates it as part of coming up - then decide.
+			time.Sleep(2 * time.Second)
+			if a.tunnelIsAlive(name) {
+				Log("TUN: adapter %q is up and a core is answering; the tunnel is alive", name)
+				return
+			}
+			a.healDeadTunnel(name, mode)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	// No core answered within the budget. The adapter is holding routes with nothing
+	// behind them, which is the blackhole.
+	a.healDeadTunnel(name, mode)
+}
+
+// healDeadTunnel removes a tunnel that is holding the routes with nothing behind it.
+//
+// It heals silently only when doing so costs the user nothing: with the resident
+// service running, the removal needs no permission prompt, so it is done and the mode
+// is cleared to match. Without the service the removal needs administrator rights, and
+// a permission prompt appearing on its own at startup - with no visible cause - is not
+// something to do to somebody. The state is recorded instead, so the interface can say
+// what is wrong and offer the repair, which is the button that already knows how to ask.
+func (a *App) healDeadTunnel(name string, mode TunMode) {
+	Log("TUN: adapter %q and its default route are present but no core is serving them; "+
+		"traffic is being black-holed. This is what a crashed service leaves behind",
+		name, "WARN")
+
+	if a.serviceReachable() {
+		if err := a.removeAdapterWithRights(name); err == nil {
+			if _, err := a.store.UpdateSettings(map[string]interface{}{
+				"tunMode": string(TunOff),
+			}); err != nil {
+				Log("TUN: could not clear the dead mode: %v", err, "WARN")
+			}
+			Log("TUN: removed the dead tunnel left by a previous run; the mode is off again")
+			a.mu.Lock()
+			if a.tunRun == nil {
+				a.tunRun = &tunRun{}
+			}
+			a.tunRun.Stage = "上次的 TUN 已失效（内核不在），已自动清理；需要时请重新启用"
+			a.tunRun.Mode = TunOff
+			a.tunRun.Error = ""
+			a.mu.Unlock()
+			return
+		} else {
+			Log("TUN: the dead tunnel could not be removed even through the service: %v",
+				err, "ERR")
+		}
+	}
+	// No silent path. Say so where the user can see it, and leave the removal to the
+	// button that is allowed to ask for permission.
+	a.recordTunnelNeedsRepair("上次的 TUN 网卡还在接管流量，但没有任何内核在服务它——"+
+		"这会导致无法上网。请点「关闭 TUN」清理", nil)
+	_ = mode
+}
+
+// recordTunnelNeedsRepair publishes a state the interface can show and act on.
+//
+// The error field is set even when there is no exception to report, because that is
+// what the interface renders: web/app.js shows the stage only when the run is active or
+// an error is present, and otherwise falls back to a pill derived from the stored mode.
+// A warning that sets only the stage therefore never reaches the user in the mode-on
+// case, which is exactly when it matters.
+func (a *App) recordTunnelNeedsRepair(stage string, cause error) {
+	a.mu.Lock()
+	if a.tunRun == nil {
+		a.tunRun = &tunRun{}
+	}
+	a.tunRun.Stage = stage
+	if cause != nil {
+		a.tunRun.Error = cause.Error()
+	} else {
+		a.tunRun.Error = stage
+	}
+	a.mu.Unlock()
+	Log("TUN: %s", stage, "WARN")
 }
 
 // tunAdapterIsCarryingTraffic reports whether the tunnel is not merely present but
@@ -1849,7 +2060,10 @@ func (a *App) UninstallTun() error {
 			return err
 		}
 	}
-	return removeTunAdapter(st.TunDevice)
+	// Through the rights-aware helper, not directly. The direct call ran with an
+	// ordinary-user token, so it failed even when the service was right there and
+	// able to do it.
+	return a.removeAdapterWithRights(st.NormalizedTunDevice())
 }
 
 // ---- the elevated instance ------------------------------------------------
@@ -1863,6 +2077,19 @@ func (a *App) UninstallTun() error {
 // never holds administrator rights it does not need.
 func (a *App) RunElevatedActivation(mode TunMode, handoverID string, requesterPID int) error {
 	Log("elevated instance: activating TUN in %s mode", mode)
+
+	// This process has the rights, so it is the moment to fix a service that was
+	// installed before failure recovery existed. A registration made by an older
+	// build has no recovery actions, and such a service stays dead after one crash
+	// until the machine is rebooted - measured: twenty-three hours, with the core it
+	// had started still holding the TUN adapter and nobody able to remove it.
+	//
+	// Done here rather than asking for another permission prompt: the user already
+	// granted elevation for the activation, and this changes only how Windows treats
+	// a future failure.
+	if serviceInstalled() {
+		configureServiceRecovery()
+	}
 
 	// Take ownership of the handover record first, so the waiting side sees
 	// progress from the very start rather than silence while the environment is

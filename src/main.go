@@ -81,8 +81,44 @@ func main() {
 		// need, and it is the one that performs the activation transaction.
 		tunElevated = flag.Bool("tun-elevated", false, "internal: continue a TUN enable with administrator rights")
 		tunModeFlag = flag.String("tun-mode", "", "internal: the TUN mode the elevated instance should activate")
+		// A one-shot elevated removal of the virtual adapter. It exists because the
+		// adapter cannot be removed without administrator rights, and the two paths
+		// that normally have them can both be unavailable: the service may have
+		// crashed (measured: 7034 / exit 1067, twice) and the interface is an
+		// ordinary user. Without this the only answer was "reboot the computer",
+		// which is not an answer.
+		tunRemoveAdapterFlag = flag.Bool("tun-remove-adapter", false, "internal: remove the virtual adapter with administrator rights and exit")
 	)
 	flag.Parse()
+
+	// The elevated removal runs before anything else and needs no App: its whole job
+	// is to delete one adapter this program created.
+	//
+	// Logging is initialised first, because the caller cannot read this process's exit
+	// status (it is started through ShellExecute) and the log is the only place the
+	// reason for a failure can appear. Without this the one-shot ran with logging
+	// uninitialised and every line went to a stderr nobody captures, so a failure was
+	// invisible and the only symptom was the caller's timeout.
+	if *tunRemoveAdapterFlag {
+		logRoot := *rootFlag
+		if logRoot == "" {
+			if r, err := resolveRoot(); err == nil {
+				logRoot = r
+			}
+		}
+		if logRoot != "" {
+			InitLog(filepath.Join(logRoot, "logs"))
+		}
+		name := defaultTunDevice
+		Log("elevated adapter removal: removing %q", name)
+		if err := removeTunAdapter(name); err != nil {
+			Log("elevated adapter removal failed: %v", err, "ERR")
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		Log("elevated adapter removal: adapter %q removed", name)
+		return
+	}
 
 	// A GUI-subsystem binary has no console, so an unhandled panic would vanish
 	// without a trace. Catch it and put it in the log instead.

@@ -40,7 +40,7 @@ var healthSweepTargets = []string{
 
 const (
 	AppName    = "Zenith"
-	AppVersion = "1.4.2"
+	AppVersion = "1.4.3"
 
 	// coreStartGrace is how long the watchdog waits before it decides the core
 	// is broken. A first run against an empty data directory downloads the rule
@@ -245,6 +245,11 @@ func (a *App) rebindDirs(dataDir string) {
 	}
 	st := store.Settings()
 	a.dnsPort = st.MixedPort + 300
+	// Tell the removal guard which adapter name this installation owns. The setting
+	// preserves a custom name, and the guard used to compare against the built-in
+	// default, so a configured name could never be removed - every disable, uninstall
+	// and rollback failed while the adapter kept holding the default route.
+	approveTunDevice(st.NormalizedTunDevice())
 	// the core always lives next to the executable, never inside the data dir
 	a.core = NewCore(filepath.Join(a.rootDir, "core", "mihomo.exe"),
 		dataDir, a.configPath, a.secret, st.ControlPort)
@@ -556,12 +561,115 @@ func copyPatch(in map[string]interface{}) map[string]interface{} {
 // geodata files on first run and that can take up to a minute. The window must
 // appear immediately so the user sees progress instead of a frozen app.
 func (a *App) Boot() {
+	// Two repairs before anything is started, in this order:
+	//
+	//   1. a core that outlived the service that started it is an orphan, and an
+	//      orphan holding the TUN adapter is the dangerous state this program has
+	//      actually been in;
+	//   2. a remembered TUN mode that this process cannot deliver has to fall back to
+	//      the system proxy before a configuration is written, or the core is started
+	//      against a tun block it has no rights to create and nothing carries traffic.
+	a.healOrphanedCore()
+	a.ensureTakeoverFeasible()
 	a.EnsureUsablePort()
 	snap := a.store.Snapshot()
 	st := snap.Settings
 
 	a.writeConfig(a.mergedNodes(), st)
 	go a.bootCore()
+}
+
+// healOrphanedCore terminates a core whose owner is gone.
+//
+// This is the state measured on this machine: the resident service crashed (SCM 7034,
+// exit 1067) and stayed dead because no recovery actions had been registered, while
+// the mihomo it had started kept running. That orphan held the TUN adapter and the
+// default route, so the tunnel still carried traffic - the machine looked healthy -
+// and the only process able to remove the adapter was gone. "关闭 TUN" then failed
+// with "需要管理员权限，而常驻服务也不可用", and the advice was to reboot.
+//
+// A core whose owner is gone is not adopted, because adopting it preserves exactly the
+// state that cannot be repaired. It is stopped, so the next start can be a normal one.
+//
+// The identity is taken from this installation's own record rather than from a process
+// scan: the file names the core pid AND the service pid that started it, so the check
+// is "the core we recorded, whose owner we recorded, and that owner is gone" - never
+// "some mihomo process".
+func (a *App) healOrphanedCore() {
+	st := a.loadServiceState()
+	if st == nil || st.ServicePID <= 0 || st.CorePID <= 0 {
+		return
+	}
+	if serviceRunning() {
+		return // the owner is alive; the core is not an orphan
+	}
+	if alive, err := processRunning(st.CorePID); err != nil || !alive {
+		return // nothing left behind
+	}
+	if !strings.EqualFold(ProcessName(st.CorePID), "mihomo.exe") {
+		return // the pid has been reused by something else
+	}
+	Log("startup: core pid %d outlived the service that started it (service pid %d); "+
+		"stopping it so it cannot keep holding the TUN adapter and the routes",
+		st.CorePID, st.ServicePID, "WARN")
+	if err := stopProcess(st.CorePID); err != nil {
+		Log("startup: could not stop the orphaned core pid %d: %v", st.CorePID, err, "ERR")
+		return
+	}
+	// Record that no core is running, so the rest of startup does not adopt a corpse.
+	a.saveServiceState(&serviceState{ServicePID: 0})
+	Log("startup: orphaned core stopped; the next core will be started by this process")
+}
+
+// ensureTakeoverFeasible falls back to the system proxy when the tunnel cannot be built.
+//
+// Creating a TUN adapter needs administrator rights, and there are exactly two ways to
+// have them: the resident service, or an elevated instance. If neither is available
+// the configuration this program is about to write still contains a `tun:` block, and
+// the core started against it either fails or comes up with no adapter - while the
+// stored settings and the interface both say the tunnel is on.
+//
+// Measured, and it is why this exists: after the service had crashed, a launch with
+// `tunMode: compat` left the machine with a remembered tunnel, no adapter, no system
+// proxy (the two are mutually exclusive) and therefore no working takeover at all.
+//
+// So the two switches are reconciled before anything is generated: if the tunnel is
+// remembered but cannot be delivered, the tunnel is switched off and the system proxy
+// is switched on. The user gets a working machine and a log line that says why.
+func (a *App) ensureTakeoverFeasible() {
+	if a.store == nil {
+		return
+	}
+	st := a.store.Settings()
+	if st.TunMode == TunOff {
+		return
+	}
+	if isElevated() {
+		return
+	}
+	if a.serviceReachable() {
+		return
+	}
+	Log("TUN: mode %s is remembered, but there is no service and this process is not "+
+		"elevated, so no adapter can be created. Falling back to the system proxy so the "+
+		"machine has a working takeover instead of a tunnel that cannot exist",
+		st.TunMode, "WARN")
+	if _, err := a.store.UpdateSettings(map[string]interface{}{
+		"tunMode":     string(TunOff),
+		"systemProxy": true,
+	}); err != nil {
+		Log("TUN: could not record the fallback: %v", err, "WARN")
+		return
+	}
+	a.mu.Lock()
+	if a.tunRun == nil {
+		a.tunRun = &tunRun{}
+	}
+	a.tunRun.Stage = "上次的 TUN 接管无法继续（没有常驻服务、也没有管理员权限），已自动切回系统代理；" +
+		"想再用 TUN 请重新启用"
+	a.tunRun.Mode = TunOff
+	a.tunRun.Active = false
+	a.mu.Unlock()
 }
 
 // coreOwnsDataDir reports whether a process is a mihomo belonging to this
